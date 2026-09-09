@@ -15,8 +15,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..registry import register_model
 from .blocks import InceptionNeXtBlock
-from .registry import register_model
 
 
 def _normalize_layer_count(
