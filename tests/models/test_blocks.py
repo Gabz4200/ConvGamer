@@ -22,7 +22,7 @@ InceptionNeXtBlock (Eq. 3, §3.1):
 import torch
 import torch.nn as nn
 
-from convgamer.models.blocks import InceptionDWConv2d, InceptionNeXtBlock
+from convgamer.models.inception_next.blocks import InceptionDWConv2d, InceptionNeXtBlock
 
 # ── InceptionDWConv2d ────────────────────────────────────────────────────────
 

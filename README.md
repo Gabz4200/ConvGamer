@@ -64,12 +64,14 @@ uv run python scripts/train.py
 convgamer/
 ├── configs/          # Hydra/OmegaConf YAML configs
 ├── src/convgamer/
-│   ├── models/       # Encoder, blocks (InceptionDWConv2d, InceptionNeXtBlock)
+│   ├── models/
+│   │   ├── inception_next/  # InceptionNeXt backbone (Encoder, blocks)
+│   │   └── registry.py      # Generic model registry
 │   ├── ops/          # Geometry op abstraction (DIP)
 │   ├── kernels/taichi/   # Taichi kernels + runtime isolation
 │   ├── integrations/     # PyTorch custom-op + Transformers wrappers
 │   ├── data/             # Lightning DataModule + Dataset
-│   ├── modules/          # LightningModule
+│   ├── modules/          # LightningModules (InceptionNeXtModule + ConvGamerModel)
 │   ├── callbacks/        # Lightning callbacks
 │   ├── training/         # Trainer factory
 │   └── scripts/          # Package-level entry points

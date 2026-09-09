@@ -13,6 +13,7 @@ Tests verify the *behavioral contracts* from the paper:
 import torch
 import torch.nn as nn
 
+# Encoder is auto-registered via convgamer.models.__init__ -> inception_next.encoder
 from convgamer.models.registry import get_model
 
 # ── Shape / architecture ─────────────────────────────────────────────────────
