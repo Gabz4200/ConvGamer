@@ -138,6 +138,7 @@ celerybeat.pid
 
 # AI
 .agents/
+.aislop/
 
 # RabbitMQ
 mnesia/
