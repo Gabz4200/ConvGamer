@@ -26,6 +26,7 @@ dependencies = [
     "taichi>=1.7.0",
     "transformers>=4.45.0",
     "huggingface-hub>=0.25.0",
+    "einops>=0.8.2",
 ]
 
 [project.optional-dependencies]
@@ -97,6 +98,7 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["N812", "N816"]
 
 [tool.pyrefly]
 output-format = "full-text"
