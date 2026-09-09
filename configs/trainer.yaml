@@ -1,0 +1,9 @@
+trainer:
+  accelerator: auto
+  devices: 1
+  max_epochs: 10  # paper §4.1 uses 300 epochs (DeiT schedule); reduced for dev
+  precision: "32-true"
+  log_every_n_steps: 10
+  callbacks:
+    - model_checkpoint
+    - logger
