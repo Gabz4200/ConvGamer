@@ -10,7 +10,7 @@ from .references.geometry_reference import reference_integrate_particles
 class ReferenceGeometryOp(GeometryOp):
     """Pure-PyTorch geometry op used for parity tests."""
 
-    def __call__(self, position: torch.Tensor, velocity: torch.Tensor, dt: float) -> torch.Tensor:
+    def forward(self, position: torch.Tensor, velocity: torch.Tensor, dt: float) -> torch.Tensor:
         return reference_integrate_particles(position, velocity, dt)
 
 
@@ -27,7 +27,11 @@ class TaichiGeometryOp(GeometryOp):
 
 
 def build_geometry_op(backend: str) -> GeometryOp:
-    return {
-        "reference": ReferenceGeometryOp,
-        "taichi": TaichiGeometryOp,
-    }[backend]()
+    try:
+        cls = {
+            "reference": ReferenceGeometryOp,
+            "taichi": TaichiGeometryOp,
+        }[backend]
+    except KeyError:
+        raise ValueError(f"Unknown backend '{backend}'. Valid: reference, taichi") from None
+    return cls()

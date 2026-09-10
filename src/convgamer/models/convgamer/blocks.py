@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import einops
 import torch
 import torch.nn as nn
@@ -11,7 +13,10 @@ def uniform_temporal_subsample(
     """Equispaced nearest-neighbour temporal subsampling."""
 
     t = x.shape[temporal_dim]
-    assert num_samples > 0 and t > 0
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be > 0, got {num_samples}")
+    if t <= 0:
+        raise ValueError(f"temporal dim size must be > 0, got {t}")
 
     # Use .round() for true nearest-neighbor.
     indices = torch.linspace(0, t - 1, num_samples, device=x.device, dtype=torch.float32)
@@ -26,7 +31,7 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        intermediate_channels: int = 255,
+        intermediate_channels: int = 255,  # 255=85*3 divisible by in_channels=3
         out_factor: int = 8,
         kernel_size: tuple[int, int, int] | int = (7, 7, 2),
         target_size: tuple[int, int] | int = (64, 64),
@@ -179,27 +184,6 @@ class ConvGamerStem(nn.Module):
             kernel_size=1,
         )
         self.norm = nn.GroupNorm(num_groups=4, num_channels=self.out_channels)
-
-    def __getattr__(self, name: str) -> nn.Module:
-        if name == "new_f_conv":
-            modules = self.__dict__.get("_modules")
-            if modules is not None and "fuse_conv" in modules:
-                return modules["fuse_conv"]
-            return object.__getattribute__(self, "fuse_conv")
-        return super().__getattr__(name)  # type: ignore[misc]
-
-    def __setattr__(self, name: str, value: object) -> None:
-        if name == "new_f_conv":
-            super().__setattr__("fuse_conv", value)
-        else:
-            super().__setattr__(name, value)
-
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if prefix + "new_f_conv.weight" in state_dict:
-            state_dict[prefix + "fuse_conv.weight"] = state_dict.pop(prefix + "new_f_conv.weight")
-        if prefix + "new_f_conv.bias" in state_dict:
-            state_dict[prefix + "fuse_conv.bias"] = state_dict.pop(prefix + "new_f_conv.bias")
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W)

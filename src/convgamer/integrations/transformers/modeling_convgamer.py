@@ -29,17 +29,24 @@ class ConvGamerModel(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         return_dict: bool | None = None,
+        **kwargs,
     ) -> BaseModelOutput | tuple:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        hidden = inputs_embeds if inputs_embeds is not None else input_ids
+        hidden = (
+            inputs_embeds
+            if inputs_embeds is not None
+            else (pixel_values if pixel_values is not None else input_ids)
+        )
         if hidden is None:
-            raise ValueError("Specify input_ids or inputs_embeds")
+            raise ValueError("Specify input_ids, pixel_values, or inputs_embeds")
         out = self.native(hidden)
         if return_dict:
             return BaseModelOutput(last_hidden_state=out)
         return (out,)
 
-    def get_input_embeddings(self) -> nn.Module:
+    def get_input_embeddings(self) -> nn.Module:  # type: ignore[override]
+        # Placeholder — ConvGamer is vision backbone with no token embeddings
         return nn.Identity()

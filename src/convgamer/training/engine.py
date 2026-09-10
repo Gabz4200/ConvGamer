@@ -7,7 +7,7 @@ from convgamer.callbacks.logging import _build_callback  # noqa: F401
 
 
 def create_trainer(cfg: DictConfig) -> pl.Trainer:
-    callback_names = cfg.trainer.callbacks
+    callback_names = getattr(cfg.trainer, "callbacks", []) or []
     callbacks = [_build_callback(name) for name in callback_names]
     return pl.Trainer(
         accelerator=cfg.trainer.accelerator,
