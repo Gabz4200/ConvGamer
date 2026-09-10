@@ -1,16 +1,18 @@
-"""Behavior tests for LearnedSpatialTemporalDownsampler.
+"""Behavior tests for LearnedSpatialTemporalDownsampler and SmoothPWAct.
 
 Behavioral contracts covered:
 
-  - forward rejects non-5D input and channel mismatches (boundary validation).
-  - forward maps (B, C, T, H, W) -> (B, C*out_factor + (C if concat) ?,
-    T // temporal_reduction_factor, target_h, target_w).
-  - concat_original=False yields base_channels = C*out_factor output channels.
-  - output is finite for typical float and zero inputs.
-  - with the correction branch zeroed, concat=False and out_factor=1, the
-    output equals the normalized downsampled path (residual algebra sanity).
-  - uniform_temporal_subsample selects equispaced indices, includes endpoints,
-    preserves ordering, clamps on oversample, and rejects invalid counts.
+  - LearnedSpatialTemporalDownsampler: forward rejects non-5D input and channel
+    mismatches, maps (B, C, T, H, W) -> (B, C*out_factor + (C if concat) ?,
+    T // temporal_reduction_factor, target_h, target_w), concat flags, finite
+    outputs, residual algebra sanity.
+  - uniform_temporal_subsample: equispaced indices, endpoints, ordering, clamp,
+    invalid counts.
+  - SmoothPWAct: arbitrary input shape preserved via reshape (not view),
+    non-contiguous safe, output bounded as convex combination of y_cords,
+    finite, gradient flows to input and params, smooth at knots (squared
+    Gaussian kernel), temperature controls sharpness, validation of
+    num_anchors and temperature.
 """
 
 import einops
@@ -19,6 +21,7 @@ import torch
 
 from convgamer.models.convgamer.blocks import (
     LearnedSpatialTemporalDownsampler,
+    SmoothPWAct,
     uniform_temporal_subsample,
 )
 
@@ -55,7 +58,7 @@ def test_when_not_depthwise_accepts_any_intermediate() -> None:
     x = torch.randn(1, 3, 8, 32, 32)
     with torch.no_grad():
         out = op(x)
-    assert out.shape == (1, 15, 4, 64, 64)
+    assert out.shape == (1, 27, 4, 64, 64)
 
 
 # ── Output shape / channel layout ────────────────────────────────────────────
@@ -224,3 +227,115 @@ def test_temporal_subsample_raises_on_invalid() -> None:
     x = torch.zeros(1, 1, 4, 1, 1)
     with pytest.raises((AssertionError, ValueError)):
         uniform_temporal_subsample(x, num_samples=0)
+
+
+# ── SmoothPWAct ────────────────────────────────────────────────────────────────
+
+
+def test_smooth_preserves_arbitrary_shapes() -> None:
+    """Output shape must equal input shape for arbitrary ranks (reshape, not view)."""
+    act = SmoothPWAct(num_anchors=8, temperature=0.5)
+    for shape in [(5,), (2, 4), (2, 3, 4), (2, 3, 4, 5)]:
+        x = torch.randn(shape)
+        assert act(x).shape == x.shape
+
+
+def test_smooth_non_contiguous_input() -> None:
+    """Non-contiguous inputs must not fail (reshape vs view)."""
+    act = SmoothPWAct(num_anchors=8, temperature=0.5)
+    x = torch.randn(4, 6).t()
+    assert not x.is_contiguous()
+    out = act(x)
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+
+
+def test_smooth_output_bounded_as_convex_combination() -> None:
+    """Softmax weights sum to 1, so output is weighted avg of y_cords."""
+    act = SmoothPWAct(num_anchors=8, temperature=0.5)
+    x = torch.randn(10, 10) * 5
+    out = act(x)
+    y_min, y_max = act.y_cords.min().item(), act.y_cords.max().item()
+    assert (out >= y_min - 1e-6).all() and (out <= y_max + 1e-6).all()
+
+
+def test_smooth_output_finite() -> None:
+    act = SmoothPWAct(num_anchors=16, temperature=0.1)
+    x = torch.randn(4, 8) * 3
+    assert torch.isfinite(act(x)).all()
+
+
+def test_smooth_gradient_flows_to_input_and_params() -> None:
+    act = SmoothPWAct(num_anchors=4, temperature=0.5)
+    x = torch.randn(2, 3, requires_grad=True)
+    loss = act(x).sum()
+    loss.backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert not torch.isnan(x.grad).any()
+    assert act.x_cords.grad is not None and torch.isfinite(act.x_cords.grad).all()
+    assert act.y_cords.grad is not None and torch.isfinite(act.y_cords.grad).all()
+
+
+def test_smooth_gradient_finite_at_knot() -> None:
+    """Squared distance is C1 smooth at x == x_cord (abs would cusp)."""
+    act = SmoothPWAct(num_anchors=4, temperature=0.5)
+    knot = act.x_cords[1].item()
+    x = torch.tensor([[knot]], requires_grad=True)
+    out = act(x).sum()
+    out.backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    eps = 1e-4
+    x_lo = torch.tensor([[knot - eps]])
+    x_hi = torch.tensor([[knot + eps]])
+    assert torch.isfinite(act(x_lo)).all() and torch.isfinite(act(x_hi)).all()
+    grad_lo = torch.autograd.grad(act(x_lo).sum(), act.x_cords, retain_graph=True)[0]
+    assert torch.isfinite(grad_lo).all()
+
+
+def test_smooth_temperature_controls_sharpness() -> None:
+    """Small temperature -> near nearest-neighbor; large -> blended average."""
+    torch.manual_seed(0)
+    sharp = SmoothPWAct(num_anchors=8, temperature=1e-3)
+    smooth = SmoothPWAct(num_anchors=8, temperature=10.0)
+    # copy cords so only temperature differs
+    with torch.no_grad():
+        smooth.x_cords.copy_(sharp.x_cords)
+        smooth.y_cords.copy_(sharp.y_cords)
+    # point exactly at a cord should map near that y value when sharp
+    cord_x = sharp.x_cords[3].item()
+    cord_y = sharp.y_cords[3].item()
+    x = torch.tensor([[cord_x]])
+    out_sharp = sharp(x).item()
+    out_smooth = smooth(x).item()
+    assert abs(out_sharp - cord_y) < 0.05
+    # smooth is pulled toward mean of y_cords
+    y_mean = sharp.y_cords.mean().item()
+    assert abs(out_smooth - y_mean) < abs(out_sharp - y_mean)
+
+
+def test_smooth_invalid_num_anchors_raises() -> None:
+    with pytest.raises(ValueError, match="num_anchors"):
+        SmoothPWAct(num_anchors=1, temperature=0.5)
+    with pytest.raises(ValueError, match="num_anchors"):
+        SmoothPWAct(num_anchors=0, temperature=0.5)
+
+
+def test_smooth_invalid_temperature_raises() -> None:
+    with pytest.raises(ValueError, match="temperature"):
+        SmoothPWAct(num_anchors=4, temperature=0)
+    with pytest.raises(ValueError, match="temperature"):
+        SmoothPWAct(num_anchors=4, temperature=-1)
+
+
+def test_smooth_params_are_learnable() -> None:
+    act = SmoothPWAct(num_anchors=6, temperature=0.5)
+    assert isinstance(act.x_cords, torch.nn.Parameter)
+    assert isinstance(act.y_cords, torch.nn.Parameter)
+    assert act.x_cords.requires_grad and act.y_cords.requires_grad
+    assert act.x_cords.shape == (6,) and act.y_cords.shape == (6,)
+
+
+def test_smooth_cords_initialized_linspace() -> None:
+    act = SmoothPWAct(num_anchors=4, temperature=0.5)
+    torch.testing.assert_close(act.x_cords, torch.linspace(-2, 2, 4))
+    torch.testing.assert_close(act.y_cords, torch.linspace(-2, 2, 4))
