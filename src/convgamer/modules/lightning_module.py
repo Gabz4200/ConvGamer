@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytorch_lightning as pl
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from convgamer.models.inception_next import Encoder
@@ -36,7 +36,10 @@ class InceptionNeXtModule(pl.LightningModule):
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
-        self.save_hyperparameters(cfg)
+        container = (
+            OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
+        )  # type: ignore[arg-type]
+        self.save_hyperparameters(container)
         self.model = Encoder(
             input_dim=cfg.model.input_dim,
             hidden_dim=cfg.model.hidden_dim,
@@ -53,20 +56,30 @@ class InceptionNeXtModule(pl.LightningModule):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, _):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        self.log("val/loss", loss, prog_bar=True)
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
         # Paper §4.1: AdamW with lr = 0.001 × batchsize/1024
-        lr = self.hparams["optimizer"]["lr"]
-        weight_decay = self.hparams["optimizer"]["weight_decay"]
+        opt_cfg = (
+            self.hparams["optimizer"]
+            if "optimizer" in self.hparams
+            else self.hparams.get("optimizer", {})
+        )  # type: ignore[attr-defined]
+        # OmegaConf container is plain dict after save_hyperparameters conversion
+        if isinstance(opt_cfg, DictConfig):
+            opt_cfg = OmegaConf.to_container(opt_cfg, resolve=True)  # type: ignore[assignment]
+        lr = opt_cfg["lr"] if isinstance(opt_cfg, dict) else opt_cfg.lr  # type: ignore[union-attr]
+        weight_decay = (
+            opt_cfg["weight_decay"] if isinstance(opt_cfg, dict) else opt_cfg.weight_decay
+        )  # type: ignore[union-attr]
         return torch.optim.AdamW(
             self.parameters(),
             lr=lr,
@@ -77,9 +90,9 @@ class InceptionNeXtModule(pl.LightningModule):
 class ConvGamerModel(InceptionNeXtModule):
     """ConvGamer LightningModule — extends InceptionNeXtModule.
 
-    Adds the ConvGamer geometry-op integration (wired in via ``cfg.ops.backend``)
-    applied in later stages.  Until the geometry ops are composed into the
-    forward pass this module trains identically to ``InceptionNeXtModule``.
+    Placeholder for future geometry-op composition (``cfg.ops.backend``).
+    Currently trains identically to ``InceptionNeXtModule`` until ops are wired
+    into forward. Kept for HF/export compatibility.
     """
 
     def __init__(self, cfg: DictConfig):

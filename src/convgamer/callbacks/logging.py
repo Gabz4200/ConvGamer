@@ -21,14 +21,18 @@ class ConvGamerLogger(Callback):
                 logger.info("%s=%.4f", name, float(val))
 
 
+def _taichi_init_callback() -> Callback:
+    from convgamer.callbacks.taichi_init import TaichiInitCallback
+
+    return TaichiInitCallback()
+
+
 _BUILDER_FOR_LAZY: dict[str, Callable[[], Callback]] = {
     "model_checkpoint": lambda: ModelCheckpoint(
         monitor="val_loss", save_last=True, save_top_k=1, mode="min"
     ),
     "early_stopping": lambda: EarlyStopping(monitor="val_loss", mode="min", patience=5),
-    "taichi_init": lambda: __import__(
-        "convgamer.callbacks.taichi_init", fromlist=["TaichiInitCallback"]
-    ).TaichiInitCallback(),
+    "taichi_init": _taichi_init_callback,
     "logger": lambda: ConvGamerLogger(),
 }
 

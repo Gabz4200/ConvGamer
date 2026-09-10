@@ -8,6 +8,8 @@ MODEL_REGISTRY: dict[str, Callable[..., Any]] = {}
 
 def register_model(name: str):
     def decorator(cls):
+        if name in MODEL_REGISTRY:
+            raise ValueError(f"Model '{name}' already registered")
         MODEL_REGISTRY[name] = cls
         return cls
 

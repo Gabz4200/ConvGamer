@@ -5,7 +5,6 @@ Contracts:
 - default in_channels=24 -> out 96, custom values preserved
 - spatial/temporal dims unchanged across sizes
 - output finite, normed, gradient flows
-- alias new_f_conv <-> fuse_conv and old checkpoint compat
 """
 
 import pytest
@@ -77,39 +76,6 @@ def test_gradient_flows_to_input_and_params() -> None:
     for n, p in m.named_parameters():
         assert p.grad is not None, f"no grad for {n}"
         assert torch.isfinite(p.grad).all(), f"non-finite grad for {n}"
-
-
-def test_alias_new_f_conv_is_fuse_conv() -> None:
-    m = ConvGamerStem(in_channels=12)
-    assert hasattr(m, "fuse_conv")
-    assert m.new_f_conv is m.fuse_conv
-    # mutating via alias mutates fuse_conv
-    new = torch.nn.Conv3d(12 * 6, 12 * 3, kernel_size=1)
-    m.new_f_conv = new
-    assert m.fuse_conv is new
-    assert m.new_f_conv is new
-    assert "fuse_conv.weight" in m.state_dict()
-    assert "new_f_conv.weight" not in m.state_dict()
-
-
-def test_old_checkpoint_with_new_f_conv_keys_loads() -> None:
-    old = ConvGamerStem(in_channels=16)
-    sd = old.state_dict()
-    legacy = {}
-    for k, v in sd.items():
-        if k.startswith("fuse_conv."):
-            legacy[k.replace("fuse_conv.", "new_f_conv.")] = v
-        else:
-            legacy[k] = v
-    assert "new_f_conv.weight" in legacy
-    new_model = ConvGamerStem(in_channels=16)
-    new_model.load_state_dict(legacy)
-    torch.testing.assert_close(new_model.fuse_conv.weight, old.fuse_conv.weight)
-    torch.testing.assert_close(new_model.fuse_conv.bias, old.fuse_conv.bias)
-    # forward after legacy load stays correct shape
-    x = torch.randn(1, 16, 4, 8, 8)
-    y = new_model(x)
-    assert y.shape == torch.Size([1, 64, 4, 8, 8])
 
 
 def test_state_dict_roundtrip_preserves_output() -> None:

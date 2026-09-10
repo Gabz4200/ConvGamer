@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..base import BaseModel
 from ..registry import register_model
 from .blocks import InceptionNeXtBlock
 
@@ -22,17 +23,25 @@ from .blocks import InceptionNeXtBlock
 def _normalize_layer_count(
     num_layers: int | list[int] | tuple[int, ...], stages: int = 4
 ) -> list[int]:
-    """Broadcast ``num_layers`` to a per-stage list of length *stages*."""
-    if isinstance(num_layers, int):
+    """Broadcast ``num_layers`` to a per-stage list of length *stages*.
+
+    Accepts OmegaConf ListConfig (Hydra) as well as plain list/tuple.
+    """
+    if isinstance(num_layers, int) and not isinstance(num_layers, bool):
         return [num_layers] * stages
-    layers = list(num_layers)
+    try:
+        layers = list(num_layers)  # type: ignore[arg-type]
+    except TypeError:
+        raise ValueError(
+            f"num_layers must be int or sequence, got {type(num_layers).__name__}"
+        ) from None
     if len(layers) != stages:
         raise ValueError(f"num_layers tuple must have length {stages}, got {len(layers)}")
     return layers
 
 
 @register_model("encoder")
-class Encoder(nn.Module):
+class Encoder(BaseModel):
     """InceptionNeXt backbone.
 
     Parameters
@@ -69,18 +78,17 @@ class Encoder(nn.Module):
     ):
         super().__init__()
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(input_dim, hidden_dim, kernel_size=4, stride=4),
-        )
+        self.stem = nn.Conv2d(input_dim, hidden_dim, kernel_size=4, stride=4)
         self.stem_norm = nn.LayerNorm(hidden_dim)
 
         layers_per_stage = _normalize_layer_count(num_layers, stages=4)
 
         stages: list[nn.Module] = []
+        last_out_ch = hidden_dim
         for stage_idx in range(4):
             in_ch = hidden_dim if stage_idx == 0 else hidden_dim * (2 ** (stage_idx - 1))
             out_ch = hidden_dim * (2**stage_idx)
-
+            last_out_ch = out_ch
             stage: list[nn.Module] = []
             if stage_idx > 0:
                 stage.append(nn.Conv2d(in_ch, out_ch, kernel_size=1))
@@ -90,23 +98,22 @@ class Encoder(nn.Module):
             stages.append(nn.Sequential(*stage))
 
         self.stages = nn.Sequential(*stages)
-        self.head = nn.Linear(hidden_dim * 8, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = nn.Linear(last_out_ch, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _stem_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         b, c, h, w = x.shape
         x = x.flatten(2).transpose(1, 2)
         x = self.stem_norm(x)
-        x = x.transpose(1, 2).reshape(b, c, h, w)
+        return x.transpose(1, 2).reshape(b, c, h, w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._stem_forward(x)
         x = self.stages(x)
         x = x.mean(dim=[2, 3])
         return self.head(x)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        b, c, h, w = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        x = self.stem_norm(x)
-        x = x.transpose(1, 2).reshape(b, c, h, w)
+        x = self._stem_forward(x)
         x = self.stages(x)
         return x.mean(dim=[2, 3])
