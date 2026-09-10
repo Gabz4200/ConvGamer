@@ -1,23 +1,70 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import repeat
 from torchvision.transforms import v2
 
 
 class LearnedDownsampler(nn.Module):
-    """
-    Uses a learned convolution to get a correction for an existing downsampling
-    to make it more ML friendly.
+    r"""Learned spatial downsampler with channel expansion via a residual correction path.
 
-    - After processing, both `x` and `correction` have shape:
-        [B, out_channels, H_t, W_t], where (H_t, W_t) = target_size.
-    - `x` channels are tiled copies of the resized input:
-        [c0, c1, c2, c0, c1, c2, ...] up to out_channels.
-    - `correction` channels are:
-        [0, 0, ..., 0 (in_channels times), d0, d1, ..., d_{out_channels-in_channels-1}]
-    - Output = x + correction.
+    Resizes the input to ``target_size`` using differentiable interpolation, then
+    tiles (repeats) the resized channels to reach ``out_channels``. A parallel
+    learned convolution branch produces a correction tensor whose first
+    ``in_channels`` slots are zero (so the tiling path stays untouched) and
+    whose remaining slots hold learned residual features. The two are summed,
+    yielding an output where every channel is a distinct learned quantity —
+    avoiding the duplication redundancy a naive tile would impose.
 
+    Args:
+        target_size (tuple[int, int] or int): Desired output spatial
+            ``(H_t, W_t)``. If an ``int``, both dimensions are set to it.
+        kernel_size (int): Kernel size of the strided correction convolution.
+            Default: ``3``
+        in_channels (int): Number of channels in the input tensor.
+            Default: ``3``
+        intermediate_channels (int): Width of the hidden correction features
+            produced by the strided convolution. Must be divisible by
+            ``groups``. Default: ``192``
+        out_channels (int): Number of output channels. Must be greater than
+            ``in_channels`` so that the correction branch has room to learn
+            new feature channels. Default: ``48``
+        groups (int): Number of groups for the first correction convolution.
+            When greater than 1, both ``in_channels`` and
+            ``intermediate_channels`` must be divisible by ``groups``.
+            Default: ``1``
+        interpolation_mode (torchvision.transforms.v2.InterpolationMode):
+            Interpolation mode used when resizing the input to
+            ``target_size``. Default: ``InterpolationMode.BILINEAR``
+
+    Shape:
+        - Input: :math:`(B, \text{in\_channels}, H_{\text{in}}, W_{\text{in}})`
+        - Output: :math:`(B, \text{out\_channels}, H_t, W_t)`
+
+    .. note::
+        The first ``in_channels`` output channels are an identity path: the
+        resized input passes through unchanged with zero correction applied, so
+        channels :math:`[0, \text{in\_channels})` equal the interpolated input.
+        Channels :math:`[\text{in\_channels}, \text{out\_channels})` carry
+        learned residual features and are distinct learned quantities.
+
+        Tiling repeats channels in blocks of ``in_channels`` —
+        ``[c0, c1, ..., c_{in-1}, c0, c1, ..., ...]`` — so that the first
+        ``in_channels`` entries of the tiling align exactly with the zero-padded
+        correction slots, preserving the identity path.
+
+    Example::
+
+        >>> import torch
+        >>> op = LearnedDownsampler(
+        ...     target_size=(16, 16),
+        ...     in_channels=3,
+        ...     out_channels=24,
+        ... )
+        >>> x = torch.randn(2, 3, 32, 32)
+        >>> out = op(x)
+        >>> out.shape
+        torch.Size([2, 24, 16, 16])
     """
 
     def __init__(
@@ -25,8 +72,8 @@ class LearnedDownsampler(nn.Module):
         target_size: tuple[int, int] | int,
         kernel_size: int = 3,
         in_channels: int = 3,
-        intermediate_channels: int = 192,  # Multiple of 3 and 8
-        out_channels: int = 48,  # Multiple of 3 and 8
+        intermediate_channels: int = 192,  # Divisible by groups for grouped conv
+        out_channels: int = 48,  # Divisible by in_channels for clean tiling
         groups: int = 1,
         interpolation_mode: v2.InterpolationMode = v2.InterpolationMode.BILINEAR,
     ) -> None:
@@ -99,37 +146,30 @@ class LearnedDownsampler(nn.Module):
         remainder = self.out_channels % self.in_channels
 
         # Repeat full blocks of in_channels -> [B, in_channels * repeats, H_t, W_t]
+        # Pattern: (repeat c) gives [c0,c1,c2, c0,c1,c2, ...] so the first
+        # in_channels of x_tiled align with the zero-padded correction path.
         x_full_blocks = repeat(
             x_resized,
-            "b c h w -> b (c repeat) h w",
+            "b c h w -> b (repeat c) h w",
             repeat=repeats,
         )
 
         if remainder == 0:
-            # Exact multiple: just take the first out_channels (should already match)
-            x_tiled = rearrange(
-                x_full_blocks,
-                "b (c repeat) h w -> b (repeat c) h w",
-                c=self.in_channels,
-                repeat=repeats,
-            )
-            # Ensure exact channel count (safety slice)
-            x_tiled = x_tiled[:, : self.out_channels, :, :]
+            # Exact multiple: x_full_blocks already has out_channels in the
+            # correct (repeat c) order — no rearrange needed.
+            x_tiled = x_full_blocks
         else:
-            # We have extra channels to fill from a prefix of x_resized.
-            # Take the first `remainder` channels explicitly using rearrange:
-            x_prefix = rearrange(
-                x_resized,
-                "b c h w -> b c h w",
-            )[:, :remainder, :, :]  # [B, remainder, H_t, W_t]
+            # Extra channels from a prefix of x_resized. These match the
+            # start of the block pattern [c0,c1,...] since x_resized[:remainder]
+            # are channels [c0..c_{remainder-1}], consistent with (repeat c).
+            x_prefix = x_resized[:, :remainder, :, :]  # [B, remainder, H_t, W_t]
 
-            # Now concatenate full blocks + prefix along channel dimension.
-            # We keep this cat explicit for clarity; einops doesn't add much here.
+            # Concatenate full blocks + prefix along the channel dimension.
             x_tiled = torch.cat([x_full_blocks, x_prefix], dim=1)  # [B, out_channels, H_t, W_t]
 
         # At this point:
         #   x_tiled: [B, out_channels, H_t, W_t]
-        #   channel pattern: [c0..c_{in-1}, c0..c_{in-1}, ..., c0..c_{remainder-1}]
+        #   channel pattern: [c0,c1,c2, c0,c1,c2, ..., c0..c_{remainder-1}]
 
         # Build correction tensor with zeros in the first in_channels,
         # then learned features in the remaining out_channels - in_channels.
@@ -152,8 +192,8 @@ class LearnedDownsampler(nn.Module):
         #   x_tiled:           [B, out_channels, H_t, W_t], tiled input channels
         #   correction_padded: [B, out_channels, H_t, W_t], [0..0, learned...]
         # This matches:
-        #   x = [a,b,c,a,b,c,a,b,c,...]
-        #   correction = [0,0,0,d,e,f,g,h,i,j,k,l,...]
+        #   x_tiled = [a,b,c, a,b,c, a,b,c, ...]
+        #   correction = [0,0,0, d,e,f, g,h,i, ...]
 
         out: torch.Tensor = x_tiled + correction_padded
         return out
