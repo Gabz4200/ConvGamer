@@ -1,0 +1,12 @@
+defaults:
+  - model: encoder
+  - optimizer: adamw
+  - data: default
+  - trainer: default
+  - ops: reference
+  - experiment: default
+  - _self_
+
+# Runtime toggles
+fast_dev_run: false
+seed: 42

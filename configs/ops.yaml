@@ -1,2 +1,0 @@
-ops:
-  backend: reference  # "reference" (pure PyTorch) | "taichi" — ConvGamer geometry integration

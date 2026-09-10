@@ -1,0 +1,3 @@
+# Default experiment — plain training with no overrides.
+# Override hyperparameters on the command line, e.g.:
+#   python scripts/train.py experiment=debug trainer.max_epochs=1

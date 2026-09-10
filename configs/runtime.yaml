@@ -1,8 +1,0 @@
-defaults:
-  - model
-  - data
-  - trainer
-  - ops
-  - _self_
-
-fast_dev_run: false

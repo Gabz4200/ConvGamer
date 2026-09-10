@@ -139,6 +139,8 @@ celerybeat.pid
 # AI
 .agents/
 .aislop/
+.agents/**
+**/skills-lock.json
 
 # RabbitMQ
 mnesia/
