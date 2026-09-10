@@ -19,6 +19,7 @@ __all__ = [
     "linear_srgb_to_srgb",
     "srgb_to_oklab",
     "oklab_to_srgb",
+    "convert_srgb_oklab",
     "oklab_to_lch",
     "lch_to_oklab",
     "compute_max_saturation",
@@ -161,6 +162,20 @@ def srgb_to_oklab(x: Tensor, dim: int = -3) -> Tensor:
 def oklab_to_srgb(x: Tensor, dim: int = -3) -> Tensor:
     lin = oklab_to_linear_srgb(x, dim=dim)
     return srgb_transfer_function(lin)
+
+
+def convert_srgb_oklab(x: Tensor, dim: int = -3, *, to_oklab: bool = True) -> Tensor:
+    """Direct sRGB <-> Oklab without manual linear step.
+
+    Wrapper over :func:`srgb_to_oklab` and :func:`oklab_to_srgb` so you
+    don't call the linear intermediate yourself.
+
+    Args:
+        x: Tensor with 3-channel dim `dim` (`... ,3, ...`).
+        dim: Channel dimension (default ``-3`` for ``C,H,W`` / ``B,C,H,W`` / video).
+        to_oklab: If True ``sRGB -> Oklab``, else ``Oklab -> sRGB``.
+    """
+    return srgb_to_oklab(x, dim=dim) if to_oklab else oklab_to_srgb(x, dim=dim)
 
 
 def xyz_to_oklab(x: Tensor, dim: int = -3) -> Tensor:
