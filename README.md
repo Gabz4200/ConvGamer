@@ -52,11 +52,33 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 uv sync --extra cpu --extra dev
 
 # Run a fast dev smoke test (1 batch train + 1 batch val)
-uv run python scripts/train.py --fast-dev-run true
+uv run train +trainer.fast_dev_run=true
 
 # Full training
-uv run python scripts/train.py
+uv run train
 ```
+
+## Hydra configuration
+
+All config lives in `configs/`. Hydra composes the final config from
+config groups listed in `configs/config.yaml`. You can override any
+value from the command line:
+
+```bash
+# Switch the geometry-op backend
+uv run train ops=taichi
+
+# Override hyperparameters
+uv run train model.hidden_dim=48 trainer.max_epochs=50
+
+# Compose from a debug config group
+uv run train debug/fdr +trainer.limit_train_batches=2
+
+# Run a multirun sweep
+uv run train --multirun model.hidden_dim=48,96 trainer.max_epochs=10,20
+```
+
+Available config groups: `model`, `optimizer`, `data`, `trainer`, `ops`, `experiment`, `debug`.
 
 ## Project structure
 
@@ -74,8 +96,8 @@ convgamer/
 │   ├── modules/          # LightningModules (InceptionNeXtModule + ConvGamerModel)
 │   ├── callbacks/        # Lightning callbacks
 │   ├── training/         # Trainer factory
-│   └── scripts/          # Package-level entry points
-├── scripts/          # User-facing CLI entry points
+│   └── scripts/          # Hydra CLI entry points (train, eval, export-hf)
+├── configs/          # Hydra/OmegaConf YAML configs (config groups)
 ├── tests/            # Reference vs impl parity tests
 ├── notebooks/        # Jupytext-paired quickstart
 └── benchmarks/

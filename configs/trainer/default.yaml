@@ -1,0 +1,11 @@
+target: pytorch_lightning.Trainer
+
+# Paper §4.1 uses 300 epochs (DeiT schedule); reduced for dev
+accelerator: auto
+devices: 1
+max_epochs: 10
+precision: "32-true"
+log_every_n_steps: 10
+callbacks:
+  - model_checkpoint
+  - logger

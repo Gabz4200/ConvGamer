@@ -1,0 +1,6 @@
+batch_size: 4  # paper uses 4096 effective; small for dev
+num_workers: 0
+num_samples: 64
+channels: 3
+image_size: 224  # paper §4.1: 224×224 for ImageNet
+num_classes: 10  # dev; paper uses 1000

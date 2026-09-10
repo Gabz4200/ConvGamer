@@ -1,28 +1,25 @@
+"""Hydra-CLI entrypoint for training ConvGamer / InceptionNeXt.
+
+Run via ``uv run train`` or ``python -m convgamer.scripts.train``.
+"""
+
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-from omegaconf import DictConfig, OmegaConf
+import hydra
+from omegaconf import DictConfig
 
 from convgamer.data.datamemodule import ConvGamerDataModule
 from convgamer.modules.lightning_module import ConvGamerModel
 from convgamer.training.engine import create_trainer
 
-_CONFIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "configs"
+# Absolute config path so Hydra finds configs regardless of CWD or __main__.
+CONFIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "configs"
 
 
-def _load_cfg() -> DictConfig:
-    cfg: DictConfig = OmegaConf.create({})
-    for name in ("model", "data", "trainer", "ops"):
-        cfg = OmegaConf.merge(cfg, OmegaConf.load(_CONFIG_DIR / f"{name}.yaml"))  # type: ignore[assignment]
-    return OmegaConf.merge(cfg, OmegaConf.create({"fast_dev_run": False}))  # type: ignore[return-value]
-
-
-def main() -> None:
-    cfg = _load_cfg()
-    if "--fast-dev-run" in sys.argv:
-        cfg.fast_dev_run = True
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="config")
+def main(cfg: DictConfig) -> None:
     if cfg.fast_dev_run:
         cfg.trainer.max_epochs = 1
     trainer = create_trainer(cfg)

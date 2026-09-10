@@ -1,0 +1,5 @@
+# Paper §4.1: AdamW with lr = 0.001 × batchsize/1024, weight_decay = 0.05
+target: torch.optim.AdamW
+
+lr: 4.0e-3  # paper §4.1: lr = 0.001 × batchsize/1024, with batch 4096 -> 4e-3
+weight_decay: 0.05  # paper §4.1

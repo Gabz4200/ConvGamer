@@ -1,0 +1,4 @@
+# Fast development run: 1 batch train, 1 batch val, 1 epoch
+trainer:
+  max_epochs: 1
+  fast_dev_run: true

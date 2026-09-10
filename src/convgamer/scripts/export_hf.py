@@ -1,3 +1,8 @@
+"""Export ConvGamer model to HuggingFace format.
+
+CLI: python -m convgamer.scripts.export_hf --checkpoint <path> --output-dir <dir>
+"""
+
 from __future__ import annotations
 
 import argparse
