@@ -1,116 +1,140 @@
 # ConvGamer
 
-InceptionNeXt: When Inception Meets ConvNeXt — a CNN research project implementing the model from [arXiv:2303.16900](https://arxiv.org/abs/2303.16900) by Weihao Yu, Pan Zhou, and Shuicheng Yan.
+ConvGamer is a PyTorch and PyTorch Lightning research framework implementing [InceptionNeXt](https://arxiv.org/abs/2303.16900) (*When Inception Meets ConvNeXt*), featuring decomposed large-kernel depthwise convolutions, composable Hydra configuration, and accelerated geometry kernels.
 
-## What is InceptionNeXt?
+## Key Features
 
-> *Although ConvNeXt's depthwise convolution has few FLOPs, high memory access costs make it a bottleneck on GPUs. InceptionNeXt decomposes large-kernel depthwise convolution into four parallel branches — small square kernel, two orthogonal band kernels, and an identity mapping — achieving ConvNeXt-level accuracy with ResNet-level speed.* ([Paper](https://arxiv.org/abs/2303.16900))
-
-The core operation (`InceptionDWConv2d`) splits input channels into:
-- 1/8 → 3×3 square kernel
-- 1/8 → 1×k horizontal band
-- 1/8 → k×1 vertical band
-- 5/8 → identity passthrough
+- **InceptionNeXt Backbone**: Implements the `InceptionDWConv2d` operator—decomposing large-kernel depthwise convolutions into 3×3 square kernels, 1×k horizontal band kernels, k×1 vertical band kernels, and identity passthrough to achieve ConvNeXt-level accuracy with ResNet-level speed.
+- **Dual Execution Backends**: Provides pure PyTorch reference operations alongside accelerated Taichi kernels.
+- **Lightning Workflows**: Complete training and evaluation loops powered by PyTorch Lightning with checkpointing, metric logging, and deterministic seeding.
+- **Hugging Face Integration**: Custom Hugging Face Transformers model configuration, architecture wrappers, and export tooling (`export-hf`).
+- **Hydra Configuration**: Composable YAML configuration groups for models, optimizers, datasets, trainers, and execution backends.
 
 ## Installation
 
-### CPU (default for tests/CI)
+### With `uv` (Recommended)
 
 ```bash
+# CPU setup (default for testing and development)
 uv sync --extra cpu
-# or
-pip install -e ".[cpu]"
+
+# GPU setup (CUDA 12.4)
+uv sync --extra cu124
+
+# Development setup (includes testing and linting tools)
+uv sync --extra cpu --extra dev
 ```
 
-### GPU NVIDIA (CUDA 12.4)
+### With `pip`
 
 ```bash
-uv sync --extra cu124
-# or
+# CPU
+pip install -e ".[cpu]"
+
+# GPU (CUDA 12.4)
 pip install -e ".[cu124]"
 ```
 
-### Base only (no PyTorch — lint/docs)
+> [!NOTE]
+> ConvGamer configures `cpu` and `cu124` as mutually exclusive environment extras via `uv` conflict resolution. Switching between them with `uv sync --extra <extra>` updates dependencies atomically.
 
-```bash
-uv sync
-```
+## Quick Start
 
-### Verify
+### Python API
+
+Instantiate and execute the InceptionNeXt encoder directly:
 
 ```python
 import torch
+from convgamer.models.inception_next import Encoder
 
-print(torch.__version__)
-print(f"CUDA available: {torch.cuda.is_available()}")
+# Initialize Tiny/Small stage layout (96 hidden dims, 4 stages)
+model = Encoder(
+    input_dim=3,
+    hidden_dim=96,
+    num_layers=[3, 3, 9, 3],
+    num_classes=10,
+)
+
+x = torch.randn(2, 3, 224, 224)
+logits = model(x)
+print(f"Output shape: {logits.shape}")  # [2, 10]
 ```
 
-## Quick start
+Models can also be instantiated via the registry:
+
+```python
+from convgamer.models.registry import get_model
+
+model = get_model("encoder", input_dim=3, hidden_dim=96, num_layers=[3, 3, 9, 3], num_classes=10)
+```
+
+### Command-Line Training
+
+Train with PyTorch Lightning using Hydra configuration:
 
 ```bash
-# Install (CPU)
-uv sync --extra cpu --extra dev
-
-# Run a fast dev smoke test (1 batch train + 1 batch val)
-uv run train +trainer.fast_dev_run=true
-
-# Full training
+# Full training run with default configuration
 uv run train
+
+# Quick single-batch smoke run
+uv run train fast_dev_run=true
 ```
 
-## Hydra configuration
+### Evaluation & Model Export
 
-All config lives in `configs/`. Hydra composes the final config from
-config groups listed in `configs/config.yaml`. You can override any
-value from the command line:
+Evaluate checkpoints or export trained weights to Hugging Face Transformers format:
 
 ```bash
-# Switch the geometry-op backend
+# Evaluate a trained checkpoint
+uv run eval +eval.checkpoint=path/to/checkpoint.ckpt
+
+# Export to Hugging Face format
+uv run export-hf --checkpoint path/to/checkpoint.ckpt --output-dir exported_model
+```
+
+## Configuration
+
+Experiments are configured using Hydra files in `configs/`. Default parameters can be overridden from the CLI:
+
+```bash
+# Select execution backend (reference or taichi)
 uv run train ops=taichi
 
-# Override hyperparameters
+# Override model and training hyperparameters
 uv run train model.hidden_dim=48 trainer.max_epochs=50
 
-# Compose from a debug config group
-uv run train debug/fdr +trainer.limit_train_batches=2
-
-# Run a multirun sweep
+# Run multi-run sweeps
 uv run train --multirun model.hidden_dim=48,96 trainer.max_epochs=10,20
 ```
 
-Available config groups: `model`, `optimizer`, `data`, `trainer`, `ops`, `experiment`, `debug`.
+Available configuration groups: `model`, `optimizer`, `data`, `trainer`, `ops`, `experiment`, `debug`.
 
-## Project structure
+## Development
 
-```
-convgamer/
-├── configs/          # Hydra/OmegaConf YAML configs
-├── src/convgamer/
-│   ├── models/
-│   │   ├── inception_next/  # InceptionNeXt backbone (Encoder, blocks)
-│   │   └── registry.py      # Generic model registry
-│   ├── ops/          # Geometry op abstraction (DIP)
-│   ├── kernels/taichi/   # Taichi kernels + runtime isolation
-│   ├── integrations/     # PyTorch custom-op + Transformers wrappers
-│   ├── data/             # Lightning DataModule + Dataset
-│   ├── modules/          # LightningModules (InceptionNeXtModule + ConvGamerModel)
-│   ├── callbacks/        # Lightning callbacks
-│   ├── training/         # Trainer factory
-│   └── scripts/          # Hydra CLI entry points (train, eval, export-hf)
-├── configs/          # Hydra/OmegaConf YAML configs (config groups)
-├── tests/            # Reference vs impl parity tests
-├── notebooks/        # Jupytext-paired quickstart
-└── benchmarks/
-```
-
-## Switching backends later
+Run tests, formatting, and type checks:
 
 ```bash
-uv sync --extra cu124   # removes cpu extra, adds cu124
+# Run test suite
+uv run pytest
+
+# Format and lint code
+uv run ruff check
+uv run ruff format --check
+
+# Type check
+uv run pyrefly check
 ```
 
-`uv` handles the transition atomically via the `conflicts` block in `pyproject.toml`.
+## References
 
-## License
+If you use InceptionNeXt in your research, please cite the original paper:
 
-MIT
+```bibtex
+@article{yu2023inceptionnext,
+  title={InceptionNeXt: When Inception Meets ConvNeXt},
+  author={Yu, Weihao and Zhou, Pan and Shuicheng, Yan},
+  journal={arXiv preprint arXiv:2303.16900},
+  year={2023}
+}
+```
