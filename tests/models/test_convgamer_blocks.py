@@ -15,13 +15,18 @@ Behavioral contracts covered:
     num_anchors and temperature.
 """
 
+from typing import Any, cast
+
 import einops
 import pytest
 import torch
 
 from convgamer.models.convgamer.blocks import (
     LearnedSpatialTemporalDownsampler,
+    PWInterpolationAct,
     SmoothPWAct,
+    StrictLearnableGrid,
+    spatial_softmax,
     uniform_temporal_subsample,
 )
 
@@ -61,6 +66,24 @@ def test_when_not_depthwise_accepts_any_intermediate() -> None:
     assert out.shape == (1, 27, 4, 64, 64)
 
 
+def test_correction_branch_processes_full_resolution_before_pooling() -> None:
+    op = LearnedSpatialTemporalDownsampler(
+        in_channels=3,
+        target_size=(8, 10),
+        temporal_reduction_factor=2,
+        concat_original=False,
+    )
+    seen: list[tuple[int, ...]] = []
+    op.correction_conv.register_forward_hook(
+        lambda _, inputs, __: seen.append(tuple(inputs[0].shape))
+    )
+
+    with torch.no_grad():
+        op(torch.randn(1, 3, 12, 64, 64))
+
+    assert seen == [(1, 3, 12, 64, 64)]
+
+
 # ── Output shape / channel layout ────────────────────────────────────────────
 
 
@@ -92,6 +115,11 @@ def test_when_temporal_reduction_factor_then_temporal_dim_halved() -> None:
     with torch.no_grad():
         out = op(x)
     assert out.shape[2] == 10 // 2
+
+
+def test_when_temporal_reduction_factor_non_positive_then_raises() -> None:
+    with pytest.raises(ValueError, match="temporal_reduction_factor"):
+        LearnedSpatialTemporalDownsampler(temporal_reduction_factor=0)
 
 
 def test_when_odd_temporal_then_target_is_floor() -> None:
@@ -339,3 +367,132 @@ def test_smooth_cords_initialized_linspace() -> None:
     act = SmoothPWAct(num_anchors=4, temperature=0.5)
     torch.testing.assert_close(act.x_cords, torch.linspace(-2, 2, 4))
     torch.testing.assert_close(act.y_cords, torch.linspace(-2, 2, 4))
+
+
+def test_smooth_preserves_input_dtype() -> None:
+    act = SmoothPWAct(num_anchors=4).half()
+    out = act(torch.randn(2, 3, dtype=torch.float16))
+    assert out.dtype == torch.float16
+
+
+# ── spatial_softmax ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("shape", [(2, 3, 4, 5), (2, 4, 3, 4, 5)])
+def test_spatial_softmax_normalizes_each_channel_spatially(shape: tuple[int, ...]) -> None:
+    x = torch.randn(shape)
+    out = spatial_softmax(x)
+    assert out.shape == x.shape
+    torch.testing.assert_close(out.sum(dim=(-2, -1)), torch.ones(shape[:-2]))
+
+
+def test_spatial_softmax_does_not_mix_channels() -> None:
+    x = torch.zeros(1, 2, 2, 2)
+    x[:, 0, 0, 0] = 2
+    out = spatial_softmax(x)
+    torch.testing.assert_close(out[0, 0].sum(), torch.tensor(1.0))
+    torch.testing.assert_close(out[0, 1], torch.full((2, 2), 0.25))
+
+
+def test_spatial_softmax_rejects_unsupported_rank() -> None:
+    with pytest.raises(ValueError, match="Expected 4D"):
+        spatial_softmax(torch.randn(2, 3, 4))
+
+
+def test_spatial_softmax_preserves_input_dtype() -> None:
+    out = spatial_softmax(torch.randn(2, 3, 4, 5, dtype=torch.float16))
+    assert out.dtype == torch.float16
+
+
+# ── StrictLearnableGrid ──────────────────────────────────────────────────────
+
+
+def test_grid_has_fixed_endpoints_and_minimum_spacing() -> None:
+    grid = StrictLearnableGrid(n_points=5, low=-2, high=3, min_spacing=0.5)
+    points = grid()
+    torch.testing.assert_close(points[[0, -1]], torch.tensor([-2.0, 3.0]))
+    assert torch.all(points[1:] - points[:-1] >= 0.5)
+    assert torch.all(points[1:] > points[:-1])
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"n_points": 1, "low": 0, "high": 1, "min_spacing": 0}, "n_points"),
+        ({"n_points": 3, "low": 1, "high": 1, "min_spacing": 0}, "high"),
+        ({"n_points": 3, "low": 0, "high": 1, "min_spacing": -1}, "non-negative"),
+        ({"n_points": 3, "low": 0, "high": 1, "min_spacing": 1}, "too large"),
+    ],
+)
+def test_grid_rejects_invalid_configuration(kwargs: dict[str, float | int], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        StrictLearnableGrid(**cast(Any, kwargs))
+
+
+# ── PWInterpolationAct behavior ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("monotonic", [True, False])
+def test_piecewise_clamps_outside_domain_and_hits_endpoints(monotonic: bool) -> None:
+    act = PWInterpolationAct(num_anchors=4, monotonic=monotonic)
+    x = torch.tensor([[-100.0, -2.0, 2.0, 100.0]])
+    out = act(x)
+    torch.testing.assert_close(out[0, 0], out[0, 1])
+    torch.testing.assert_close(out[0, 2], out[0, 3])
+
+
+def test_piecewise_rejects_non_matrix_input() -> None:
+    out = PWInterpolationAct()(torch.randn(2, 3, 4))
+    assert out.shape == (2, 3, 4)
+
+
+@pytest.mark.parametrize("monotonic", [True, False])
+def test_piecewise_preserves_arbitrary_shape_and_dtype(monotonic: bool) -> None:
+    act = PWInterpolationAct(num_anchors=4, monotonic=monotonic).half()
+    x = torch.randn(2, 3, 4, dtype=torch.float16)
+    out = act(x)
+    assert out.shape == x.shape
+    assert out.dtype == x.dtype
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"num_anchors": 1}, "num_anchors"),
+        ({"min_range": 1, "max_range": 1}, "max_range"),
+        ({"min_spacing": -1}, "non-negative"),
+        ({"num_anchors": 3, "min_spacing": 2.1}, "too large"),
+    ],
+)
+def test_piecewise_rejects_invalid_configuration(
+    kwargs: dict[str, float | int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        PWInterpolationAct(**cast(Any, kwargs))
+
+
+# ── PWInterpolationAct ───────────────────────────────────────────────────────
+
+
+def test_piecewise_monotonic_mode_registers_only_grid_parameters() -> None:
+    act = PWInterpolationAct(num_anchors=4, monotonic=True)
+
+    assert act.y_cords_gen is not None
+    assert act.y_cords is None
+    assert [name for name, _ in act.named_parameters()] == [
+        "x_cords_gen.raw",
+        "y_cords_gen.raw",
+    ]
+    assert act(torch.randn(2, 3)).shape == (2, 3)
+
+
+def test_piecewise_non_monotonic_mode_registers_unconstrained_y_parameter() -> None:
+    act = PWInterpolationAct(num_anchors=4, monotonic=False)
+
+    assert act.y_cords_gen is None
+    assert isinstance(act.y_cords, torch.nn.Parameter)
+    assert {name for name, _ in act.named_parameters()} == {
+        "x_cords_gen.raw",
+        "y_cords",
+    }
+    assert act(torch.randn(2, 3)).shape == (2, 3)
