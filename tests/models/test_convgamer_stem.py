@@ -17,19 +17,32 @@ def test_default_expands_24_to_96_preserves_resolution() -> None:
     m = ConvGamerStem(in_channels=24)
     x = torch.randn(2, 24, 8, 64, 64)
     y = m(x)
-    assert y.shape == torch.Size([2, 96, 8, 64, 64])
-    assert m.out_channels == 96
+    assert y.shape == torch.Size([2, 192, 8, 64, 64])
+    assert m.out_channels == 192
     assert m.in_channels == 24
 
 
 @pytest.mark.parametrize("in_channels", [3, 8, 16, 24, 32])
 def test_channel_expansion_is_fourfold(in_channels: int) -> None:
-    m = ConvGamerStem(in_channels=in_channels)
+    m = ConvGamerStem(in_channels=in_channels, use_softmax=False, use_norm=True)
     x = torch.randn(1, in_channels, 4, 16, 16)
     y = m(x)
     assert y.shape[1] == in_channels * 4
     assert m.out_channels == in_channels * 4
     assert m.norm.num_channels == m.out_channels
+
+
+def test_softmax_concatenation_doubles_channels() -> None:
+    m = ConvGamerStem(in_channels=8, use_norm=True)
+    x = torch.randn(1, 8, 4, 16, 16)
+    y = m(x)
+    assert y.shape[1] == 8 * 8
+    assert m.out_channels == 8 * 8
+    assert m.norm.num_channels == m.out_channels
+
+
+def test_norm_is_identity_by_default() -> None:
+    assert isinstance(ConvGamerStem(in_channels=8).norm, torch.nn.Identity)
 
 
 @pytest.mark.parametrize(
