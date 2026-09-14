@@ -35,6 +35,8 @@ class InceptionDWConv2d(nn.Module):
             raise ValueError(f"branch_ratio must be in (0,1), got {branch_ratio}")
         if band_kernel_size % 2 == 0:
             raise ValueError(f"band_kernel_size must be odd, got {band_kernel_size}")
+        if square_kernel_size % 2 == 0:
+            raise ValueError(f"square_kernel_size must be odd, got {square_kernel_size}")
         gc = int(in_channels * branch_ratio)  # channels per conv branch
         if gc <= 0:
             raise ValueError(

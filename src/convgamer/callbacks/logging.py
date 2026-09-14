@@ -29,9 +29,9 @@ def _taichi_init_callback() -> Callback:
 
 _BUILDER_FOR_LAZY: dict[str, Callable[[], Callback]] = {
     "model_checkpoint": lambda: ModelCheckpoint(
-        monitor="val_loss", save_last=True, save_top_k=1, mode="min"
+        monitor="val/loss", save_last=True, save_top_k=1, mode="min"
     ),
-    "early_stopping": lambda: EarlyStopping(monitor="val_loss", mode="min", patience=5),
+    "early_stopping": lambda: EarlyStopping(monitor="val/loss", mode="min", patience=5),
     "taichi_init": _taichi_init_callback,
     "logger": lambda: ConvGamerLogger(),
 }

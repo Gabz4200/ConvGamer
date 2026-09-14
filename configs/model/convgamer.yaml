@@ -1,0 +1,14 @@
+target: convgamer.models.convgamer.encoder.ConvGamerEncoder
+
+# Causal streaming video encoder: downsampler stem, per-frame InceptionNeXt,
+# dilated causal TCN head. Temporal subsampling is strided from frame 0, so
+# output i depends only on input frames <= i * step (streaming contract).
+input_dim: 3
+hidden_dim: 32
+num_layers: 1
+num_classes: 10
+layer_scale_init: 1.0e-6
+mlp_ratios: [4, 4, 4, 3]
+out_factor: 2
+use_softmax: false
+temporal_dilations: [1, 2, 4]

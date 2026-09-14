@@ -4,3 +4,5 @@ num_samples: 64
 channels: 3
 image_size: 224  # paper §4.1: 224×224 for ImageNet
 num_classes: 10  # dev; paper uses 1000
+modality: image
+num_frames: 8
