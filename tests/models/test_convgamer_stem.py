@@ -17,8 +17,8 @@ def test_default_expands_24_to_96_preserves_resolution() -> None:
     m = ConvGamerStem(in_channels=24)
     x = torch.randn(2, 24, 8, 64, 64)
     y = m(x)
-    assert y.shape == torch.Size([2, 192, 8, 64, 64])
-    assert m.out_channels == 192
+    assert y.shape == torch.Size([2, 96, 8, 64, 64])
+    assert m.out_channels == 96
     assert m.in_channels == 24
 
 
@@ -33,7 +33,7 @@ def test_channel_expansion_is_fourfold(in_channels: int) -> None:
 
 
 def test_softmax_concatenation_doubles_channels() -> None:
-    m = ConvGamerStem(in_channels=8, use_norm=True)
+    m = ConvGamerStem(in_channels=8, use_softmax=True, use_norm=True)
     x = torch.randn(1, 8, 4, 16, 16)
     y = m(x)
     assert y.shape[1] == 8 * 8

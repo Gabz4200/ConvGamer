@@ -1,4 +1,4 @@
-"""Behavior tests for LearnedSpatialTemporalDownsampler and SmoothPWAct.
+"""Behavior tests for LearnedSpatialTemporalDownsampler.
 
 Behavioral contracts covered:
 
@@ -8,14 +8,7 @@ Behavioral contracts covered:
     outputs, residual algebra sanity.
   - uniform_temporal_subsample: equispaced indices, endpoints, ordering, clamp,
     invalid counts.
-  - SmoothPWAct: arbitrary input shape preserved via reshape (not view),
-    non-contiguous safe, output bounded as convex combination of y_cords,
-    finite, gradient flows to input and params, smooth at knots (squared
-    Gaussian kernel), temperature controls sharpness, validation of
-    num_anchors and temperature.
 """
-
-from typing import Any, cast
 
 import einops
 import pytest
@@ -23,9 +16,6 @@ import torch
 
 from convgamer.models.convgamer.blocks import (
     LearnedSpatialTemporalDownsampler,
-    PWInterpolationAct,
-    SmoothPWAct,
-    StrictLearnableGrid,
     spatial_softmax,
     uniform_temporal_subsample,
 )
@@ -58,12 +48,15 @@ def test_when_depthwise_and_intermediate_not_divisible_then_raises() -> None:
 def test_when_not_depthwise_accepts_any_intermediate() -> None:
     """Non-depthwise conv accepts intermediate_channels not divisible by in_channels."""
     op = LearnedSpatialTemporalDownsampler(
-        in_channels=3, intermediate_channels=256, depthwise=False
+        in_channels=3,
+        intermediate_channels=256,
+        depthwise=False,
+        target_size=(64, 64),
     )
     x = torch.randn(1, 3, 8, 32, 32)
     with torch.no_grad():
         out = op(x)
-    assert out.shape == (1, 27, 4, 64, 64)
+    assert out.shape == (1, 6, 4, 64, 64)
 
 
 def test_correction_branch_processes_full_resolution_before_pooling() -> None:
@@ -90,7 +83,7 @@ def test_correction_branch_processes_full_resolution_before_pooling() -> None:
 def test_when_default_config_then_output_channels_match_formula() -> None:
     """out_channels = in_channels*out_factor (+ in_channels if concat_original)."""
     op = LearnedSpatialTemporalDownsampler(in_channels=3, out_factor=4, concat_original=True)
-    x = torch.randn(1, 3, 8, 32, 32)
+    x = torch.randn(1, 3, 8, 64, 64)
     with torch.no_grad():
         out = op(x)
     expected_c = 3 * 4 + 3  # base + original concat
@@ -100,7 +93,7 @@ def test_when_default_config_then_output_channels_match_formula() -> None:
 def test_when_concat_original_false_then_no_extra_channels() -> None:
     """Without concat, output channels = in_channels * out_factor."""
     op = LearnedSpatialTemporalDownsampler(in_channels=3, out_factor=2, concat_original=False)
-    x = torch.randn(1, 3, 8, 32, 32)
+    x = torch.randn(1, 3, 8, 64, 64)
     with torch.no_grad():
         out = op(x)
     assert out.shape == (1, 3 * 2, 4, 64, 64)
@@ -120,6 +113,24 @@ def test_when_temporal_reduction_factor_then_temporal_dim_halved() -> None:
 def test_when_temporal_reduction_factor_non_positive_then_raises() -> None:
     with pytest.raises(ValueError, match="temporal_reduction_factor"):
         LearnedSpatialTemporalDownsampler(temporal_reduction_factor=0)
+
+
+def test_downsampler_correction_is_causal_after_temporal_reduction() -> None:
+    op = LearnedSpatialTemporalDownsampler(
+        in_channels=1,
+        intermediate_channels=1,
+        out_factor=1,
+        target_size=(2, 2),
+        temporal_reduction_factor=2,
+        concat_original=False,
+    )
+    x = torch.zeros(1, 1, 4, 4, 4)
+    with torch.no_grad():
+        baseline = op(x)
+        x[:, :, 1] = 1
+        changed = op(x)
+
+    torch.testing.assert_close(changed[:, :, 0], baseline[:, :, 0])
 
 
 def test_when_odd_temporal_then_target_is_floor() -> None:
@@ -148,7 +159,10 @@ def test_when_int_target_size_then_normalized_to_square() -> None:
 def test_when_scaled_out_factor_then_channels_scale_linearly(out_factor: int) -> None:
     """Output channels (without concat) scale by out_factor."""
     op = LearnedSpatialTemporalDownsampler(
-        in_channels=3, out_factor=out_factor, concat_original=False
+        in_channels=3,
+        out_factor=out_factor,
+        concat_original=False,
+        target_size=(16, 16),
     )
     x = torch.randn(1, 3, 4, 16, 16)
     with torch.no_grad():
@@ -178,7 +192,7 @@ def test_output_is_finite() -> None:
 
 
 def test_zero_input_yields_finite_output() -> None:
-    """Zero input must not produce NaN through GroupNorm (single group)."""
+    """Zero input must not produce NaN through LayerNorm."""
     op = LearnedSpatialTemporalDownsampler(in_channels=3, concat_original=False)
     x = torch.zeros(1, 3, 8, 32, 32)
     with torch.no_grad():
@@ -188,10 +202,14 @@ def test_zero_input_yields_finite_output() -> None:
 
 def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
     """Correction branch zeroed, concat=False, out_factor=1:
-    out = GroupNorm(ones, zeros)(tiled_x_down). With norm biased to identity,
+    out = LayerNorm(ones, zeros)(tiled_x_down). With norm biased to identity,
     output equals the spatial+temporal downsampled input path."""
     op = LearnedSpatialTemporalDownsampler(
-        in_channels=3, out_factor=1, concat_original=False, intermediate_channels=15
+        in_channels=3,
+        out_factor=1,
+        concat_original=False,
+        intermediate_channels=15,
+        target_size=(32, 32),
     )
     with torch.no_grad():
         torch.nn.init.zeros_(op.correction_conv.weight)
@@ -208,7 +226,7 @@ def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
 
         # Replicate the downsampled path the module uses internally.
         xd = einops.rearrange(x, "b c t h w -> b t c h w")
-        xd = op.downsample_x_down(xd)
+        xd = op._resize_for_test(xd, (32, 32))
         xd = einops.rearrange(xd, "b t c h w -> b c t h w")
         target_t = max(1, xd.shape[2] // op.temporal_reduction_factor)
         xd = uniform_temporal_subsample(xd, num_samples=target_t, temporal_dim=-3)
@@ -216,6 +234,24 @@ def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
         expected = op.norm(tiled)
 
     torch.testing.assert_close(out, expected)
+
+
+def test_when_small_input_then_never_upsampled() -> None:
+    """Relative sizing caps at input resolution: 16px stays 16px."""
+    op = LearnedSpatialTemporalDownsampler(in_channels=3)
+    x = torch.randn(1, 3, 8, 16, 16)
+    with torch.no_grad():
+        out = op(x)
+    assert out.shape == (1, 6, 4, 16, 16)
+
+
+def test_when_large_input_then_capped_at_max_spatial() -> None:
+    """224px input downsamples to the 64px cap."""
+    op = LearnedSpatialTemporalDownsampler(in_channels=3)
+    x = torch.randn(1, 3, 8, 224, 224)
+    with torch.no_grad():
+        out = op(x)
+    assert out.shape == (1, 6, 4, 64, 64)
 
 
 # ── uniform_temporal_subsample (in-house replacement for pytorchvideo) ────────
@@ -257,124 +293,6 @@ def test_temporal_subsample_raises_on_invalid() -> None:
         uniform_temporal_subsample(x, num_samples=0)
 
 
-# ── SmoothPWAct ────────────────────────────────────────────────────────────────
-
-
-def test_smooth_preserves_arbitrary_shapes() -> None:
-    """Output shape must equal input shape for arbitrary ranks (reshape, not view)."""
-    act = SmoothPWAct(num_anchors=8, temperature=0.5)
-    for shape in [(5,), (2, 4), (2, 3, 4), (2, 3, 4, 5)]:
-        x = torch.randn(shape)
-        assert act(x).shape == x.shape
-
-
-def test_smooth_non_contiguous_input() -> None:
-    """Non-contiguous inputs must not fail (reshape vs view)."""
-    act = SmoothPWAct(num_anchors=8, temperature=0.5)
-    x = torch.randn(4, 6).t()
-    assert not x.is_contiguous()
-    out = act(x)
-    assert out.shape == x.shape
-    assert torch.isfinite(out).all()
-
-
-def test_smooth_output_bounded_as_convex_combination() -> None:
-    """Softmax weights sum to 1, so output is weighted avg of y_cords."""
-    act = SmoothPWAct(num_anchors=8, temperature=0.5)
-    x = torch.randn(10, 10) * 5
-    out = act(x)
-    y_min, y_max = act.y_cords.min().item(), act.y_cords.max().item()
-    assert (out >= y_min - 1e-6).all() and (out <= y_max + 1e-6).all()
-
-
-def test_smooth_output_finite() -> None:
-    act = SmoothPWAct(num_anchors=16, temperature=0.1)
-    x = torch.randn(4, 8) * 3
-    assert torch.isfinite(act(x)).all()
-
-
-def test_smooth_gradient_flows_to_input_and_params() -> None:
-    act = SmoothPWAct(num_anchors=4, temperature=0.5)
-    x = torch.randn(2, 3, requires_grad=True)
-    loss = act(x).sum()
-    loss.backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
-    assert not torch.isnan(x.grad).any()
-    assert act.x_cords.grad is not None and torch.isfinite(act.x_cords.grad).all()
-    assert act.y_cords.grad is not None and torch.isfinite(act.y_cords.grad).all()
-
-
-def test_smooth_gradient_finite_at_knot() -> None:
-    """Squared distance is C1 smooth at x == x_cord (abs would cusp)."""
-    act = SmoothPWAct(num_anchors=4, temperature=0.5)
-    knot = act.x_cords[1].item()
-    x = torch.tensor([[knot]], requires_grad=True)
-    out = act(x).sum()
-    out.backward()
-    assert x.grad is not None and torch.isfinite(x.grad).all()
-    eps = 1e-4
-    x_lo = torch.tensor([[knot - eps]])
-    x_hi = torch.tensor([[knot + eps]])
-    assert torch.isfinite(act(x_lo)).all() and torch.isfinite(act(x_hi)).all()
-    grad_lo = torch.autograd.grad(act(x_lo).sum(), act.x_cords, retain_graph=True)[0]
-    assert torch.isfinite(grad_lo).all()
-
-
-def test_smooth_temperature_controls_sharpness() -> None:
-    """Small temperature -> near nearest-neighbor; large -> blended average."""
-    torch.manual_seed(0)
-    sharp = SmoothPWAct(num_anchors=8, temperature=1e-3)
-    smooth = SmoothPWAct(num_anchors=8, temperature=10.0)
-    # copy cords so only temperature differs
-    with torch.no_grad():
-        smooth.x_cords.copy_(sharp.x_cords)
-        smooth.y_cords.copy_(sharp.y_cords)
-    # point exactly at a cord should map near that y value when sharp
-    cord_x = sharp.x_cords[3].item()
-    cord_y = sharp.y_cords[3].item()
-    x = torch.tensor([[cord_x]])
-    out_sharp = sharp(x).item()
-    out_smooth = smooth(x).item()
-    assert abs(out_sharp - cord_y) < 0.05
-    # smooth is pulled toward mean of y_cords
-    y_mean = sharp.y_cords.mean().item()
-    assert abs(out_smooth - y_mean) < abs(out_sharp - y_mean)
-
-
-def test_smooth_invalid_num_anchors_raises() -> None:
-    with pytest.raises(ValueError, match="num_anchors"):
-        SmoothPWAct(num_anchors=1, temperature=0.5)
-    with pytest.raises(ValueError, match="num_anchors"):
-        SmoothPWAct(num_anchors=0, temperature=0.5)
-
-
-def test_smooth_invalid_temperature_raises() -> None:
-    with pytest.raises(ValueError, match="temperature"):
-        SmoothPWAct(num_anchors=4, temperature=0)
-    with pytest.raises(ValueError, match="temperature"):
-        SmoothPWAct(num_anchors=4, temperature=-1)
-
-
-def test_smooth_params_are_learnable() -> None:
-    act = SmoothPWAct(num_anchors=6, temperature=0.5)
-    assert isinstance(act.x_cords, torch.nn.Parameter)
-    assert isinstance(act.y_cords, torch.nn.Parameter)
-    assert act.x_cords.requires_grad and act.y_cords.requires_grad
-    assert act.x_cords.shape == (6,) and act.y_cords.shape == (6,)
-
-
-def test_smooth_cords_initialized_linspace() -> None:
-    act = SmoothPWAct(num_anchors=4, temperature=0.5)
-    torch.testing.assert_close(act.x_cords, torch.linspace(-2, 2, 4))
-    torch.testing.assert_close(act.y_cords, torch.linspace(-2, 2, 4))
-
-
-def test_smooth_preserves_input_dtype() -> None:
-    act = SmoothPWAct(num_anchors=4).half()
-    out = act(torch.randn(2, 3, dtype=torch.float16))
-    assert out.dtype == torch.float16
-
-
 # ── spatial_softmax ──────────────────────────────────────────────────────────
 
 
@@ -402,97 +320,3 @@ def test_spatial_softmax_rejects_unsupported_rank() -> None:
 def test_spatial_softmax_preserves_input_dtype() -> None:
     out = spatial_softmax(torch.randn(2, 3, 4, 5, dtype=torch.float16))
     assert out.dtype == torch.float16
-
-
-# ── StrictLearnableGrid ──────────────────────────────────────────────────────
-
-
-def test_grid_has_fixed_endpoints_and_minimum_spacing() -> None:
-    grid = StrictLearnableGrid(n_points=5, low=-2, high=3, min_spacing=0.5)
-    points = grid()
-    torch.testing.assert_close(points[[0, -1]], torch.tensor([-2.0, 3.0]))
-    assert torch.all(points[1:] - points[:-1] >= 0.5)
-    assert torch.all(points[1:] > points[:-1])
-
-
-@pytest.mark.parametrize(
-    "kwargs, message",
-    [
-        ({"n_points": 1, "low": 0, "high": 1, "min_spacing": 0}, "n_points"),
-        ({"n_points": 3, "low": 1, "high": 1, "min_spacing": 0}, "high"),
-        ({"n_points": 3, "low": 0, "high": 1, "min_spacing": -1}, "non-negative"),
-        ({"n_points": 3, "low": 0, "high": 1, "min_spacing": 1}, "too large"),
-    ],
-)
-def test_grid_rejects_invalid_configuration(kwargs: dict[str, float | int], message: str) -> None:
-    with pytest.raises(ValueError, match=message):
-        StrictLearnableGrid(**cast(Any, kwargs))
-
-
-# ── PWInterpolationAct behavior ─────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("monotonic", [True, False])
-def test_piecewise_clamps_outside_domain_and_hits_endpoints(monotonic: bool) -> None:
-    act = PWInterpolationAct(num_anchors=4, monotonic=monotonic)
-    x = torch.tensor([[-100.0, -2.0, 2.0, 100.0]])
-    out = act(x)
-    torch.testing.assert_close(out[0, 0], out[0, 1])
-    torch.testing.assert_close(out[0, 2], out[0, 3])
-
-
-def test_piecewise_rejects_non_matrix_input() -> None:
-    out = PWInterpolationAct()(torch.randn(2, 3, 4))
-    assert out.shape == (2, 3, 4)
-
-
-@pytest.mark.parametrize("monotonic", [True, False])
-def test_piecewise_preserves_arbitrary_shape_and_dtype(monotonic: bool) -> None:
-    act = PWInterpolationAct(num_anchors=4, monotonic=monotonic).half()
-    x = torch.randn(2, 3, 4, dtype=torch.float16)
-    out = act(x)
-    assert out.shape == x.shape
-    assert out.dtype == x.dtype
-
-
-@pytest.mark.parametrize(
-    "kwargs, message",
-    [
-        ({"num_anchors": 1}, "num_anchors"),
-        ({"min_range": 1, "max_range": 1}, "max_range"),
-        ({"min_spacing": -1}, "non-negative"),
-        ({"num_anchors": 3, "min_spacing": 2.1}, "too large"),
-    ],
-)
-def test_piecewise_rejects_invalid_configuration(
-    kwargs: dict[str, float | int], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        PWInterpolationAct(**cast(Any, kwargs))
-
-
-# ── PWInterpolationAct ───────────────────────────────────────────────────────
-
-
-def test_piecewise_monotonic_mode_registers_only_grid_parameters() -> None:
-    act = PWInterpolationAct(num_anchors=4, monotonic=True)
-
-    assert act.y_cords_gen is not None
-    assert act.y_cords is None
-    assert [name for name, _ in act.named_parameters()] == [
-        "x_cords_gen.raw",
-        "y_cords_gen.raw",
-    ]
-    assert act(torch.randn(2, 3)).shape == (2, 3)
-
-
-def test_piecewise_non_monotonic_mode_registers_unconstrained_y_parameter() -> None:
-    act = PWInterpolationAct(num_anchors=4, monotonic=False)
-
-    assert act.y_cords_gen is None
-    assert isinstance(act.y_cords, torch.nn.Parameter)
-    assert {name for name, _ in act.named_parameters()} == {
-        "x_cords_gen.raw",
-        "y_cords",
-    }
-    assert act(torch.randn(2, 3)).shape == (2, 3)

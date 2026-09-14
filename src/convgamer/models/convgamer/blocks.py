@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import einops
 import torch
 import torch.nn as nn
@@ -13,7 +11,8 @@ class CausalConv3d(nn.Module):
     """3D convolution causal in T, symmetric in H/W.
 
     Temporal causality via left-only padding on depth (T) dimension.
-    Spatial dims padded symmetrically to preserve H/W with stride 1.
+    Spatial dims are padded symmetrically for odd kernels. Even spatial kernels
+    use one extra pixel on the right/bottom to preserve the output shape.
     """
 
     def __init__(
@@ -69,16 +68,64 @@ class CausalConv3d(nn.Module):
         return self.conv(x)
 
 
-class CausalGroupNorm(nn.GroupNorm):
-    """GroupNorm applied per-frame to preserve temporal causality."""
+class CausalLayerNorm(nn.LayerNorm):
+    """Channel LayerNorm applied per location to preserve temporal causality."""
+
+    def __init__(self, num_channels: int) -> None:
+        super().__init__(num_channels)
+        self.num_channels = num_channels
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
         if input.ndim == 5:
-            b, _c, t, _h, _w = input.shape
-            x = einops.rearrange(input, "b c t h w -> (b t) c h w")
-            x = super().forward(x)
-            return einops.rearrange(x, "(b t) c h w -> b c t h w", b=b, t=t)
-        return super().forward(input)
+            b, _c, t, h, w = input.shape
+            y = einops.rearrange(input, "b c t h w -> (b t h w) c")
+            y = super().forward(y)
+            return einops.rearrange(y, "(b t h w) c -> b c t h w", b=b, t=t, h=h, w=w)
+        if input.ndim == 4:
+            b, _c, h, w = input.shape
+            y = einops.rearrange(input, "b c h w -> (b h w) c")
+            y = super().forward(y)
+            return einops.rearrange(y, "(b h w) c -> b c h w", b=b, h=h, w=w)
+        raise ValueError(f"Expected 4D (B,C,H,W) or 5D (B,C,T,H,W), got {input.ndim}D")
+
+
+class CausalTemporalMixer(nn.Module):
+    """Dilated causal TCN over frame vectors (B, F, T).
+
+    Stacks ``CausalConv3d(kernel=(3, 1, 1))`` layers with dilations
+    ``(1, 2, 4)`` by default: receptive field 15 subsampled frames with
+    3 layers instead of 3 frames for a single conv. Each layer is
+    residual (``x + GELU(conv(x))``); all ops are pointwise or causal,
+    so no future frame leaks into the past.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        dilations: tuple[int, ...] = (1, 2, 4),
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.dilations = dilations
+        self.receptive_field = 1 + sum(d * (kernel_size - 1) for d in dilations)
+        self.layers = nn.ModuleList(
+            [
+                CausalConv3d(
+                    in_channels=channels,
+                    out_channels=channels,
+                    kernel_size=(kernel_size, 1, 1),
+                    dilation=(d, 1, 1),
+                )
+                for d in dilations
+            ]
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for conv in self.layers:
+            x = x + self.act(conv(x))
+        return x
 
 
 def uniform_temporal_subsample(
@@ -105,14 +152,15 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        intermediate_channels: int = 255,  # 255=85*3 divisible by in_channels=3
-        out_factor: int = 8,
-        kernel_size: tuple[int, int, int] | int = (7, 7, 2),
-        target_size: tuple[int, int] | int = (64, 64),
+        intermediate_channels: int | None = None,
+        out_factor: int = 2,
+        kernel_size: tuple[int, int, int] | int = (7, 7, 3),
+        target_size: tuple[int, int] | int | None = None,
+        max_spatial_size: int = 64,
         temporal_reduction_factor: int = 2,
         interpolation_mode: v2.InterpolationMode = v2.InterpolationMode.BILINEAR,
         depthwise: bool = True,
-        concat_original: bool = True,
+        concat_original: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -120,24 +168,28 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         self.kernel_size = kernel_size
         self.depthwise = depthwise
         self.concat_original = concat_original
+        if intermediate_channels is None:
+            intermediate_channels = in_channels * 85
         self.intermediate_channels = intermediate_channels
         self.temporal_reduction_factor = temporal_reduction_factor
         self.interpolation_mode = interpolation_mode
+        self.max_spatial_size = max_spatial_size
 
         if temporal_reduction_factor <= 0:
             raise ValueError(
                 f"temporal_reduction_factor must be positive, got {temporal_reduction_factor}"
             )
 
-        # Normalize target_size to a tuple of ints for spatial dims
-        self.target_size: tuple[int, int] = (
-            (target_size, target_size) if isinstance(target_size, int) else target_size
-        )
+        if target_size is None:
+            self.target_size: tuple[int, int] | None = None
+        else:
+            self.target_size = (
+                (target_size, target_size) if isinstance(target_size, int) else target_size
+            )
 
         # Compute output channels
         base_channels = in_channels * out_factor
-        norm_channels = base_channels + (in_channels if concat_original else 0)
-        self.out_channels = base_channels
+        self.out_channels = base_channels + (in_channels if concat_original else 0)
 
         if depthwise and intermediate_channels % in_channels != 0:
             raise ValueError(
@@ -158,19 +210,28 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
             v2.InterpolationMode.BILINEAR,
             v2.InterpolationMode.BICUBIC,
         )
-        self.downsample_x_down = v2.Resize(
-            size=self.target_size, antialias=antialias, interpolation=self.interpolation_mode
-        )
+        self._antialias = antialias
 
         self.out_correction_conv = CausalConv3d(
             in_channels=intermediate_channels,
-            out_channels=self.out_channels,
+            out_channels=base_channels,
             kernel_size=1,
         )
 
-        self.norm = CausalGroupNorm(
-            num_groups=norm_channels // in_channels, num_channels=norm_channels
-        )
+        self.norm = CausalLayerNorm(self.out_channels)
+
+    def _resolve_spatial_size(self, h: int, w: int) -> tuple[int, int]:
+        if self.target_size is not None:
+            return self.target_size
+        scale = min(1.0, self.max_spatial_size / max(h, w))
+        return (max(1, round(h * scale)), max(1, round(w * scale)))
+
+    def _resize_for_test(self, x_down: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        return v2.Resize(
+            size=size,
+            antialias=self._antialias,
+            interpolation=self.interpolation_mode,
+        )(x_down)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W)
@@ -182,13 +243,15 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         T = x.shape[2]
         # Clamp target_t to be at least 1 and at most T (if temporal_reduction_factor < 1)
         target_t = max(1, min(T, T // self.temporal_reduction_factor))
-        h_out, w_out = self.target_size
+        h_out, w_out = self._resolve_spatial_size(x.shape[3], x.shape[4])
 
-        # Spatial downsampling
-        x_down = x
-        x_down = einops.rearrange(x_down, "b c t h w -> b t c h w")  # (B, T, C, H, W)
-        x_down = self.downsample_x_down(x_down)
-        x_down = einops.rearrange(x_down, "b t c h w -> b c t h w")  # (B, C, T, H, W)
+        # Spatial downsampling (relative mode never upsamples; explicit target wins)
+        if (h_out, w_out) == (x.shape[3], x.shape[4]):
+            x_down = x
+        else:
+            x_down = einops.rearrange(x, "b c t h w -> b t c h w")
+            x_down = self._resize_for_test(x_down, (h_out, w_out))
+            x_down = einops.rearrange(x_down, "b t c h w -> b c t h w")
 
         # Temporal downsampling
         x_down = uniform_temporal_subsample(
@@ -202,10 +265,10 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         # full-resolution spatial and temporal information.
         correct = self.correction_conv(x)
         correct = self.act(correct)
-        correct = F.adaptive_avg_pool3d(
-            correct,
-            output_size=(target_t, h_out, w_out),
-        )
+        correct = einops.rearrange(correct, "b c t h w -> (b t) c h w")
+        correct = F.adaptive_avg_pool2d(correct, output_size=(h_out, w_out))
+        correct = einops.rearrange(correct, "(b t) c h w -> b c t h w", b=x.shape[0], t=T)
+        correct = uniform_temporal_subsample(correct, num_samples=target_t, temporal_dim=-3)
         correct = self.out_correction_conv(correct)  # (B, C*out_factor, target_t, H, W)
 
         # Combine
@@ -243,15 +306,17 @@ def spatial_softmax(x: torch.Tensor) -> torch.Tensor:
 class ConvGamerStem(nn.Module):
     """Multi-scale 3D convolution stem.
 
-    Input: (B, C, T, H, W) -> Output: (B, 8*C, T, H, W) by default.
+    Input: (B, C, T, H, W) -> Output: (B, 4*C, T, H, W) by default.
 
     Three parallel branches (1x1x1 local, 3x3x3 near, 7x7x7 grouped far)
     are concatenated, fused with a 1x1x1 conv, then concatenated with the
     residual input and normalized. Resolution is preserved; downsampling is
-    expected to happen before this module.
+    expected to happen before this module. ``use_softmax`` doubles the
+    output (raw + spatial distribution) and is off by default: enable only
+    as an explicit ablation.
     """
 
-    def __init__(self, in_channels: int = 24, use_softmax: bool = True, use_norm=False) -> None:
+    def __init__(self, in_channels: int = 24, use_softmax: bool = False, use_norm=False) -> None:
         super().__init__()
         branch_channels = in_channels * 2
         fused_channels = in_channels * 3
@@ -283,11 +348,7 @@ class ConvGamerStem(nn.Module):
             out_channels=fused_channels,
             kernel_size=1,
         )
-        self.norm = (
-            CausalGroupNorm(num_groups=4, num_channels=self.out_channels)
-            if use_norm
-            else nn.Identity()
-        )
+        self.norm = CausalLayerNorm(self.out_channels) if use_norm else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W)
@@ -307,199 +368,3 @@ class ConvGamerStem(nn.Module):
             x = torch.cat((x, spatial_softmax(x)), dim=1)
 
         return self.norm(x)
-
-
-class SmoothPWAct(nn.Module):
-    """Smooth piecewise activation via Gaussian kernel.
-
-    For each value in the input tensor:
-    1. Compute squared distance to each x_cord.
-    2. Convert to weights with ``softmax(-sq_dist / temperature)``
-
-    3. Weighted sum of y_cords.
-    4. Return tensor with same shape as input. Works for arbitrary input shapes.
-    """
-
-    def __init__(self, num_anchors: int = 16, temperature: float = 0.1) -> None:
-        super().__init__()
-        self.num_anchors = num_anchors
-        self.temperature = temperature
-
-        if num_anchors <= 1:
-            raise ValueError("num_anchors must be > 1.")
-
-        if temperature <= 0:
-            raise ValueError("temperature must be positive.")
-
-        self.y_cords = nn.Parameter(torch.linspace(-2, 2, num_anchors))
-        self.x_cords = nn.Parameter(torch.linspace(-2, 2, num_anchors))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape contract: (B, C), which is a 1d vector but allows Batching.
-        # Use squared distance for C1 smoothness; broadcasting handles arbitrary x.shape.
-        x_cords = self.x_cords.to(dtype=x.dtype)
-        y_cords = self.y_cords.to(dtype=x.dtype)
-        sq_distances = (x.unsqueeze(-1) - x_cords).pow(2)
-        weights = F.softmax(-sq_distances / self.temperature, dim=-1)
-        out = torch.sum(weights * y_cords, dim=-1)
-        return out.reshape(x.shape)
-
-
-class StrictLearnableGrid(nn.Module):
-    def __init__(
-        self,
-        n_points: int,
-        low: float,
-        high: float,
-        min_spacing: float,
-    ) -> None:
-        super().__init__()
-
-        if n_points < 2:
-            raise ValueError("n_points must be at least 2")
-
-        if not (math.isfinite(low) and math.isfinite(high) and math.isfinite(min_spacing)):
-            raise ValueError("low, high, and min_spacing must be finite")
-
-        if high <= low:
-            raise ValueError("high must be greater than low")
-
-        if min_spacing < 0:
-            raise ValueError("min_spacing must be non-negative")
-
-        intervals = n_points - 1
-        domain_length = high - low
-        available = domain_length - intervals * min_spacing
-
-        if available < 0:
-            raise ValueError("min_spacing is too large for this interval")
-
-        self.n_points = n_points
-        self.intervals = intervals
-        self.low = low
-        self.high = high
-        self.min_spacing = min_spacing
-        self.available = available
-
-        self.raw = nn.Parameter(torch.zeros(intervals))
-
-    def forward(self) -> torch.Tensor:
-        weights = torch.softmax(self.raw, dim=0)
-        gaps = self.min_spacing + self.available * weights
-
-        origin = torch.zeros_like(gaps[:1])
-        positions = torch.cat([origin, torch.cumsum(gaps, dim=0)])
-
-        return positions + self.low
-
-
-class PWInterpolationAct(nn.Module):
-    """Learnable piecewise-linear interpolation activation.
-
-    The module defines a function through learnable monotonic knots:
-
-        (x_cords[0], y_cords[0]), ..., (x_cords[N - 1], y_cords[N - 1])
-
-    Inputs of any shape are interpolated elementwise. Inputs outside
-    [min_range, max_range] are clamped to endpoint values.
-    """
-
-    def __init__(
-        self,
-        num_anchors: int = 16,
-        min_range: float = -2.0,
-        max_range: float = 2.0,
-        min_spacing: float = 0.1,
-        monotonic: bool = True,
-    ) -> None:
-        super().__init__()
-
-        if num_anchors < 2:
-            raise ValueError("num_anchors must be at least 2")
-
-        if max_range <= min_range:
-            raise ValueError("max_range must be greater than min_range")
-
-        if min_spacing < 0:
-            raise ValueError("min_spacing must be non-negative")
-
-        if (num_anchors - 1) * min_spacing > max_range - min_range:
-            raise ValueError("min_spacing is too large for the selected range")
-
-        self.num_anchors = num_anchors
-        self.min_range = min_range
-        self.max_range = max_range
-        self.monotonic = monotonic
-
-        self.x_cords_gen = StrictLearnableGrid(
-            n_points=num_anchors,
-            low=min_range,
-            high=max_range,
-            min_spacing=min_spacing,
-        )
-
-        self.y_cords_gen: StrictLearnableGrid | None
-        self.y_cords: nn.Parameter | None
-        if monotonic:
-            self.y_cords_gen = StrictLearnableGrid(
-                n_points=num_anchors,
-                low=min_range,
-                high=max_range,
-                min_spacing=min_spacing,
-            )
-            self.y_cords = None
-        else:
-            self.y_cords_gen = None
-            self.y_cords = nn.Parameter(torch.linspace(min_range, max_range, num_anchors))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        original_shape = x.shape
-        x_query = x.reshape(-1)
-
-        x_cords = self.x_cords_gen().to(dtype=x.dtype)
-        if self.monotonic:
-            y_cords_gen = self.y_cords_gen
-            # It is impossible for it to be None at this point,
-            # but pyrefly yells at me if I dont check for it
-            if y_cords_gen is None:
-                raise RuntimeError("monotonic mode requires y_cords_gen")
-            y_cords = y_cords_gen().to(dtype=x.dtype)
-        else:
-            y_cords = self.y_cords
-            # It is impossible for it to be None at this point,
-            # but pyrefly yells at me if I dont check for it
-            if y_cords is None:
-                raise RuntimeError("non-monotonic mode requires y_cords")
-            y_cords = y_cords.to(dtype=x.dtype)
-
-        # Outside-domain behavior: constant endpoint extrapolation.
-        x_query = x_query.clamp(
-            min=x_cords[0],
-            max=x_cords[-1],
-        )
-
-        # index satisfies:
-        # x_cords[index - 1] <= x_query < x_cords[index]
-        right = torch.searchsorted(
-            x_cords,
-            x_query,
-            right=True,
-        )
-
-        # Convert insertion position into the left interval index.
-        left = (right - 1).clamp(
-            min=0,
-            max=self.num_anchors - 2,
-        )
-        right = left + 1
-
-        x_left = x_cords[left]
-        x_right = x_cords[right]
-
-        y_left = y_cords[left]
-        y_right = y_cords[right]
-
-        denominator = x_right - x_left
-        weight = (x_query - x_left) / denominator
-
-        return torch.lerp(y_left, y_right, weight).reshape(original_shape)
