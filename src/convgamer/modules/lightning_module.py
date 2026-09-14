@@ -15,7 +15,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
-from convgamer.models.inception_next import Encoder
+from convgamer.models.inception_next import InceptionNeXtEncoder
 
 
 class InceptionNeXtModule(pl.LightningModule):
@@ -40,7 +40,7 @@ class InceptionNeXtModule(pl.LightningModule):
             OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
         )  # type: ignore[arg-type]
         self.save_hyperparameters(container)
-        self.model = Encoder(
+        self.model = InceptionNeXtEncoder(
             input_dim=cfg.model.input_dim,
             hidden_dim=cfg.model.hidden_dim,
             num_layers=cfg.model.num_layers,

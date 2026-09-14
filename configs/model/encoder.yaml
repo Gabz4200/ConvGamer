@@ -1,9 +1,0 @@
-target: convgamer.models.inception_next.encoder.Encoder
-
-# InceptionNeXt (arXiv:2303.16900) §3.3
-input_dim: 3
-hidden_dim: 96  # matches paper Table 3: Tiny/Small use 96
-num_layers: [3, 3, 9, 3]  # paper §3.3: Tiny/Small stage layout
-num_classes: 10
-layer_scale_init: 1.0e-6  # paper §3.3: LayerScale init
-mlp_ratios: [4, 4, 4, 3]  # paper §3.3: MLP ratio 4 in stages 1–3, 3 in stage 4

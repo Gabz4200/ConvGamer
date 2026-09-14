@@ -17,7 +17,7 @@ class ConvGamerModel(PreTrainedModel):
     def __init__(self, config: ConvGamerConfig):
         super().__init__(config)
         self.native = get_model(
-            "encoder",
+            "InceptionNeXtEncoder",
             input_dim=config.input_dim,
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,

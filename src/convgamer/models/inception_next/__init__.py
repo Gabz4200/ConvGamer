@@ -5,10 +5,10 @@ this package from above — never the reverse.
 """
 
 from .blocks import InceptionDWConv2d, InceptionNeXtBlock
-from .encoder import Encoder
+from .encoder import InceptionNeXtEncoder
 
 __all__ = [
-    "Encoder",
+    "InceptionNeXtEncoder",
     "InceptionDWConv2d",
     "InceptionNeXtBlock",
 ]
