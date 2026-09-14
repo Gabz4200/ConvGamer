@@ -47,3 +47,26 @@ def test_video_module_optimizer_builds() -> None:
     m = ConvGamerModel(_video_cfg())
     opt = m.configure_optimizers()
     assert isinstance(opt, torch.optim.AdamW)
+
+
+def test_video_temporal_mix_operates_on_spatial_maps() -> None:
+    """TCN must see (B,F,T,H,W) maps, not head logits: mix input has H,W > 1."""
+    from convgamer.models import ConvGamerEncoder
+
+    enc = ConvGamerEncoder(
+        input_dim=3, hidden_dim=8, num_layers=1, num_classes=4, temporal_dilations=(1,)
+    )
+    enc.eval()
+    seen: dict = {}
+    orig = enc.temporal_mix.forward
+
+    def spy(x: torch.Tensor) -> torch.Tensor:
+        seen["shape"] = tuple(x.shape)
+        return orig(x)
+
+    enc.temporal_mix.forward = spy  # type: ignore[method-assign]
+    with torch.no_grad():
+        enc(torch.randn(1, 3, 4, 32, 32))
+    b, f, t, h, w = seen["shape"]
+    assert (b, f, t) == (1, enc.frame_encoder.feature_dim, 2)
+    assert (h, w) == (8, 8)

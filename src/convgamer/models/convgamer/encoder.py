@@ -23,7 +23,12 @@ from convgamer.models.registry import register_model
 
 @register_model("ConvGamerEncoder")
 class ConvGamerEncoder(BaseModel):
-    """Video encoder: downsampler stem, per-frame InceptionNeXt, causal temporal mix."""
+    """Video encoder: downsampler stem, per-frame maps, causal temporal mix.
+
+    Per-frame path uses ``forward_feature_map`` (spatial maps, never the
+    classification head): maps are stacked to (B, F, T, H, W), mixed
+    causally across T at full resolution, then spatially pooled.
+    """
 
     def __init__(
         self,
@@ -69,9 +74,11 @@ class ConvGamerEncoder(BaseModel):
         x = self.stem(x)
         b, _c, t, _h, _w = x.shape
         frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
-        feats = self.frame_encoder.forward_features(frames)
-        video = einops.rearrange(feats, "(b t) f -> b f t 1 1", b=b, t=t)
-        return self.temporal_mix(video).squeeze(-1).squeeze(-1)
+        maps = self.frame_encoder.forward_feature_map(frames)
+        _, _, h, w = maps.shape
+        video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
+        mixed = self.temporal_mix(video)
+        return mixed.mean(dim=[3, 4])
 
     def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         """Encode video to logits, causally pooled over past frames only."""

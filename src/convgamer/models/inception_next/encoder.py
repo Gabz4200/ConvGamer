@@ -111,13 +111,15 @@ class InceptionNeXtEncoder(BaseModel):
         return x.transpose(1, 2).reshape(b, c, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._stem_forward(x)
-        x = self.stages(x)
+        x = self.forward_feature_map(x)
         x = x.mean(dim=[2, 3])
         return self.head(x)
 
+    def forward_feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatial feature map (B, F, H', W'); no pooling, no head."""
+        x = self._stem_forward(x)
+        return self.stages(x)
+
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Spatially pooled frame features (B, F); resolution collapsed by mean."""
-        x = self._stem_forward(x)
-        x = self.stages(x)
-        return x.mean(dim=[2, 3])
+        return self.forward_feature_map(x).mean(dim=[2, 3])
