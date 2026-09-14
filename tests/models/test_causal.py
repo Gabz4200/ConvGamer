@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from convgamer.models.convgamer.blocks import (
     CausalConv3d,
-    CausalGroupNorm,
+    CausalLayerNorm,
     ConvGamerStem,
     LearnedSpatialTemporalDownsampler,
 )
@@ -106,59 +106,52 @@ def test_causal_conv_gradient_flows() -> None:
     assert m.weight.grad is not None and torch.isfinite(m.weight.grad).all()
 
 
-# ── CausalGroupNorm ─────────────────────────────────────────────────────────
+# ── CausalLayerNorm ─────────────────────────────────────────────────────────
 
 
-def test_causal_groupnorm_preserves_shape_5d() -> None:
-    m = CausalGroupNorm(num_groups=2, num_channels=4)
+def test_causal_layernorm_preserves_shape_5d() -> None:
+    m = CausalLayerNorm(4)
     x = torch.randn(2, 4, 3, 4, 4)
     assert m(x).shape == x.shape
 
 
-def test_causal_groupnorm_4d_fallback_behaves_like_gn() -> None:
+def test_causal_layernorm_matches_per_location_layernorm() -> None:
     torch.manual_seed(0)
-    g = nn.GroupNorm(2, 4)
-    c = CausalGroupNorm(2, 4)
-    c.load_state_dict(g.state_dict())
+    c = CausalLayerNorm(4)
     x = torch.randn(2, 4, 4, 4)
-    torch.testing.assert_close(c(x), g(x))
+    ref = nn.LayerNorm(4)(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+    torch.testing.assert_close(c(x), ref, rtol=1e-4, atol=1e-5)
 
 
-def test_causal_groupnorm_temporal_causality() -> None:
-    m = CausalGroupNorm(num_groups=2, num_channels=4)
+def test_causal_layernorm_temporal_causality() -> None:
+    m = CausalLayerNorm(4)
     _assert_causal(m, (1, 4, 6, 4, 4), perturb_from=3)
 
 
-def test_causal_groupnorm_future_perturb_does_not_affect_past_vs_vanilla_leaks() -> None:
-    # vanilla GroupNorm leaks across T; causal does not
+def test_causal_layernorm_spatial_location_does_not_leak() -> None:
     torch.manual_seed(1)
-    gn = nn.GroupNorm(2, 4)
-    cg = CausalGroupNorm(2, 4)
-    cg.load_state_dict(gn.state_dict())
+    m = CausalLayerNorm(4)
     x1 = torch.randn(1, 4, 4, 4, 4)
     x2 = x1.clone()
     x2[:, :, 2:, :, :] += 5.0
+    m.eval()
     with torch.no_grad():
-        y_gn1, y_gn2 = gn(x1), gn(x2)
-        y_cg1, y_cg2 = cg(x1), cg(x2)
-    # vanilla leaks: past differs
-    assert (y_gn1[:, :, 0] - y_gn2[:, :, 0]).abs().max() > 1e-3
-    # causal preserves past
-    torch.testing.assert_close(y_cg1[:, :, 0], y_cg2[:, :, 0])
+        y1, y2 = m(x1), m(x2)
+    torch.testing.assert_close(y1[:, :, 0], y2[:, :, 0])
 
 
-def test_causal_groupnorm_state_dict_roundtrip() -> None:
-    m = CausalGroupNorm(2, 4)
+def test_causal_layernorm_state_dict_roundtrip() -> None:
+    m = CausalLayerNorm(4)
     sd = m.state_dict()
     assert "weight" in sd and "bias" in sd
-    m2 = CausalGroupNorm(2, 4)
+    m2 = CausalLayerNorm(4)
     m2.load_state_dict(sd)
     x = torch.randn(1, 4, 2, 4, 4)
     torch.testing.assert_close(m(x), m2(x))
 
 
-def test_causal_groupnorm_gradient_flows() -> None:
-    m = CausalGroupNorm(2, 4)
+def test_causal_layernorm_gradient_flows() -> None:
+    m = CausalLayerNorm(4)
     x = torch.randn(1, 4, 2, 3, 3, requires_grad=True)
     m(x).sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
