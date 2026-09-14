@@ -96,7 +96,8 @@ class CausalTemporalMixer(nn.Module):
     ``(1, 2, 4)`` by default: receptive field 15 subsampled frames with
     3 layers instead of 3 frames for a single conv. Each layer is
     residual (``x + GELU(conv(x))``); all ops are pointwise or causal,
-    so no future frame leaks into the past.
+    so no future frame leaks into the past. Residuals are unnormalized:
+    fine at the default depth, add a per-layer norm past ~6 layers.
     """
 
     def __init__(
@@ -131,23 +132,33 @@ class CausalTemporalMixer(nn.Module):
 def uniform_temporal_subsample(
     x: torch.Tensor, num_samples: int, temporal_dim: int = -3
 ) -> torch.Tensor:
-    """Equispaced nearest-neighbour temporal subsampling."""
+    """Strided causal temporal subsampling for the streaming contract.
 
+    Takes every ``step``-th frame starting at index 0, where
+    ``step = max(1, T // num_samples)``. Online-safe: output frame ``i``
+    depends only on input frames ``<= i * step``, so prefixes can be
+    emitted without seeing the full clip. The last output frame is the
+    latest frame at or before ``(num_samples - 1) * step``, which may be
+    earlier than ``T - 1`` when ``T`` is not a multiple of ``step``.
+    """
     t = x.shape[temporal_dim]
     if num_samples <= 0:
         raise ValueError(f"num_samples must be > 0, got {num_samples}")
     if t <= 0:
         raise ValueError(f"temporal dim size must be > 0, got {t}")
 
-    # Use .round() for true nearest-neighbor.
-    indices = torch.linspace(0, t - 1, num_samples, device=x.device, dtype=torch.float32)
-    indices = indices.round().long()
-
+    step = max(1, t // num_samples)
+    indices = torch.arange(0, t, step, device=x.device)[:num_samples]
     return torch.index_select(x, temporal_dim, indices)
 
 
 class LearnedSpatialTemporalDownsampler(nn.Module):
-    """Learned spatial-temporal downsampler with residual correction."""
+    """Learned spatial-temporal downsampler with residual correction.
+
+    Streaming contract: temporal subsampling is strided from frame 0, so
+    output frame ``i`` depends only on input frames ``<= i * step``.
+    Prefixes can be emitted online without seeing the full clip.
+    """
 
     def __init__(
         self,
@@ -169,6 +180,8 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         self.depthwise = depthwise
         self.concat_original = concat_original
         if intermediate_channels is None:
+            # 85x oversampling keeps the depthwise correction branch expressive
+            # while staying divisible by in_channels for any input_dim.
             intermediate_channels = in_channels * 85
         self.intermediate_channels = intermediate_channels
         self.temporal_reduction_factor = temporal_reduction_factor
@@ -179,6 +192,10 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
             raise ValueError(
                 f"temporal_reduction_factor must be positive, got {temporal_reduction_factor}"
             )
+        if out_factor <= 0:
+            raise ValueError(f"out_factor must be positive, got {out_factor}")
+        if max_spatial_size <= 0:
+            raise ValueError(f"max_spatial_size must be positive, got {max_spatial_size}")
 
         if target_size is None:
             self.target_size: tuple[int, int] | None = None
@@ -226,7 +243,7 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         scale = min(1.0, self.max_spatial_size / max(h, w))
         return (max(1, round(h * scale)), max(1, round(w * scale)))
 
-    def _resize_for_test(self, x_down: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    def _resize_spatial(self, x_down: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
         return v2.Resize(
             size=size,
             antialias=self._antialias,
@@ -250,7 +267,7 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
             x_down = x
         else:
             x_down = einops.rearrange(x, "b c t h w -> b t c h w")
-            x_down = self._resize_for_test(x_down, (h_out, w_out))
+            x_down = self._resize_spatial(x_down, (h_out, w_out))
             x_down = einops.rearrange(x_down, "b t c h w -> b c t h w")
 
         # Temporal downsampling
@@ -285,11 +302,11 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
 def spatial_softmax(x: torch.Tensor) -> torch.Tensor:
     """Applies softmax over (H, W) independently for every channel.
 
-    Supports (B, C, H, W) and (B, T, C, H, W) tensors with any channel count.
-    Cross-frame channels do not communicate; each (b, t, c) slice gets its own spatial softmax.
+    Supports (B, C, H, W) and (B, C, T, H, W) tensors with any channel count.
+    H and W are always the trailing dims; other leading dims never mix.
     """
     if x.ndim not in (4, 5):
-        raise ValueError(f"Expected 4D (B,C,H,W) or 5D (B,T,C,H,W), got {x.ndim}D")
+        raise ValueError(f"Expected 4D (B,C,H,W) or 5D (B,C,T,H,W), got {x.ndim}D")
 
     # Flatten only the last two spatial dimensions (H, W) -> (..., H*W)
     # For 4D: (B, C, H, W) -> (B, C, H*W)

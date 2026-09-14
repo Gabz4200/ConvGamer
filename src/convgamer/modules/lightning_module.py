@@ -1,11 +1,8 @@
 """Lightning modules for InceptionNeXt (arXiv:2303.16900) and ConvGamer.
 
-``InceptionNeXtModule`` is the pure training module — it imports the
-InceptionNeXt backbone directly from ``convgamer.models.inception_next`` and
-knows nothing about ConvGamer-specific geometry ops.
-
-``ConvGamerModel`` extends it to wire in the ConvGamer geometry-op backend
-(via ``cfg.ops.backend``) in later stages.
+``InceptionNeXtModule`` trains the 2D image backbone on (B, C, H, W).
+``ConvGamerModel`` trains the causal video encoder on (B, C, T, H, W).
+Standalone classes: the video model is not a subclass of the image module.
 """
 
 from __future__ import annotations
@@ -15,7 +12,24 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
+from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.inception_next import InceptionNeXtEncoder
+
+
+def _optimizer_from_cfg(parameters, cfg) -> torch.optim.AdamW:
+    opt = cfg.optimizer if isinstance(cfg, DictConfig) else cfg["optimizer"]
+    if not isinstance(opt, DictConfig):
+        assert isinstance(opt, dict)
+        return torch.optim.AdamW(parameters, lr=opt["lr"], weight_decay=opt["weight_decay"])
+    opt = OmegaConf.to_container(opt, resolve=True)
+    assert isinstance(opt, dict)
+    return torch.optim.AdamW(parameters, lr=opt["lr"], weight_decay=opt["weight_decay"])
+
+
+def _cls_metrics(logits: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    loss = nn.functional.cross_entropy(logits, y)
+    acc = (logits.argmax(dim=1) == y).float().mean()
+    return loss, acc
 
 
 class InceptionNeXtModule(pl.LightningModule):
@@ -38,62 +52,92 @@ class InceptionNeXtModule(pl.LightningModule):
         super().__init__()
         container = (
             OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
-        )  # type: ignore[arg-type]
+        )
         self.save_hyperparameters(container)
+        mlp_ratios = tuple(cfg.model.get("mlp_ratios", (4, 4, 4, 3)))
         self.model = InceptionNeXtEncoder(
             input_dim=cfg.model.input_dim,
             hidden_dim=cfg.model.hidden_dim,
             num_layers=cfg.model.num_layers,
             num_classes=cfg.model.num_classes,
             layer_scale_init=cfg.model.layer_scale_init,
+            mlp_ratios=mlp_ratios,
         )
-        self.criterion = nn.CrossEntropyLoss()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def training_step(self, batch, _):
+    def _step(self, batch, stage: str) -> torch.Tensor:
         x, y = batch
-        logits = self(x)
-        loss = self.criterion(logits, y)
-        self.log("train/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        loss, acc = _cls_metrics(self(x), y)
+        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
+    def training_step(self, batch, _):
+        return self._step(batch, "train")
+
     def validation_step(self, batch, _):
-        x, y = batch
-        logits = self(x)
-        loss = self.criterion(logits, y)
-        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        return loss
+        return self._step(batch, "val")
+
+    def test_step(self, batch, _):
+        return self._step(batch, "test")
 
     def configure_optimizers(self):
         # Paper §4.1: AdamW with lr = 0.001 × batchsize/1024
-        opt_cfg = (
-            self.hparams["optimizer"]
-            if "optimizer" in self.hparams
-            else self.hparams.get("optimizer", {})
-        )  # type: ignore[attr-defined]
-        # OmegaConf container is plain dict after save_hyperparameters conversion
-        if isinstance(opt_cfg, DictConfig):
-            opt_cfg = OmegaConf.to_container(opt_cfg, resolve=True)  # type: ignore[assignment]
-        lr = opt_cfg["lr"] if isinstance(opt_cfg, dict) else opt_cfg.lr  # type: ignore[union-attr]
-        weight_decay = (
-            opt_cfg["weight_decay"] if isinstance(opt_cfg, dict) else opt_cfg.weight_decay
-        )  # type: ignore[union-attr]
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-        )
+        return _optimizer_from_cfg(self.parameters(), self.hparams)
 
 
-class ConvGamerModel(InceptionNeXtModule):
-    """ConvGamer LightningModule — extends InceptionNeXtModule.
+class ConvGamerModel(pl.LightningModule):
+    """ConvGamer video LightningModule — trains ``ConvGamerEncoder`` end to end.
 
-    Placeholder for future geometry-op composition (``cfg.ops.backend``).
-    Currently trains identically to ``InceptionNeXtModule`` until ops are wired
-    into forward. Kept for HF/export compatibility.
+    Batch is ``(video, label)`` with video shaped (B, C, T, H, W).
+    Fully causal: pooled logits at frame ``t`` see only frames ``<= t``.
     """
 
     def __init__(self, cfg: DictConfig):
-        super().__init__(cfg)
+        super().__init__()
+        container = (
+            OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
+        )
+        self.save_hyperparameters(container)
+        model_cfg = cfg.model
+        target_size = model_cfg.get("target_size", None)
+        if target_size is not None:
+            target_size = tuple(target_size)
+        temporal_dilations = tuple(model_cfg.get("temporal_dilations", (1, 2, 4)))
+        mlp_ratios = tuple(model_cfg.get("mlp_ratios", (4, 4, 4, 3)))
+        self.model = ConvGamerEncoder(
+            input_dim=model_cfg.input_dim,
+            hidden_dim=model_cfg.hidden_dim,
+            num_layers=model_cfg.num_layers,
+            num_classes=model_cfg.num_classes,
+            layer_scale_init=model_cfg.layer_scale_init,
+            mlp_ratios=mlp_ratios,
+            out_factor=model_cfg.get("out_factor", 2),
+            use_softmax=model_cfg.get("use_softmax", False),
+            target_size=target_size,
+            temporal_dilations=temporal_dilations,
+        )
+
+    def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
+        return self.model(x, return_sequence=return_sequence)
+
+    def _step(self, batch, stage: str) -> torch.Tensor:
+        x, y = batch
+        loss, acc = _cls_metrics(self(x), y)
+        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def training_step(self, batch, _):
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, _):
+        return self._step(batch, "val")
+
+    def test_step(self, batch, _):
+        return self._step(batch, "test")
+
+    def configure_optimizers(self):
+        return _optimizer_from_cfg(self.parameters(), self.hparams)

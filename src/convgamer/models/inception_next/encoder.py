@@ -78,6 +78,8 @@ class InceptionNeXtEncoder(BaseModel):
     ):
         super().__init__()
 
+        if len(mlp_ratios) != 4:
+            raise ValueError(f"mlp_ratios must have length 4, got {len(mlp_ratios)}")
         self.stem = nn.Conv2d(input_dim, hidden_dim, kernel_size=4, stride=4)
         self.stem_norm = nn.LayerNorm(hidden_dim)
 
@@ -115,6 +117,7 @@ class InceptionNeXtEncoder(BaseModel):
         return self.head(x)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatially pooled frame features (B, F); resolution collapsed by mean."""
         x = self._stem_forward(x)
         x = self.stages(x)
         return x.mean(dim=[2, 3])

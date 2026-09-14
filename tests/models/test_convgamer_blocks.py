@@ -6,7 +6,7 @@ Behavioral contracts covered:
     mismatches, maps (B, C, T, H, W) -> (B, C*out_factor + (C if concat) ?,
     T // temporal_reduction_factor, target_h, target_w), concat flags, finite
     outputs, residual algebra sanity.
-  - uniform_temporal_subsample: equispaced indices, endpoints, ordering, clamp,
+  - uniform_temporal_subsample: strided causal prefix, ordering, clamp,
     invalid counts.
 """
 
@@ -226,7 +226,7 @@ def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
 
         # Replicate the downsampled path the module uses internally.
         xd = einops.rearrange(x, "b c t h w -> b t c h w")
-        xd = op._resize_for_test(xd, (32, 32))
+        xd = op._resize_spatial(xd, (32, 32))
         xd = einops.rearrange(xd, "b t c h w -> b c t h w")
         target_t = max(1, xd.shape[2] // op.temporal_reduction_factor)
         xd = uniform_temporal_subsample(xd, num_samples=target_t, temporal_dim=-3)
@@ -263,12 +263,12 @@ def test_temporal_subsample_reduces_length() -> None:
     assert out.shape[2] == 5
 
 
-def test_temporal_subsample_preserves_endpoints() -> None:
-    """linspace(0, t-1, n).long() always includes first and last index."""
+def test_temporal_subsample_preserves_prefix_causality() -> None:
+    """Strided subsample: output i depends only on input frames <= i*step."""
     x = torch.arange(8, dtype=torch.float).reshape(1, 1, 8, 1, 1)
     out = uniform_temporal_subsample(x, num_samples=4)
     vals = out[0, 0, :, 0, 0].tolist()
-    assert vals[0] == 0.0 and vals[-1] == 7.0
+    assert vals == [0.0, 2.0, 4.0, 6.0]
 
 
 def test_temporal_subsample_no_reorder() -> None:
@@ -280,10 +280,10 @@ def test_temporal_subsample_no_reorder() -> None:
 
 
 def test_temporal_subsample_clamps_oversample() -> None:
-    """num_samples > t → nearest-neighbour clamp, no error."""
+    """num_samples > t → step=1, outputs a frame-count prefix of length t."""
     x = torch.arange(3, dtype=torch.float).reshape(1, 1, 3, 1, 1)
     out = uniform_temporal_subsample(x, num_samples=5)
-    assert out.shape[2] == 5
+    assert out.shape[2] == 3
     assert torch.isfinite(out).all()
 
 
