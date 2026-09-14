@@ -219,11 +219,17 @@ class CausalTemporalMixer(nn.Module):
             ]
         )
         self.act = nn.GELU()
+        self.aggregator = MinConvExpLSTM(channels, channels, 3, bias=True)
+        self.register_buffer(
+            "_agg_state",
+            torch.empty(0, channels, 1, 1),
+            persistent=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for conv in self.layers:
             x = x + self.act(conv(x))
-        return x
+        return self.aggregator(x)
 
     def reset_cache(
         self,
@@ -233,18 +239,30 @@ class CausalTemporalMixer(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        """Reset cache for all temporal conv layers."""
+        """Reset cache for all temporal conv layers and the LSTM aggregator."""
         for layer in self.layers:
             assert isinstance(layer, CausalConv3d)
             layer.reset_cache(batch_size, spatial_h, spatial_w, device=device, dtype=dtype)
+        self._agg_state = self.aggregator.init_state(
+            batch_size, spatial_h, spatial_w, device=device, dtype=dtype
+        )
 
-    def step(self, x_t: torch.Tensor) -> torch.Tensor:
-        """Process one frame ``(B, F, 1, 1, 1)`` through the stacked dilated convs."""
+    def step(self, x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process one frame ``(B, F, 1, H, W)`` through the stacked dilated convs.
+
+        Returns ``(output_t, next_state)`` where ``output_t`` is ``(B, F, 1, H, W)``
+        and ``next_state`` is the updated aggregator state ``(B, Hid, H, W)``.
+        The aggregator state is held in ``self._agg_state`` and updated in place,
+        so callers must use the returned ``next_state`` for chaining.
+        """
         for layer in self.layers:
             assert isinstance(layer, CausalConv3d)
             out = layer.step(x_t)
             x_t = x_t + self.act(out)
-        return x_t
+        x_t_4d = x_t.squeeze(2)
+        out_t, self._agg_state = self.aggregator.step(x_t_4d, self._agg_state)
+        out_t = out_t.unsqueeze(2)
+        return out_t, self._agg_state
 
 
 def uniform_temporal_subsample(

@@ -7,6 +7,7 @@ import torch.nn as nn
 from convgamer.models.convgamer.blocks import (
     CausalConv3d,
     CausalLayerNorm,
+    CausalTemporalMixer,
     ConvGamerStem,
     LearnedSpatialTemporalDownsampler,
 )
@@ -225,17 +226,43 @@ def test_downsampler_streaming_parity() -> None:
     assert y_par.shape == y_step.shape
     torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
 
+    assert y_par.shape == y_step.shape
+    torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
 
-def test_stem_streaming_parity() -> None:
+
+# ── CausalTemporalMixer ──────────────────────────────────────────────────────
+
+
+def test_causal_temporal_mixer_forward_shape() -> None:
+    """forward maps (B, F, T, H, W) -> (B, Hid, T, H, W) with Hid==channels."""
+    m = CausalTemporalMixer(channels=4, dilations=(1,))
+    m.eval()
+    x = torch.randn(2, 4, 5, 8, 8)
+    with torch.no_grad():
+        out = m(x)
+    assert out.shape == (2, 4, 5, 8, 8)
+
+
+def test_causal_temporal_mixer_streaming_parity() -> None:
     """step() one frame at a time must match forward() over the full sequence."""
     torch.manual_seed(42)
-    m = ConvGamerStem(in_channels=6, use_softmax=False, use_norm=True)
+    m = CausalTemporalMixer(channels=4, dilations=(1, 2, 4))
     m.eval()
-    x = torch.randn(1, 6, 6, 16, 16)
+    x = torch.randn(2, 4, 6, 8, 8)
     with torch.no_grad():
         y_par = m(x)
         m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
-        outs = [m.step(x[:, :, t : t + 1]) for t in range(x.shape[2])]
+        outs = [m.step(x[:, :, t : t + 1])[0] for t in range(x.shape[2])]
         y_step = torch.cat(outs, dim=2)
     assert y_par.shape == y_step.shape
     torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
+
+
+def test_causal_temporal_mixer_step_requires_reset_cache() -> None:
+    """step() without reset_cache must error (state buffer is empty)."""
+    torch.manual_seed(42)
+    m = CausalTemporalMixer(channels=4, dilations=(1,))
+    m.eval()
+    x_t = torch.randn(1, 4, 1, 8, 8)
+    with pytest.raises(RuntimeError, match="Cache mismatch"):
+        m.step(x_t)
