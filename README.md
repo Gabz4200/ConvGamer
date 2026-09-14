@@ -67,11 +67,11 @@ Models can also be instantiated via the registry:
 from convgamer.models.registry import get_model
 
 model = get_model(
-  "InceptionNeXtEncoder",
-  input_dim=3,
-  hidden_dim=96,
-  num_layers=[3, 3, 9, 3],
-  num_classes=10,
+    "InceptionNeXtEncoder",
+    input_dim=3,
+    hidden_dim=96,
+    num_layers=[3, 3, 9, 3],
+    num_classes=10,
 )
 ```
 

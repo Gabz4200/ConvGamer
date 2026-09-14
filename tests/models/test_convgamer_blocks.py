@@ -4,8 +4,8 @@ Behavioral contracts covered:
 
   - LearnedSpatialTemporalDownsampler: forward rejects non-5D input and channel
     mismatches, maps (B, C, T, H, W) -> (B, C*out_factor + (C if concat) ?,
-    T // temporal_reduction_factor, target_h, target_w), concat flags, finite
-    outputs, residual algebra sanity.
+    T, target_h, target_w), concat flags, finite outputs, residual algebra
+    sanity. T is preserved (only spatial downsampling).
   - uniform_temporal_subsample: strided causal prefix, ordering, clamp,
     invalid counts.
 """
@@ -57,14 +57,13 @@ def test_when_custom_multiple_then_correction_width_scales() -> None:
     x = torch.randn(1, 3, 8, 32, 32)
     with torch.no_grad():
         out = op(x)
-    assert out.shape == (1, 6, 4, 64, 64)
+    assert out.shape == (1, 6, 8, 64, 64)
 
 
 def test_correction_branch_processes_full_resolution_before_pooling() -> None:
     op = LearnedSpatialTemporalDownsampler(
         in_channels=3,
         target_size=(8, 10),
-        temporal_reduction_factor=2,
         concat_original=False,
     )
     seen: list[tuple[int, ...]] = []
@@ -88,7 +87,7 @@ def test_when_default_config_then_output_channels_match_formula() -> None:
     with torch.no_grad():
         out = op(x)
     expected_c = 3 * 4 + 3  # base + original concat
-    assert out.shape == (1, expected_c, 4, 64, 64)
+    assert out.shape == (1, expected_c, 8, 64, 64)
 
 
 def test_when_concat_original_false_then_no_extra_channels() -> None:
@@ -97,32 +96,24 @@ def test_when_concat_original_false_then_no_extra_channels() -> None:
     x = torch.randn(1, 3, 8, 64, 64)
     with torch.no_grad():
         out = op(x)
-    assert out.shape == (1, 3 * 2, 4, 64, 64)
+    assert out.shape == (1, 3 * 2, 8, 64, 64)
 
 
-def test_when_temporal_reduction_factor_then_temporal_dim_halved() -> None:
-    """target_t = T // temporal_reduction_factor (min 1)."""
-    op = LearnedSpatialTemporalDownsampler(
-        in_channels=3, temporal_reduction_factor=2, concat_original=False
-    )
+def test_when_temporal_preserving_then_temporal_dim_unchanged() -> None:
+    """T dimension is preserved: temporal subsampling removed, only spatial downsample."""
+    op = LearnedSpatialTemporalDownsampler(in_channels=3, concat_original=False)
     x = torch.randn(1, 3, 10, 32, 32)
     with torch.no_grad():
         out = op(x)
-    assert out.shape[2] == 10 // 2
+    assert out.shape[2] == 10  # T preserved
 
 
-def test_when_temporal_reduction_factor_non_positive_then_raises() -> None:
-    with pytest.raises(ValueError, match="temporal_reduction_factor"):
-        LearnedSpatialTemporalDownsampler(temporal_reduction_factor=0)
-
-
-def test_downsampler_correction_is_causal_after_temporal_reduction() -> None:
+def test_downsampler_correction_is_causal() -> None:
     op = LearnedSpatialTemporalDownsampler(
         in_channels=1,
         channel_multiple=1,
         out_factor=1,
         target_size=(2, 2),
-        temporal_reduction_factor=2,
         concat_original=False,
     )
     x = torch.zeros(1, 1, 4, 4, 4)
@@ -132,17 +123,6 @@ def test_downsampler_correction_is_causal_after_temporal_reduction() -> None:
         changed = op(x)
 
     torch.testing.assert_close(changed[:, :, 0], baseline[:, :, 0])
-
-
-def test_when_odd_temporal_then_target_is_floor() -> None:
-    """T=7, factor=2 → target_t = 7//2 = 3 (floor, per code)."""
-    op = LearnedSpatialTemporalDownsampler(
-        in_channels=3, temporal_reduction_factor=2, concat_original=False
-    )
-    x = torch.randn(1, 3, 7, 32, 32)
-    with torch.no_grad():
-        out = op(x)
-    assert out.shape[2] == 7 // 2
 
 
 def test_when_int_target_size_then_normalized_to_square() -> None:
@@ -229,8 +209,6 @@ def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
         xd = einops.rearrange(x, "b c t h w -> b t c h w")
         xd = op._resize_spatial(xd, (32, 32))
         xd = einops.rearrange(xd, "b t c h w -> b c t h w")
-        target_t = max(1, xd.shape[2] // op.temporal_reduction_factor)
-        xd = uniform_temporal_subsample(xd, num_samples=target_t, temporal_dim=-3)
         tiled = xd.repeat_interleave(op.out_factor, dim=1)
         expected = op.norm(tiled)
 
@@ -243,7 +221,7 @@ def test_when_small_input_then_never_upsampled() -> None:
     x = torch.randn(1, 3, 8, 16, 16)
     with torch.no_grad():
         out = op(x)
-    assert out.shape == (1, 6, 4, 16, 16)
+    assert out.shape == (1, 6, 8, 16, 16)
 
 
 def test_when_large_input_then_capped_at_max_spatial() -> None:
@@ -252,7 +230,7 @@ def test_when_large_input_then_capped_at_max_spatial() -> None:
     x = torch.randn(1, 3, 8, 224, 224)
     with torch.no_grad():
         out = op(x)
-    assert out.shape == (1, 6, 4, 64, 64)
+    assert out.shape == (1, 6, 8, 64, 64)
 
 
 # ── uniform_temporal_subsample (in-house replacement for pytorchvideo) ────────

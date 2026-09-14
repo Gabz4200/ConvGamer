@@ -51,6 +51,8 @@ class ConvGamerEncoder(BaseModel):
         stem = ConvGamerStem(
             in_channels=downsampler.out_channels, use_softmax=use_softmax, use_norm=False
         )
+        self.downsampler = downsampler
+        self.spatial_stem = stem
         self.stem = nn.Sequential(downsampler, stem)
         self.frame_encoder = InceptionNeXtEncoder(
             input_dim=stem.out_channels,
@@ -70,7 +72,15 @@ class ConvGamerEncoder(BaseModel):
             else nn.Identity()
         )
 
-    def _video_features(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-frame video features ``(B, F, T)`` — no causal pooling, no head.
+
+        Stem -> per-frame InceptionNeXt feature map -> causal temporal mix ->
+        spatial mean. Output frame ``t`` is a function of input frames ``<= t``
+        (the temporal mix is causal). The cumulative-mean pooling that makes
+        logits use only past context lives in ``forward``, keeping
+        ``forward_features`` a clean backbone seam.
+        """
         x = self.stem(x)
         b, _c, t, _h, _w = x.shape
         frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
@@ -80,9 +90,89 @@ class ConvGamerEncoder(BaseModel):
         mixed = self.temporal_mix(video)
         return mixed.mean(dim=[3, 4])
 
+    def init_state(
+        self,
+        batch_size: int = 1,
+        height: int = 32,
+        width: int = 32,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> dict:
+        """Streaming state with caches for all temporal components.
+
+        ``height``/``width`` are the **input** spatial dims.  The downsampler
+        and stem caches use these directly; the temporal mixer cache uses the
+        post-frame-encoder-stem spatial size (input // 4 from the stride-4
+        Conv2d in ``InceptionNeXtEncoder``).
+        """
+        ref = self.frame_encoder.stem.weight
+        dev = ref.device if device is None else device
+        dt = ref.dtype if dtype is None else dtype
+        # Downsampler + stem caches use input H/W
+        self.downsampler.reset_cache(batch_size, height, width, device=dev, dtype=dt)
+        self.spatial_stem.reset_cache(batch_size, height, width, device=dev, dtype=dt)
+        fe_h = max(1, height // 4)
+        fe_w = max(1, width // 4)
+        self.temporal_mix.reset_cache(batch_size, fe_h, fe_w, device=dev, dtype=dt)
+        # Streaming cumulative-mean state
+        state: dict = {
+            "batch_size": batch_size,
+            "device": dev,
+            "dtype": dt,
+            "fe_spatial": (fe_h, fe_w),
+            "feature_dim": self.frame_encoder.feature_dim,
+            "step_idx": 0,
+            "cumsum": None,  # (B, F) running sum of frame features
+        }
+        return state
+
+    def step(
+        self, x_t: torch.Tensor, state: dict | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stream one frame ``(B, C, H, W)`` -> ``(features, logits)``.
+
+        Returns:
+            ``(features_t, logits_t)`` where ``features_t`` is ``(B, F, 1)``
+            (matching ``forward_features`` frame ``t``) and ``logits_t`` is
+            ``(B, K)`` or ``(B, 1, K)`` (matching ``forward`` pooled at frame
+            ``t``).
+        """
+        b = x_t.shape[0]
+        x_t = x_t.unsqueeze(2)  # (B, C, 1, H, W)
+        x = self.downsampler.step(x_t)
+        x = self.spatial_stem.step(x)
+        # Per-frame feature map (spatial, no temporal mixing yet)
+        frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
+        maps = self.frame_encoder.forward_feature_map(frames)
+        _, _, h, w = maps.shape
+        video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=1, h=h, w=w)
+        mixed = self.temporal_mix.step(video)
+        features = mixed.mean(dim=[3, 4])  # (B, F, 1)
+
+        # Update streaming cumulative mean
+        if state is not None:
+            idx = state["step_idx"]
+            if state["cumsum"] is None:
+                state["cumsum"] = features.squeeze(2).clone()  # (B, F)
+            else:
+                state["cumsum"] = state["cumsum"] + features.squeeze(2)
+            state["step_idx"] = idx + 1
+            count = idx + 1
+            pooled = state["cumsum"] / count
+            logits = self.head(self.norm(pooled))
+        else:
+            logits = self.head(self.norm(features.squeeze(2)))
+
+        return features, logits.unsqueeze(1) if logits.dim() == 2 else logits
+
     def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
-        """Encode video to logits, causally pooled over past frames only."""
-        video = self._video_features(x)
+        """Encode video to logits, causally pooled over past frames only.
+
+        ``forward_features`` returns per-frame features; here we apply the
+        causal cumulative-mean (frame ``t`` sees only ``<= t``) then the head.
+        ``return_sequence=True`` skips pooling and emits per-frame logits.
+        """
+        video = self.forward_features(x)
         if return_sequence:
             b, _, t = video.shape
             flat = einops.rearrange(video, "b f t -> (b t) f")
