@@ -40,8 +40,8 @@ def _normalize_layer_count(
     return layers
 
 
-@register_model("encoder")
-class Encoder(BaseModel):
+@register_model("InceptionNeXtEncoder")
+class InceptionNeXtEncoder(BaseModel):
     """InceptionNeXt backbone.
 
     Parameters
@@ -98,6 +98,7 @@ class Encoder(BaseModel):
             stages.append(nn.Sequential(*stage))
 
         self.stages = nn.Sequential(*stages)
+        self.feature_dim = last_out_ch
         self.head = nn.Linear(last_out_ch, num_classes) if num_classes > 0 else nn.Identity()
 
     def _stem_forward(self, x: torch.Tensor) -> torch.Tensor:

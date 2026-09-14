@@ -1,6 +1,6 @@
 # ConvGamer
 
-ConvGamer is a PyTorch and PyTorch Lightning research framework implementing [InceptionNeXt](https://arxiv.org/abs/2303.16900) (*When Inception Meets ConvNeXt*), featuring decomposed large-kernel depthwise convolutions, composable Hydra configuration, and accelerated geometry kernels.
+ConvGamer is a PyTorch and PyTorch Lightning research framework implementing [InceptionNeXt](https://arxiv.org/abs/2303.16900) (_When Inception Meets ConvNeXt_), featuring decomposed large-kernel depthwise convolutions, composable Hydra configuration, and accelerated geometry kernels.
 
 ## Key Features
 
@@ -46,10 +46,10 @@ Instantiate and execute the InceptionNeXt encoder directly:
 
 ```python
 import torch
-from convgamer.models.inception_next import Encoder
+from convgamer.models.inception_next import InceptionNeXtEncoder
 
 # Initialize Tiny/Small stage layout (96 hidden dims, 4 stages)
-model = Encoder(
+model = InceptionNeXtEncoder(
     input_dim=3,
     hidden_dim=96,
     num_layers=[3, 3, 9, 3],
@@ -66,7 +66,13 @@ Models can also be instantiated via the registry:
 ```python
 from convgamer.models.registry import get_model
 
-model = get_model("encoder", input_dim=3, hidden_dim=96, num_layers=[3, 3, 9, 3], num_classes=10)
+model = get_model(
+  "InceptionNeXtEncoder",
+  input_dim=3,
+  hidden_dim=96,
+  num_layers=[3, 3, 9, 3],
+  num_classes=10,
+)
 ```
 
 ### Command-Line Training

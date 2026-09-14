@@ -1,5 +1,5 @@
 defaults:
-  - model: encoder
+  - model: inception_next
   - optimizer: adamw
   - data: default
   - trainer: default
