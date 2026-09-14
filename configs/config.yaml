@@ -3,7 +3,6 @@ defaults:
   - optimizer: adamw
   - data: default
   - trainer: default
-  - ops: reference
   - experiment: default
   - _self_
 

@@ -1,3 +1,0 @@
-# ConvGamer geometry integration backend
-# "reference" (pure PyTorch) | "taichi"
-backend: reference

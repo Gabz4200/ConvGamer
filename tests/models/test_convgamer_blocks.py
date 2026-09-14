@@ -39,20 +39,21 @@ def test_when_wrong_channel_count_then_raises() -> None:
         op(x)
 
 
-def test_when_depthwise_and_intermediate_not_divisible_then_raises() -> None:
-    """Depthwise conv requires intermediate_channels % in_channels == 0."""
-    with pytest.raises(ValueError, match="must be divisible"):
-        LearnedSpatialTemporalDownsampler(in_channels=3, intermediate_channels=256, depthwise=True)
+def test_when_non_positive_multiple_then_raises() -> None:
+    """Correction width stays a positive multiple of inputs by construction."""
+    with pytest.raises(ValueError, match="channel_multiple"):
+        LearnedSpatialTemporalDownsampler(in_channels=3, channel_multiple=0)
 
 
-def test_when_not_depthwise_accepts_any_intermediate() -> None:
-    """Non-depthwise conv accepts intermediate_channels not divisible by in_channels."""
+def test_when_custom_multiple_then_correction_width_scales() -> None:
+    """channel_multiple sets the correction width as in_channels * multiple."""
     op = LearnedSpatialTemporalDownsampler(
         in_channels=3,
-        intermediate_channels=256,
+        channel_multiple=4,
         depthwise=False,
         target_size=(64, 64),
     )
+    assert op.intermediate_channels == 12
     x = torch.randn(1, 3, 8, 32, 32)
     with torch.no_grad():
         out = op(x)
@@ -118,7 +119,7 @@ def test_when_temporal_reduction_factor_non_positive_then_raises() -> None:
 def test_downsampler_correction_is_causal_after_temporal_reduction() -> None:
     op = LearnedSpatialTemporalDownsampler(
         in_channels=1,
-        intermediate_channels=1,
+        channel_multiple=1,
         out_factor=1,
         target_size=(2, 2),
         temporal_reduction_factor=2,
@@ -208,7 +209,7 @@ def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
         in_channels=3,
         out_factor=1,
         concat_original=False,
-        intermediate_channels=15,
+        channel_multiple=5,
         target_size=(32, 32),
     )
     with torch.no_grad():
