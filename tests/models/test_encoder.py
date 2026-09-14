@@ -165,6 +165,15 @@ def test_forward_features_matches_forward():
     torch.testing.assert_close(feats, direct)
 
 
+def test_forward_feature_map_skips_head_and_pool():
+    """Feature maps keep spatial dims and bypass the classification head."""
+    net = get_model(MODEL_NAME, input_dim=3, hidden_dim=32, num_layers=1, num_classes=10)
+    x = torch.randn(1, 3, 64, 64)
+    maps = net.forward_feature_map(x)
+    assert maps.shape == (1, 256, 16, 16)
+    torch.testing.assert_close(maps.mean(dim=[2, 3]), net.forward_features(x))
+
+
 def test_layer_scale_gamma_present():
     """Paper: LayerScale with init 1e-6."""
     net = get_model(MODEL_NAME, input_dim=3, hidden_dim=96, num_layers=1, num_classes=10)
