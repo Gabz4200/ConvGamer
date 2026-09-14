@@ -74,7 +74,9 @@ def sgn(x: Tensor) -> Tensor:
 
 def srgb_transfer_function(x: Tensor) -> Tensor:
     """Linear sRGB (0..1) -> non-linear sRGB (gamma encode)."""
-    return torch.where(x >= 0.0031308, 1.055 * torch.pow(torch.clamp(x, min=0), 1 / 2.4) - 0.055, 12.92 * x)
+    return torch.where(
+        x >= 0.0031308, 1.055 * torch.pow(torch.clamp(x, min=0), 1 / 2.4) - 0.055, 12.92 * x
+    )
 
 
 def srgb_transfer_function_inv(x: Tensor) -> Tensor:
@@ -245,14 +247,78 @@ def compute_max_saturation(a: Tensor, b: Tensor) -> Tensor:
     a, b = torch.broadcast_tensors(a, b)
     cond_r = -1.88170328 * a - 0.80936493 * b > 1
     cond_g = (1.81444104 * a - 1.19445276 * b > 1) & (~cond_r)
-    k0 = torch.where(cond_r, torch.tensor(1.19086277, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(0.73956515, dtype=a.dtype, device=a.device), torch.tensor(1.35733652, dtype=a.dtype, device=a.device)))
-    k1 = torch.where(cond_r, torch.tensor(1.76576728, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(-0.45954404, dtype=a.dtype, device=a.device), torch.tensor(-0.00915799, dtype=a.dtype, device=a.device)))
-    k2 = torch.where(cond_r, torch.tensor(0.59662641, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(0.08285427, dtype=a.dtype, device=a.device), torch.tensor(-1.15130210, dtype=a.dtype, device=a.device)))
-    k3 = torch.where(cond_r, torch.tensor(0.75515197, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(0.12541070, dtype=a.dtype, device=a.device), torch.tensor(-0.50559606, dtype=a.dtype, device=a.device)))
-    k4 = torch.where(cond_r, torch.tensor(0.56771245, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(0.14503204, dtype=a.dtype, device=a.device), torch.tensor(0.00692167, dtype=a.dtype, device=a.device)))
-    wl = torch.where(cond_r, torch.tensor(4.0767416621, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(-1.2684380046, dtype=a.dtype, device=a.device), torch.tensor(-0.0041960863, dtype=a.dtype, device=a.device)))
-    wm = torch.where(cond_r, torch.tensor(-3.3077115913, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(2.6097574011, dtype=a.dtype, device=a.device), torch.tensor(-0.7034186147, dtype=a.dtype, device=a.device)))
-    ws = torch.where(cond_r, torch.tensor(0.2309699292, dtype=a.dtype, device=a.device), torch.where(cond_g, torch.tensor(-0.3413193965, dtype=a.dtype, device=a.device), torch.tensor(1.7076147010, dtype=a.dtype, device=a.device)))
+    k0 = torch.where(
+        cond_r,
+        torch.tensor(1.19086277, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(0.73956515, dtype=a.dtype, device=a.device),
+            torch.tensor(1.35733652, dtype=a.dtype, device=a.device),
+        ),
+    )
+    k1 = torch.where(
+        cond_r,
+        torch.tensor(1.76576728, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(-0.45954404, dtype=a.dtype, device=a.device),
+            torch.tensor(-0.00915799, dtype=a.dtype, device=a.device),
+        ),
+    )
+    k2 = torch.where(
+        cond_r,
+        torch.tensor(0.59662641, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(0.08285427, dtype=a.dtype, device=a.device),
+            torch.tensor(-1.15130210, dtype=a.dtype, device=a.device),
+        ),
+    )
+    k3 = torch.where(
+        cond_r,
+        torch.tensor(0.75515197, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(0.12541070, dtype=a.dtype, device=a.device),
+            torch.tensor(-0.50559606, dtype=a.dtype, device=a.device),
+        ),
+    )
+    k4 = torch.where(
+        cond_r,
+        torch.tensor(0.56771245, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(0.14503204, dtype=a.dtype, device=a.device),
+            torch.tensor(0.00692167, dtype=a.dtype, device=a.device),
+        ),
+    )
+    wl = torch.where(
+        cond_r,
+        torch.tensor(4.0767416621, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(-1.2684380046, dtype=a.dtype, device=a.device),
+            torch.tensor(-0.0041960863, dtype=a.dtype, device=a.device),
+        ),
+    )
+    wm = torch.where(
+        cond_r,
+        torch.tensor(-3.3077115913, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(2.6097574011, dtype=a.dtype, device=a.device),
+            torch.tensor(-0.7034186147, dtype=a.dtype, device=a.device),
+        ),
+    )
+    ws = torch.where(
+        cond_r,
+        torch.tensor(0.2309699292, dtype=a.dtype, device=a.device),
+        torch.where(
+            cond_g,
+            torch.tensor(-0.3413193965, dtype=a.dtype, device=a.device),
+            torch.tensor(1.7076147010, dtype=a.dtype, device=a.device),
+        ),
+    )
     S = k0 + k1 * a + k2 * b + k3 * a * a + k4 * a * b
     k_l = 0.3963377774 * a + 0.2158037573 * b
     k_m = -0.1055613458 * a - 0.0638541728 * b
@@ -273,7 +339,9 @@ def compute_max_saturation(a: Tensor, b: Tensor) -> Tensor:
     f1 = wl * l_dS + wm * m_dS + ws * s_dS
     f2 = wl * l_dS2 + wm * m_dS2 + ws * s_dS2
     denom = f1 * f1 - 0.5 * f * f2
-    denom = torch.where(torch.abs(denom) < 1e-12, torch.sign(denom) * 1e-12 + (denom == 0).float() * 1e-12, denom)
+    denom = torch.where(
+        torch.abs(denom) < 1e-12, torch.sign(denom) * 1e-12 + (denom == 0).float() * 1e-12, denom
+    )
     S = S - f * f1 / denom
     return S
 
@@ -305,7 +373,15 @@ def to_ST(L_cusp: Tensor, C_cusp: Tensor):
     return S, T
 
 
-def find_gamut_intersection(a: Tensor, b: Tensor, L1: Tensor, C1: Tensor, L0: Tensor, L_cusp: Tensor | None = None, C_cusp: Tensor | None = None) -> Tensor:
+def find_gamut_intersection(
+    a: Tensor,
+    b: Tensor,
+    L1: Tensor,
+    C1: Tensor,
+    L0: Tensor,
+    L_cusp: Tensor | None = None,
+    C_cusp: Tensor | None = None,
+) -> Tensor:
     a = torch.as_tensor(a)
     b = torch.as_tensor(b)
     L1 = torch.as_tensor(L1)
@@ -333,10 +409,18 @@ def find_gamut_intersection(a: Tensor, b: Tensor, L1: Tensor, C1: Tensor, L0: Te
     lower = ((L1 - L0) * Cc - (Lc - L0) * C1) <= 0
     # lower half
     denom_low = C1 * Lc + Cc * (L0 - L1)
-    denom_low = torch.where(torch.abs(denom_low) < 1e-12, torch.sign(denom_low) * 1e-12 + (denom_low == 0).float() * 1e-12, denom_low)
+    denom_low = torch.where(
+        torch.abs(denom_low) < 1e-12,
+        torch.sign(denom_low) * 1e-12 + (denom_low == 0).float() * 1e-12,
+        denom_low,
+    )
     t_low = Cc * L0 / denom_low
     denom_up = C1 * (Lc - 1) + Cc * (L0 - L1)
-    denom_up = torch.where(torch.abs(denom_up) < 1e-12, torch.sign(denom_up) * 1e-12 + (denom_up == 0).float() * 1e-12, denom_up)
+    denom_up = torch.where(
+        torch.abs(denom_up) < 1e-12,
+        torch.sign(denom_up) * 1e-12 + (denom_up == 0).float() * 1e-12,
+        denom_up,
+    )
     t_up = Cc * (L0 - 1) / denom_up
     t = torch.where(lower, t_low, t_up)
     # Halley's refinement for upper only
@@ -379,9 +463,21 @@ def find_gamut_intersection(a: Tensor, b: Tensor, L1: Tensor, C1: Tensor, L0: Te
         denom_g = g1 * g1 - 0.5 * g * g2
         denom_b = b1 * b1 - 0.5 * bl * b2
         # small eps
-        denom_r = torch.where(torch.abs(denom_r) < 1e-12, torch.sign(denom_r) * 1e-12 + (denom_r == 0).float() * 1e-12, denom_r)
-        denom_g = torch.where(torch.abs(denom_g) < 1e-12, torch.sign(denom_g) * 1e-12 + (denom_g == 0).float() * 1e-12, denom_g)
-        denom_b = torch.where(torch.abs(denom_b) < 1e-12, torch.sign(denom_b) * 1e-12 + (denom_b == 0).float() * 1e-12, denom_b)
+        denom_r = torch.where(
+            torch.abs(denom_r) < 1e-12,
+            torch.sign(denom_r) * 1e-12 + (denom_r == 0).float() * 1e-12,
+            denom_r,
+        )
+        denom_g = torch.where(
+            torch.abs(denom_g) < 1e-12,
+            torch.sign(denom_g) * 1e-12 + (denom_g == 0).float() * 1e-12,
+            denom_g,
+        )
+        denom_b = torch.where(
+            torch.abs(denom_b) < 1e-12,
+            torch.sign(denom_b) * 1e-12 + (denom_b == 0).float() * 1e-12,
+            denom_b,
+        )
         u_r = r1 / denom_r
         u_g = g1 / denom_g
         u_b = b1 / denom_b
@@ -404,12 +500,34 @@ def get_ST_mid(a_: Tensor, b_: Tensor):
     b_ = torch.as_tensor(b_)
     a_, b_ = torch.broadcast_tensors(a_, b_)
     S = 0.11516993 + 1.0 / (
-        7.44778970 + 4.15901240 * b_
-        + a_ * (-2.19557347 + 1.75198401 * b_ + a_ * (-2.13704948 - 10.02301043 * b_ + a_ * (-4.24894561 + 5.38770819 * b_ + 4.69891013 * a_)))
+        7.44778970
+        + 4.15901240 * b_
+        + a_
+        * (
+            -2.19557347
+            + 1.75198401 * b_
+            + a_
+            * (
+                -2.13704948
+                - 10.02301043 * b_
+                + a_ * (-4.24894561 + 5.38770819 * b_ + 4.69891013 * a_)
+            )
+        )
     )
     T = 0.11239642 + 1.0 / (
-        1.61320320 - 0.68124379 * b_
-        + a_ * (0.40370612 + 0.90148123 * b_ + a_ * (-0.27087943 + 0.61223990 * b_ + a_ * (0.00299215 - 0.45399568 * b_ - 0.14661872 * a_)))
+        1.61320320
+        - 0.68124379 * b_
+        + a_
+        * (
+            0.40370612
+            + 0.90148123 * b_
+            + a_
+            * (
+                -0.27087943
+                + 0.61223990 * b_
+                + a_ * (0.00299215 - 0.45399568 * b_ - 0.14661872 * a_)
+            )
+        )
     )
     return S, T
 
@@ -708,6 +826,7 @@ def gamut_clip_adaptive_L0_L_cusp(rgb: Tensor, dim: int = -3, alpha: float = 0.0
 
 f = srgb_transfer_function
 f_inv = srgb_transfer_function_inv
+
 
 # torchvision-compatible nn.Module wrappers
 class SRGBToOklab(torch.nn.Module):

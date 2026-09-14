@@ -1,5 +1,6 @@
 """Behavior tests for causal primitives and end-to-end causality."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -177,25 +178,64 @@ def test_downsampler_is_causal() -> None:
         channel_multiple=2,
         out_factor=2,
         target_size=(8, 8),
-        temporal_reduction_factor=1,
     )
     _assert_causal(m, (1, 3, 6, 8, 8), perturb_from=3)
 
 
-def test_downsampler_causal_with_temporal_reduction() -> None:
-    m = LearnedSpatialTemporalDownsampler(
-        in_channels=3,
-        channel_multiple=2,
-        out_factor=2,
-        target_size=(8, 8),
-        temporal_reduction_factor=2,
-    )
-    # T=6 -> target_t=3, perturb future source frames >=4 should not affect output t=0
-    torch.manual_seed(0)
-    x1 = torch.randn(1, 3, 6, 16, 16)
-    x2 = x1.clone()
-    x2[:, :, 4:, :, :] += 5.0
+def test_causal_conv_streaming_parity() -> None:
+    """step() one frame at a time must match forward() over the full sequence."""
+    for use_caching in [True]:
+        torch.manual_seed(42)
+        m = CausalConv3d(
+            in_channels=3, out_channels=6, kernel_size=(3, 3, 3), use_caching=use_caching
+        )
+        m.eval()
+        x = torch.randn(2, 3, 5, 8, 8)
+        with torch.no_grad():
+            y_par = m(x)
+            m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
+            outs = [m.step(x[:, :, t : t + 1]) for t in range(x.shape[2])]
+            y_step = torch.cat(outs, dim=2)
+        assert y_par.shape == y_step.shape
+        torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
+
+
+def test_causal_conv_step_requires_caching() -> None:
+    """step() without use_caching must error."""
+    m = CausalConv3d(3, 6, kernel_size=3, use_caching=False)
     m.eval()
+    x_t = torch.randn(1, 3, 1, 8, 8)
+    with pytest.raises(RuntimeError, match="use_caching=True"):
+        m.step(x_t)
+
+
+def test_downsampler_streaming_parity() -> None:
+    """step() one frame at a time must match forward() over the full sequence."""
+    torch.manual_seed(42)
+    m = LearnedSpatialTemporalDownsampler(
+        in_channels=3, channel_multiple=2, out_factor=2, target_size=(8, 8)
+    )
+    m.eval()
+    x = torch.randn(1, 3, 6, 16, 16)
     with torch.no_grad():
-        y1, y2 = m(x1), m(x2)
-    torch.testing.assert_close(y1[:, :, 0], y2[:, :, 0])
+        y_par = m(x)
+        m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
+        outs = [m.step(x[:, :, t : t + 1]) for t in range(x.shape[2])]
+        y_step = torch.cat(outs, dim=2)
+    assert y_par.shape == y_step.shape
+    torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
+
+
+def test_stem_streaming_parity() -> None:
+    """step() one frame at a time must match forward() over the full sequence."""
+    torch.manual_seed(42)
+    m = ConvGamerStem(in_channels=6, use_softmax=False, use_norm=True)
+    m.eval()
+    x = torch.randn(1, 6, 6, 16, 16)
+    with torch.no_grad():
+        y_par = m(x)
+        m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
+        outs = [m.step(x[:, :, t : t + 1]) for t in range(x.shape[2])]
+        y_step = torch.cat(outs, dim=2)
+    assert y_par.shape == y_step.shape
+    torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)

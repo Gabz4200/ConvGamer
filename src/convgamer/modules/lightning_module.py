@@ -125,3 +125,17 @@ class ConvGamerModel(ClassificationLightningModule):
 
     def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         return self.model(x, return_sequence=return_sequence)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Delegate to the encoder's feature extractor."""
+        return self.model.forward_features(x)
+
+    def init_state(self, batch_size: int = 1, height: int = 32, width: int = 32) -> dict:
+        """Delegate to the encoder's streaming state."""
+        return self.model.init_state(batch_size, height, width)
+
+    def step(
+        self, x_t: torch.Tensor, state: dict | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stream one frame through the full video pipeline -> (features, logits)."""
+        return self.model.step(x_t, state)

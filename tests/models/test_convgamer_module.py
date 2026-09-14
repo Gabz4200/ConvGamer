@@ -68,5 +68,5 @@ def test_video_temporal_mix_operates_on_spatial_maps() -> None:
     with torch.no_grad():
         enc(torch.randn(1, 3, 4, 32, 32))
     b, f, t, h, w = seen["shape"]
-    assert (b, f, t) == (1, enc.frame_encoder.feature_dim, 2)
+    assert (b, f, t) == (1, enc.frame_encoder.feature_dim, 4)
     assert (h, w) == (8, 8)

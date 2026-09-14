@@ -24,6 +24,7 @@ class CausalConv3d(nn.Module):
         dilation: tuple[int, int, int] | int = 1,
         groups: int = 1,
         bias: bool = True,
+        use_caching: bool = True,
     ) -> None:
         super().__init__()
 
@@ -35,6 +36,7 @@ class CausalConv3d(nn.Module):
         self._kernel_t = kt
         self._stride = _triple(stride)
         self._dilation = (dt, dh, dw)
+        self._use_caching = use_caching
 
         pt = dt * (kt - 1)
         ph = dh * (kh - 1)
@@ -42,6 +44,7 @@ class CausalConv3d(nn.Module):
 
         # temporal left only, spatial symmetric
         self._pad = (pw // 2, pw - pw // 2, ph // 2, ph - ph // 2, pt, 0)
+        self._pt = pt
 
         self.conv = nn.Conv3d(
             in_channels=in_channels,
@@ -54,6 +57,18 @@ class CausalConv3d(nn.Module):
             bias=bias,
         )
 
+        if use_caching:
+            # Cache: sliding window of past frames (B, C_in, pt, H, W)
+            # Registered as buffer so it moves with .to(device)/.to(dtype)
+            self.register_buffer(
+                "_cache",
+                torch.empty(0, in_channels, pt, 1, 1),
+                persistent=False,
+            )
+        else:
+            # Non-caching: still need a placeholder so step() can detect it
+            self.register_buffer("_cache", torch.empty(0), persistent=False)
+
     @property
     def weight(self) -> torch.Tensor:
         return self.conv.weight
@@ -62,10 +77,92 @@ class CausalConv3d(nn.Module):
     def bias(self) -> torch.Tensor | None:
         return self.conv.bias
 
+    def reset_cache(
+        self,
+        batch_size: int,
+        spatial_h: int,
+        spatial_w: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """Allocate the cache buffer for streaming step.
+
+        ``spatial_h``/``spatial_w`` are the H/W of the **input** frame
+        (i.e., before any spatial padding).  The cache stores raw frames;
+        spatial padding is applied per-frame at ``step`` time so it matches
+        ``forward`` semantics exactly.
+        """
+        if not self._use_caching:
+            raise RuntimeError(
+                f"CausalConv3d({self.conv.kernel_size}) requires use_caching=True "
+                "to use streaming step()"
+            )
+        c_in = self.conv.in_channels
+        ref = self.conv.weight
+        dev = ref.device if device is None else device
+        dt = ref.dtype if dtype is None else dtype
+        self._cache = torch.zeros(
+            batch_size,
+            c_in,
+            self._pt,
+            spatial_h,
+            spatial_w,
+            device=dev,
+            dtype=dt,
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if any(p != 0 for p in self._pad):
             x = F.pad(x, self._pad)
         return self.conv(x)
+
+    def step(self, x_t: torch.Tensor) -> torch.Tensor:
+        """Process one frame ``(B, C_in, 1, H, W)`` using cached history.
+
+        The cache is a sliding window of ``pt`` past **raw** frames.  At
+        each step the current frame is spatially padded (symmetric), prepended
+        to the cache, and the convolution runs on the full padded window —
+        mirroring ``forward`` exactly.  The cache slides by one (drop oldest).
+        Returns ``(B, C_out, 1, H_out, W_out)``.
+        """
+        if self._pt == 0 and all(p == 0 for p in self._pad[:4]):
+            # Kernel 1x1x1 with no padding — frame independent
+            return self.conv(x_t)
+
+        if not self._use_caching:
+            raise RuntimeError(
+                f"CausalConv3d({self.conv.kernel_size}) requires use_caching=True "
+                "to use streaming step()"
+            )
+
+        b, c_in, _, h, w = x_t.shape
+        cache = self._cache
+
+        # Apply spatial padding to current frame only (symmetric on H, W).
+        # Temporal left padding is supplied by the cache.
+        sp_pad = (self._pad[0], self._pad[1], self._pad[2], self._pad[3])
+        x_t_padded = F.pad(x_t, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else x_t
+
+        if cache.shape[2] != self._pt or cache.shape[3] != h or cache.shape[4] != w:
+            raise RuntimeError(
+                f"Cache mismatch: expected (B, {c_in}, {self._pt}, {h}, {w}), "
+                f"got {tuple(cache.shape)}"
+            )
+
+        # Pad cache spatially too (so cached frames see the same border behavior)
+        cache_padded = F.pad(cache, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else cache
+
+        # Full window: [pt padded past frames, 1 padded current frame]
+        # Spatial pad gives hp/h_out and wp/w_out matching forward()
+        window = torch.cat([cache_padded, x_t_padded], dim=2)  # (B, C, pt+1, hp, wp)
+        # Conv with padding=0 (no temporal pad — cache handles it)
+        out = self.conv(window)
+        out_t = out[:, :, -1:]  # (B, C_out, 1, H_out, W_out)
+
+        # Slide window: drop oldest frame from cache.  Store raw frame (pre-spatial-pad)
+        # so the cache keeps original H/W.
+        self._cache = torch.cat([cache[:, :, 1:], x_t], dim=2).detach()
+        return out_t
 
 
 class CausalLayerNorm(nn.LayerNorm):
@@ -128,6 +225,27 @@ class CausalTemporalMixer(nn.Module):
             x = x + self.act(conv(x))
         return x
 
+    def reset_cache(
+        self,
+        batch_size: int,
+        spatial_h: int = 1,
+        spatial_w: int = 1,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """Reset cache for all temporal conv layers."""
+        for layer in self.layers:
+            assert isinstance(layer, CausalConv3d)
+            layer.reset_cache(batch_size, spatial_h, spatial_w, device=device, dtype=dtype)
+
+    def step(self, x_t: torch.Tensor) -> torch.Tensor:
+        """Process one frame ``(B, F, 1, 1, 1)`` through the stacked dilated convs."""
+        for layer in self.layers:
+            assert isinstance(layer, CausalConv3d)
+            out = layer.step(x_t)
+            x_t = x_t + self.act(out)
+        return x_t
+
 
 def uniform_temporal_subsample(
     x: torch.Tensor, num_samples: int, temporal_dim: int = -3
@@ -168,7 +286,6 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         kernel_size: tuple[int, int, int] | int = (7, 7, 3),
         target_size: tuple[int, int] | int | None = None,
         max_spatial_size: int = 64,
-        temporal_reduction_factor: int = 2,
         interpolation_mode: v2.InterpolationMode = v2.InterpolationMode.BILINEAR,
         depthwise: bool = True,
         concat_original: bool = False,
@@ -184,14 +301,9 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         # construction: intermediate channels are always a multiple of inputs.
         intermediate_channels = in_channels * channel_multiple
         self.intermediate_channels = intermediate_channels
-        self.temporal_reduction_factor = temporal_reduction_factor
         self.interpolation_mode = interpolation_mode
         self.max_spatial_size = max_spatial_size
 
-        if temporal_reduction_factor <= 0:
-            raise ValueError(
-                f"temporal_reduction_factor must be positive, got {temporal_reduction_factor}"
-            )
         if out_factor <= 0:
             raise ValueError(f"out_factor must be positive, got {out_factor}")
         if max_spatial_size <= 0:
@@ -248,15 +360,13 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         )(x_down)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, T, H, W)
+        # x: (B, C, T, H, W) — temporal dim preserved, spatial downsampled only
         if x.ndim != 5:
             raise ValueError(f"Expected 5D input (B, C, T, H, W), got shape {x.shape}")
         if x.shape[1] != self.in_channels:
             raise ValueError(f"Expected in_channels={self.in_channels}, got {x.shape[1]}")
 
         T = x.shape[2]
-        # Clamp target_t to be at least 1 and at most T (if temporal_reduction_factor < 1)
-        target_t = max(1, min(T, T // self.temporal_reduction_factor))
         h_out, w_out = self._resolve_spatial_size(x.shape[3], x.shape[4])
 
         # Spatial downsampling (relative mode never upsamples; explicit target wins)
@@ -267,31 +377,71 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
             x_down = self._resize_spatial(x_down, (h_out, w_out))
             x_down = einops.rearrange(x_down, "b t c h w -> b c t h w")
 
-        # Temporal downsampling
-        x_down = uniform_temporal_subsample(
-            x_down, num_samples=target_t, temporal_dim=-3
-        )  # (B, C, target_t, H, W)
-
         # Repeat channels, repeat_interleave produces [C0, C0, C0, C1, C1, C1, ..., Cn, Cn, Cn].
         tiled_x_down = x_down.repeat_interleave(self.out_factor, dim=1)
 
         # Correction branch runs before downsampling so it can learn from
-        # full-resolution spatial and temporal information.
+        # full-resolution spatial information. Temporal context is captured
+        # via the 3D conv's causal padding; T is preserved.
         correct = self.correction_conv(x)
         correct = self.act(correct)
         correct = einops.rearrange(correct, "b c t h w -> (b t) c h w")
         correct = F.adaptive_avg_pool2d(correct, output_size=(h_out, w_out))
         correct = einops.rearrange(correct, "(b t) c h w -> b c t h w", b=x.shape[0], t=T)
-        correct = uniform_temporal_subsample(correct, num_samples=target_t, temporal_dim=-3)
-        correct = self.out_correction_conv(correct)  # (B, C*out_factor, target_t, H, W)
+        correct = self.out_correction_conv(correct)  # (B, C*out_factor, T, H, W)
 
         # Combine
         out = tiled_x_down + correct
 
-        # Concat downsampled (spatial+temporal) original with corrected output
+        # Concat downsampled (spatial) original with corrected output
         if self.concat_original:
             out = torch.cat((x_down, out), dim=1)
 
+        out = self.norm(out)
+        return out
+
+    def reset_cache(
+        self,
+        batch_size: int,
+        h: int,
+        w: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """Reset temporal cache for the correction conv layers."""
+        self.correction_conv.reset_cache(batch_size, h, w, device=device, dtype=dtype)
+        self.out_correction_conv.reset_cache(batch_size, h, w, device=device, dtype=dtype)
+
+    def step(self, x_t: torch.Tensor) -> torch.Tensor:
+        """Stream one frame ``(B, C, 1, H, W)`` through the downsampler.
+
+        Matches ``forward`` frame-by-frame: spatial resize, causal correction
+        conv with cached history, channel repeat, residual, norm.
+        """
+        b, c, _t, h, w = x_t.shape
+        h_out, w_out = self._resolve_spatial_size(h, w)
+
+        # Spatial downsample current frame
+        if (h_out, w_out) == (h, w):
+            x_down = x_t
+        else:
+            x_down = einops.rearrange(x_t, "b c t h w -> b t c h w")
+            x_down = self._resize_spatial(x_down, (h_out, w_out))
+            x_down = einops.rearrange(x_down, "b t c h w -> b c t h w")
+
+        tiled_x_down = x_down.repeat_interleave(self.out_factor, dim=1)
+
+        # Correction branch: step through cached convs
+        correct = self.correction_conv.step(x_t)
+        correct = self.act(correct)
+        correct = einops.rearrange(correct, "b c t h w -> (b t) c h w")
+        correct = F.adaptive_avg_pool2d(correct, output_size=(h_out, w_out))
+        correct = einops.rearrange(correct, "(b t) c h w -> b c t h w", b=b, t=1)
+        correct = self.out_correction_conv.step(correct)
+
+        out = tiled_x_down + correct
+        if self.concat_original:
+            out = torch.cat((x_down, out), dim=1)
         out = self.norm(out)
         return out
 
@@ -381,6 +531,31 @@ class ConvGamerStem(nn.Module):
         if self.use_softmax:
             x = torch.cat((x, spatial_softmax(x)), dim=1)
 
+        return self.norm(x)
+
+    def reset_cache(
+        self,
+        batch_size: int,
+        h: int,
+        w: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """Reset temporal cache for all conv layers in the stem."""
+        for conv in [self.near_conv, self.far_conv, self.local_conv, self.fuse_conv]:
+            conv.reset_cache(batch_size, h, w, device=device, dtype=dtype)
+
+    def step(self, x_t: torch.Tensor) -> torch.Tensor:
+        """Stream one frame ``(B, C, 1, H, W)`` through the stem."""
+        near = self.near_conv.step(x_t)
+        local = self.local_conv.step(x_t)
+        far = self.far_conv.step(x_t)
+        new = torch.cat((near, local, far), dim=1)
+        new = self.act(new)
+        new = self.fuse_conv.step(new)
+        x = torch.cat((x_t, new), dim=1)
+        if self.use_softmax:
+            x = torch.cat((x, spatial_softmax(x)), dim=1)
         return self.norm(x)
 
 
