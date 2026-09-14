@@ -146,7 +146,7 @@ class ConvGamerEncoder(BaseModel):
         maps = self.frame_encoder.forward_feature_map(frames)
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=1, h=h, w=w)
-        mixed = self.temporal_mix.step(video)
+        mixed, _ = self.temporal_mix.step(video)
         features = mixed.mean(dim=[3, 4])  # (B, F, 1)
 
         # Update streaming cumulative mean
