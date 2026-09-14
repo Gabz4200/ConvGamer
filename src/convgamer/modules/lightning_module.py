@@ -2,7 +2,7 @@
 
 ``InceptionNeXtModule`` trains the 2D image backbone on (B, C, H, W).
 ``ConvGamerModel`` trains the causal video encoder on (B, C, T, H, W).
-Standalone classes: the video model is not a subclass of the image module.
+Both share ``ClassificationLightningModule`` for the step/optimizer logic.
 """
 
 from __future__ import annotations
@@ -32,7 +32,30 @@ def _cls_metrics(logits: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, t
     return loss, acc
 
 
-class InceptionNeXtModule(pl.LightningModule):
+class ClassificationLightningModule(pl.LightningModule):
+    """Shared train/val/test step and AdamW wiring for classifiers."""
+
+    def _step(self, batch, stage: str) -> torch.Tensor:
+        x, y = batch
+        loss, acc = _cls_metrics(self(x), y)
+        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def training_step(self, batch, _):
+        return self._step(batch, "train")
+
+    def validation_step(self, batch, _):
+        return self._step(batch, "val")
+
+    def test_step(self, batch, _):
+        return self._step(batch, "test")
+
+    def configure_optimizers(self):
+        return _optimizer_from_cfg(self.parameters(), self.hparams)
+
+
+class InceptionNeXtModule(ClassificationLightningModule):
     """Pure InceptionNeXt LightningModule — matches paper §4.1.
 
     AdamW optimiser, CrossEntropyLoss on classification logits.  The
@@ -67,28 +90,8 @@ class InceptionNeXtModule(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def _step(self, batch, stage: str) -> torch.Tensor:
-        x, y = batch
-        loss, acc = _cls_metrics(self(x), y)
-        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
-        return loss
 
-    def training_step(self, batch, _):
-        return self._step(batch, "train")
-
-    def validation_step(self, batch, _):
-        return self._step(batch, "val")
-
-    def test_step(self, batch, _):
-        return self._step(batch, "test")
-
-    def configure_optimizers(self):
-        # Paper §4.1: AdamW with lr = 0.001 × batchsize/1024
-        return _optimizer_from_cfg(self.parameters(), self.hparams)
-
-
-class ConvGamerModel(pl.LightningModule):
+class ConvGamerModel(ClassificationLightningModule):
     """ConvGamer video LightningModule — trains ``ConvGamerEncoder`` end to end.
 
     Batch is ``(video, label)`` with video shaped (B, C, T, H, W).
@@ -122,22 +125,3 @@ class ConvGamerModel(pl.LightningModule):
 
     def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         return self.model(x, return_sequence=return_sequence)
-
-    def _step(self, batch, stage: str) -> torch.Tensor:
-        x, y = batch
-        loss, acc = _cls_metrics(self(x), y)
-        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
-        return loss
-
-    def training_step(self, batch, _):
-        return self._step(batch, "train")
-
-    def validation_step(self, batch, _):
-        return self._step(batch, "val")
-
-    def test_step(self, batch, _):
-        return self._step(batch, "test")
-
-    def configure_optimizers(self):
-        return _optimizer_from_cfg(self.parameters(), self.hparams)

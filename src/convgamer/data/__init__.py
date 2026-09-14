@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from . import oklab as oklab
 from .datamemodule import ConvGamerDataModule
-from .dataset import RandomImageDataset, RandomVideoDataset
+from .dataset import RandomImageDataset, RandomSyntheticDataset, RandomVideoDataset
 
-__all__ = ["ConvGamerDataModule", "RandomImageDataset", "RandomVideoDataset", "oklab"]
+__all__ = [
+    "ConvGamerDataModule",
+    "RandomImageDataset",
+    "RandomSyntheticDataset",
+    "RandomVideoDataset",
+    "oklab",
+]

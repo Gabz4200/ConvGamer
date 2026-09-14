@@ -174,7 +174,7 @@ def test_stem_is_causal_without_norm() -> None:
 def test_downsampler_is_causal() -> None:
     m = LearnedSpatialTemporalDownsampler(
         in_channels=3,
-        intermediate_channels=6,
+        channel_multiple=2,
         out_factor=2,
         target_size=(8, 8),
         temporal_reduction_factor=1,
@@ -185,7 +185,7 @@ def test_downsampler_is_causal() -> None:
 def test_downsampler_causal_with_temporal_reduction() -> None:
     m = LearnedSpatialTemporalDownsampler(
         in_channels=3,
-        intermediate_channels=6,
+        channel_multiple=2,
         out_factor=2,
         target_size=(8, 8),
         temporal_reduction_factor=2,

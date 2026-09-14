@@ -1,5 +1,9 @@
 """Lightning modules for InceptionNeXt and ConvGamer."""
 
-from .lightning_module import ConvGamerModel, InceptionNeXtModule
+from .lightning_module import (
+    ClassificationLightningModule,
+    ConvGamerModel,
+    InceptionNeXtModule,
+)
 
-__all__ = ["InceptionNeXtModule", "ConvGamerModel"]
+__all__ = ["ClassificationLightningModule", "InceptionNeXtModule", "ConvGamerModel"]

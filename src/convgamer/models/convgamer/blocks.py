@@ -163,7 +163,7 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        intermediate_channels: int | None = None,
+        channel_multiple: int = 85,
         out_factor: int = 2,
         kernel_size: tuple[int, int, int] | int = (7, 7, 3),
         target_size: tuple[int, int] | int | None = None,
@@ -179,10 +179,10 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         self.kernel_size = kernel_size
         self.depthwise = depthwise
         self.concat_original = concat_original
-        if intermediate_channels is None:
-            # 85x oversampling keeps the depthwise correction branch expressive
-            # while staying divisible by in_channels for any input_dim.
-            intermediate_channels = in_channels * 85
+        self.channel_multiple = channel_multiple
+        # Correction branch stays expressive and depthwise-compatible by
+        # construction: intermediate channels are always a multiple of inputs.
+        intermediate_channels = in_channels * channel_multiple
         self.intermediate_channels = intermediate_channels
         self.temporal_reduction_factor = temporal_reduction_factor
         self.interpolation_mode = interpolation_mode
@@ -208,11 +208,8 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         base_channels = in_channels * out_factor
         self.out_channels = base_channels + (in_channels if concat_original else 0)
 
-        if depthwise and intermediate_channels % in_channels != 0:
-            raise ValueError(
-                f"intermediate_channels={intermediate_channels} must be divisible "
-                f"by in_channels={in_channels} for depthwise convolution"
-            )
+        if channel_multiple <= 0:
+            raise ValueError(f"channel_multiple must be positive, got {channel_multiple}")
 
         self.correction_conv = CausalConv3d(
             in_channels=in_channels,

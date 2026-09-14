@@ -33,12 +33,10 @@ dependencies = [
 cpu = [
     "torch>=2.5.0",
     "torchvision>=0.20.0",
-    "torchaudio>=0.20.0",
 ]
 cu124 = [
     "torch>=2.5.0",
     "torchvision>=0.20.0",
-    "torchaudio>=0.20.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -84,10 +82,6 @@ torch = [
     { index = "pytorch-cu124", extra = "cu124" },
 ]
 torchvision = [
-    { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu124", extra = "cu124" },
-]
-torchaudio = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu124", extra = "cu124" },
 ]
