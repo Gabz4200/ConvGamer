@@ -31,9 +31,8 @@ def test_predictor_outputs_mask_and_context_tokens() -> None:
         num_levels=1,
     )
     out = predictor(feat, mask)
-    # Dense prediction: B, F', T, H, W
-    assert out.shape[:1] == (B,)
-    assert out.shape[2:] == (T, H, W)
+    # Dense prediction preserves batch/time/space: (B, F, T, H, W).
+    assert out.shape == (B, F, T, H, W)
 
 
 def test_predictor_context_loss_weighting_decays_with_distance() -> None:

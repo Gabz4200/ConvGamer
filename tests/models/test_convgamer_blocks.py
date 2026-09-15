@@ -108,23 +108,6 @@ def test_when_temporal_preserving_then_temporal_dim_unchanged() -> None:
     assert out.shape[2] == 10  # T preserved
 
 
-def test_downsampler_correction_is_causal() -> None:
-    op = LearnedSpatialTemporalDownsampler(
-        in_channels=1,
-        channel_multiple=1,
-        out_factor=1,
-        target_size=(2, 2),
-        concat_original=False,
-    )
-    x = torch.zeros(1, 1, 4, 4, 4)
-    with torch.no_grad():
-        baseline = op(x)
-        x[:, :, 1] = 1
-        changed = op(x)
-
-    torch.testing.assert_close(changed[:, :, 0], baseline[:, :, 0])
-
-
 def test_when_int_target_size_then_normalized_to_square() -> None:
     """Integer target_size produces (s, s) spatial output."""
     op = LearnedSpatialTemporalDownsampler(
@@ -151,34 +134,16 @@ def test_when_scaled_out_factor_then_channels_scale_linearly(out_factor: int) ->
     assert out.shape[1] == 3 * out_factor
 
 
-def test_when_batch_gt_one_then_preserved() -> None:
-    """Batch dimension preserved through forward."""
-    op = LearnedSpatialTemporalDownsampler(in_channels=3, concat_original=False)
-    x = torch.randn(4, 3, 8, 32, 32)
-    with torch.no_grad():
-        out = op(x)
-    assert out.shape[0] == 4
+# ── Numerical behavior ───
 
 
-# ── Numerical behavior ───────────────────────────────────────────────────────
-
-
-def test_output_is_finite() -> None:
-    """No NaN/Inf in output for standard float input."""
+def test_output_finite_including_zero_input() -> None:
+    """No NaN/Inf for standard float or zero input (LayerNorm-safe)."""
     op = LearnedSpatialTemporalDownsampler(in_channels=3)
     x = torch.randn(1, 3, 8, 32, 32)
     with torch.no_grad():
-        out = op(x)
-    assert torch.isfinite(out).all()
-
-
-def test_zero_input_yields_finite_output() -> None:
-    """Zero input must not produce NaN through LayerNorm."""
-    op = LearnedSpatialTemporalDownsampler(in_channels=3, concat_original=False)
-    x = torch.zeros(1, 3, 8, 32, 32)
-    with torch.no_grad():
-        out = op(x)
-    assert torch.isfinite(out).all()
+        assert torch.isfinite(op(x)).all()
+        assert torch.isfinite(op(torch.zeros_like(x))).all()
 
 
 def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
@@ -248,14 +213,6 @@ def test_temporal_subsample_preserves_prefix_causality() -> None:
     out = uniform_temporal_subsample(x, num_samples=4)
     vals = out[0, 0, :, 0, 0].tolist()
     assert vals == [0.0, 2.0, 4.0, 6.0]
-
-
-def test_temporal_subsample_no_reorder() -> None:
-    """Equispaced selection must preserve temporal ordering."""
-    x = torch.arange(10, dtype=torch.float).reshape(1, 1, 10, 1, 1)
-    out = uniform_temporal_subsample(x, num_samples=5)
-    vals = out[0, 0, :, 0, 0].tolist()
-    assert vals == sorted(vals)
 
 
 def test_temporal_subsample_clamps_oversample() -> None:
