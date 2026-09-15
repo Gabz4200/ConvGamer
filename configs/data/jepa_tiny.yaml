@@ -12,7 +12,6 @@ width: 224
 mask_ratio: 0.25         # V-JEPA 2.1 spatial mask scale [0.15, 0.7]
 image_mask_ratio: 0.10   # lower mask for spatial regularizer
 to_oklab: true           # RGB -> Oklab conversion in dataset loading
-image_interval: 5        # inject 1 image batch every 5 video batches
 data_dir: ./data/jepa
 num_synthetic_samples: 64
 sample_stride: 1         # frames to skip when slicing long MP4s
@@ -34,7 +33,18 @@ video_dataset_ids:
   # Hand-drawn 2D kinematics
   - ch1415926/cuphead
 
+# Tier 2: Extracted archives (download + extract first)
+archive_dataset_ids:
+  - elefantai/p2p-full-data
+  - KlingTeam/GameFactory-Dataset
+  - zizhaotong/CrossFPS-train
+  - quchenyuan/UCF101-ZIP
+
 # Tier 3: Static images (T=1 spatial regularizer)
 image_dataset_ids:
   - asgaardlab/VideoGameBunny-Dataset
   - VideoGameBunny/Dataset
+
+# Tier 4: Regularization video (Kinetics-400)
+regularization_dataset_ids:
+  - kiyoonkim/kinetics-400-splits

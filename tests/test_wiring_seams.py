@@ -103,6 +103,34 @@ def test_when_invalid_jepa_mode_then_raises() -> None:
         dm.setup()
 
 
+def test_when_mixed_mode_then_video_and_image_loaders_stay_separate(tmp_path) -> None:
+    """Mixed mode returns modality-homogeneous loaders; no T=12/T=1 collate mix."""
+    from torchvision.io import write_png
+
+    video_dir = tmp_path / "videos"
+    image_dir = tmp_path / "images"
+    video_dir.mkdir()
+    image_dir.mkdir()
+    for i in range(2):
+        write_png((torch.rand(3, 16, 16) * 255).to(torch.uint8), str(image_dir / f"img{i}.png"))
+    dm = VJEPAGamingDataModule(
+        batch_size=1,
+        num_workers=0,
+        num_frames=4,
+        height=16,
+        width=16,
+        video_dataset_ids=[str(video_dir / "*.mp4")],
+        image_dataset_ids=[str(image_dir / "*.png")],
+        mode="mixed",
+    )
+    dm.setup()
+    loaders = dm.train_dataloader()
+    assert isinstance(loaders, list) and len(loaders) == 2
+    _, y_img, mask_img = next(iter(loaders[1]))
+    assert y_img.shape == (1, 3, 1, 16, 16)
+    assert mask_img.shape == (1, 1, 16, 16)
+
+
 def test_when_invalid_modality_then_raises() -> None:
     """Classification datamodule rejects modalities outside image/video."""
     with pytest.raises(ValueError, match="modality"):

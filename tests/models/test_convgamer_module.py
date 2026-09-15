@@ -28,11 +28,14 @@ def _video_cfg() -> DictConfig:
 
 
 def test_video_module_forward_produces_logits() -> None:
+    """Feature maps keep H,W > 1 while logits collapse to a per-class vector."""
     m = ConvGamerModel(_video_cfg())
     m.eval()
     with torch.no_grad():
         out = m(torch.randn(1, 3, 8, 32, 32))
+        maps = m.model.forward_feature_maps(torch.randn(1, 3, 8, 32, 32))
     assert out.shape == (1, 4)
+    assert maps.ndim == 5 and maps.shape[3] > 1 and maps.shape[4] > 1
 
 
 def test_video_module_steps_run() -> None:
@@ -46,18 +49,3 @@ def test_video_module_optimizer_builds() -> None:
     m = ConvGamerModel(_video_cfg())
     opt = m.configure_optimizers()
     assert isinstance(opt, torch.optim.AdamW)
-
-
-def test_video_temporal_mix_operates_on_spatial_maps() -> None:
-    """Feature maps keep H,W > 1; logits collapse to per-class vector."""
-    from convgamer.models import ConvGamerEncoder
-
-    enc = ConvGamerEncoder(
-        input_dim=3, hidden_dim=8, num_layers=1, num_classes=4, temporal_dilations=(1,)
-    )
-    enc.eval()
-    with torch.no_grad():
-        maps = enc.forward_feature_maps(torch.randn(1, 3, 4, 32, 32))
-        logits = enc(torch.randn(1, 3, 4, 32, 32))
-    assert maps.ndim == 5 and maps.shape[3] > 1 and maps.shape[4] > 1
-    assert logits.shape == (1, 4)

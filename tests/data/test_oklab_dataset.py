@@ -5,7 +5,6 @@ Seams tested:
 - ``GameVideoDataset``: returns (B,C,T,H,W) video tensor from mp4 paths.
 - ``GameImageDataset``: returns (B,C,H,W) from image paths -> oklab.
 - ``JEPADataset``: yields (x_view, y_view, mask) where x is masked.
-- ``MixedGameDataset``: interleaves video clips and T=1 images.
 """
 
 from __future__ import annotations
@@ -13,10 +12,7 @@ from __future__ import annotations
 import torch
 
 from convgamer.data.dataset import (
-    GameImageDataset,
-    GameVideoDataset,
     JEPADataset,
-    MixedGameDataset,
     _resolve_image_paths,
     _resolve_video_paths,
     oklab_convert_srgb,
@@ -116,37 +112,18 @@ def test_resolve_image_paths_expands_globs(tmp_path, monkeypatch) -> None:
     assert _resolve_image_paths(["*.jpg", "*.png"]) == ["x.jpg", "y.png"]
 
 
-def test_mixed_dataset_interleaves_video_and_images() -> None:
-    """Every Nth sample comes from the image source with T=1."""
+def test_resolve_video_paths_extracts_tier2_archives(tmp_path, monkeypatch) -> None:
+    """Tier 2 .tar.gz/.tgz shards extract once and feed the decord pipeline."""
+    import tarfile
 
-    class ListVideo(GameVideoDataset):
-        def __init__(self, samples: list):
-            self.samples = samples
-
-        def __iter__(self):
-            yield from self.samples
-
-    class ListImage(GameImageDataset):
-        def __init__(self, samples: list):
-            self.samples = samples
-
-        def __iter__(self):
-            yield from self.samples
-
-    videos = [
-        (torch.zeros(3, 2, 4, 4), torch.ones(3, 2, 4, 4), torch.zeros(2, 4, 4, dtype=torch.bool))
-        for _ in range(5)
-    ]
-    images = [
-        (torch.zeros(3, 1, 4, 4), torch.ones(3, 1, 4, 4), torch.zeros(1, 4, 4, dtype=torch.bool))
-        for _ in range(3)
-    ]
-    mixed = MixedGameDataset(
-        video_dataset=ListVideo(videos),
-        image_dataset=ListImage(images),
-        image_interval=2,
-    )
-    samples = list(mixed)
-    assert len(samples) == 7
-    assert [sample[0].shape[1] for sample in samples] == [2, 1, 2, 1, 2, 1, 2]
-    assert sum(1 for sample in samples if sample[0].shape[1] == 1) == 3
+    inner = tmp_path / "clip.mp4"
+    inner.write_bytes(b"placeholder")
+    specs: list[tuple[str, str]] = [("a.tar.gz", "w:gz"), ("b.tgz", "w:gz"), ("c.tar", "w")]
+    for name, mode in specs:
+        with tarfile.open(tmp_path / name, mode=mode) as tf:  # type: ignore[call-overload]
+            tf.add(inner, arcname="clip.mp4")
+    monkeypatch.chdir(tmp_path)
+    resolved = _resolve_video_paths(["*.tar.gz", "*.tgz", "*.tar"])
+    assert len(resolved) == 3
+    assert all(path.endswith("clip.mp4") for path in resolved)
+    assert len({path.rsplit(".extracted", 1)[0] for path in resolved}) == 3

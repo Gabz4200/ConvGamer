@@ -76,7 +76,7 @@ class ConvGamerEncoder(BaseModel):
         self.norm = nn.LayerNorm(self.frame_encoder.feature_dim)
         # Foundation-model seam: no classification head by default.
         # Callers may attach one later via ``add_classification_head``.
-        if num_classes is not None and num_classes != 0 and num_classes is not None:
+        if num_classes is not None and num_classes > 0:
             warnings.warn(
                 "ConvGamerEncoder is now a foundation model without a classification "
                 "head. Pass ``num_classes=None`` (or omit). The head will be added "

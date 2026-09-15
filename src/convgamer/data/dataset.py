@@ -2,12 +2,32 @@ from __future__ import annotations
 
 import glob
 import os
+import tarfile
+import zipfile
 
 import einops
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from convgamer.data.oklab import srgb_to_oklab
+
+try:  # decord is an optional dependency (only needed for video loading)
+    from decord import VideoReader as _DecordVideoReader
+    from decord import cpu as _decord_cpu
+except ImportError:  # pragma: no cover - decord absent
+    _DecordVideoReader = None  # type: ignore[assignment]
+    _decord_cpu = None  # type: ignore[assignment]
+
+
+def _looks_like_hf_id(item: str) -> bool:
+    """True for ``owner/repo`` ids; false for local files, globs, and abs paths."""
+    if os.path.exists(item) or os.path.isabs(item):
+        return False
+    if "*" in item or "?" in item or "[" in item:
+        return False
+    if item.endswith((".mp4", ".jpg", ".jpeg", ".png")):
+        return False
+    return "/" in item
 
 
 def _resolve_video_paths(
@@ -25,19 +45,65 @@ def _resolve_video_paths(
 
     paths: list[str] = []
     for item in video_ids:
-        if "/" in item and not os.path.exists(item):
+        if _looks_like_hf_id(item) and not os.path.exists(item):
             local_dir = snapshot_download(
                 repo_id=item,
                 repo_type="dataset",
                 local_dir=os.path.join(data_dir, item.replace("/", "__")),
-                allow_patterns=["**/*.mp4", "*.mp4"],
+                allow_patterns=["**/*.mp4", "*.mp4", "**/*.tar", "*.tar", "**/*.zip", "*.zip"],
             )
-            paths.extend(sorted(glob.glob(os.path.join(local_dir, "**", "*.mp4"), recursive=True)))
+            paths.extend(_expand_archive_globs(local_dir, recursive=True))
         else:
-            paths.extend(sorted(glob.glob(item, recursive=True)))
+            paths.extend(_expand_archive_globs(item, recursive=True))
     if num_workers > 1:
         paths = paths[worker_id::num_workers]
     return paths
+
+
+def _expand_archive_globs(pattern: str, recursive: bool = True) -> list[str]:
+    """Glob ``pattern`` and flatten any ``.tar``/``.zip`` archives into MP4 paths.
+
+    Archives are extracted once to a sibling cache directory; subsequent
+    globs reuse the extracted tree.  This lets Tier 2 datasets (Pixel2Play,
+    UCF101 shards, Kinetics tarballs) feed the same ``decord`` pipeline as
+    Tier 1 direct MP4s.
+    """
+    matches = sorted(glob.glob(pattern, recursive=recursive))
+    out: list[str] = []
+    for match in matches:
+        if os.path.isdir(match):
+            out.extend(sorted(glob.glob(os.path.join(match, "**", "*.mp4"), recursive=True)))
+            continue
+        ext = os.path.splitext(match)[1].lower()
+        # Tier 2 archives arrive as .tar, .tar.gz, .tgz, or .zip.
+        name = os.path.basename(match).lower()
+        if (
+            ext in {".tar", ".zip", ".tgz"}
+            or name.endswith((".tar.gz", ".tgz"))
+            or (ext == ".gz" and ".tar" in name)
+        ):
+            out.extend(_extract_archive(match))
+        elif ext == ".mp4":
+            out.append(match)
+    return out
+
+
+def _extract_archive(archive_path: str) -> list[str]:
+    """Extract ``.tar``/``.zip`` to a sibling cache dir and return MP4 paths."""
+    extract_dir = archive_path + ".extracted"
+    if not os.path.isdir(extract_dir):
+        os.makedirs(extract_dir, exist_ok=True)
+        if archive_path.endswith(".zip"):
+            with zipfile.ZipFile(archive_path) as zf:
+                zf.extractall(extract_dir)
+        else:
+            # tarfile auto-detects compression (.tar, .tar.gz, .tgz).
+            with tarfile.open(archive_path, mode="r:*") as tf:
+                try:
+                    tf.extractall(extract_dir, filter="data")
+                except TypeError:
+                    tf.extractall(extract_dir)
+    return sorted(glob.glob(os.path.join(extract_dir, "**", "*.mp4"), recursive=True))
 
 
 def _resolve_image_paths(
@@ -51,7 +117,7 @@ def _resolve_image_paths(
 
     paths: list[str] = []
     for item in image_ids:
-        if "/" in item and not os.path.exists(item):
+        if _looks_like_hf_id(item) and not os.path.exists(item):
             local_dir = snapshot_download(
                 repo_id=item,
                 repo_type="dataset",
@@ -154,45 +220,6 @@ def oklab_convert_srgb(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
     return srgb_to_oklab(x, dim=dim)
 
 
-class RandomVideoIterableDataset(IterableDataset):
-    """Infinite synthetic video stream for JEPA training smoke tests.
-
-    Yields ``(x_masked, y_clean, mask)`` tuples where ``x`` is the
-    masked view (mask tokens replaced with zeros), ``y`` is the clean
-    view in oklab space, and ``mask`` is a boolean tensor.
-    """
-
-    def __init__(
-        self,
-        channels: int = 3,
-        num_frames: int = 16,
-        height: int = 224,
-        width: int = 224,
-        mask_ratio: float = 0.25,
-        to_oklab: bool = True,
-    ):
-        self.channels = channels
-        self.num_frames = num_frames
-        self.height = height
-        self.width = width
-        self.mask_ratio = mask_ratio
-        self.to_oklab = to_oklab
-
-    def __iter__(self):
-        while True:
-            y = torch.rand(self.num_frames, self.channels, self.height, self.width)
-            x = y.clone()
-            mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
-            # Zero out masked positions in x (mask tokens)
-            x[mask.unsqueeze(1).expand(-1, self.channels, -1, -1)] = 0.0
-
-            if self.to_oklab:
-                y = oklab_convert_srgb(y, dim=1)
-                x = oklab_convert_srgb(x, dim=1)
-
-            yield x, y, mask
-
-
 class JEPADataset(Dataset):
     """Synthetic JEPA dataset for smoke testing.
 
@@ -278,7 +305,6 @@ class GameVideoDataset(IterableDataset):
         sample_stride: int = 1,
         max_frames: int = 10_000,
         data_dir: str = "./data/jepa",
-        emit_hw: bool = True,
     ):
         self.video_paths = video_paths
         self.num_frames = num_frames
@@ -289,7 +315,6 @@ class GameVideoDataset(IterableDataset):
         self.sample_stride = sample_stride
         self.max_frames = max_frames
         self.data_dir = data_dir
-        self.emit_hw = emit_hw
 
     def _load_video(self, path: str) -> torch.Tensor:
         """Load frames from a single mp4 using decord.
@@ -362,15 +387,6 @@ class GameVideoDataset(IterableDataset):
                 logger.warning("Skipping unreadable video %s (%s)", path, error)
                 continue
 
-            if self.emit_hw and tuple(y.shape[-2:]) != (self.height, self.width):
-                import torch.nn.functional as torch_f
-
-                flat = einops.rearrange(y, "t c h w -> (t c) 1 h w")
-                flat = torch_f.interpolate(
-                    flat, size=(self.height, self.width), mode="bilinear", align_corners=False
-                )
-                y = einops.rearrange(flat, "(t c) 1 h w -> t c h w", t=self.num_frames)
-
             mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
             x = y.clone()
             c = y.shape[1]
@@ -431,58 +447,151 @@ class GameImageDataset(IterableDataset):
                 logger.warning("Skipping unreadable image %s (%s)", path, error)
                 continue
 
+            if img.shape[0] == 1:
+                img = img.repeat(3, 1, 1)
+            elif img.shape[0] == 4:
+                img = img[:3]
+            if img.shape[0] != 3:
+                logger.warning("Skipping non-RGB image %s (C=%d)", path, img.shape[0])
+                continue
+
             img = img.float() / 255.0
-            img = torch.nn.functional.interpolate(
-                img.unsqueeze(0), size=(self.size, self.size), mode="bilinear", align_corners=False
-            ).squeeze(0)
+            img = (
+                torch.nn.functional.interpolate(
+                    img.unsqueeze(0),
+                    size=(self.size, self.size),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                if img.shape[-2:] != (self.size, self.size)
+                else img
+            )
 
             # Inject dummy temporal axis: (C, 1, H, W)
             y = img.unsqueeze(1)  # (C, 1, H, W)
 
             mask = torch.rand(1, self.size, self.size) < self.mask_ratio
             x = y.clone()
-            x[mask.unsqueeze(0).expand(-1, y.shape[1], -1, -1)] = 0.0
+            # y is (C, 1, H, W); mask is (T=1, H, W) -> align on (C, T) dims.
+            x[mask.unsqueeze(0).expand_as(y)] = 0.0
+
+            if self.to_oklab:
+                # Single sample (C, T, H, W): channel lives at dim 0.
+                y = oklab_convert_srgb(y, dim=0)
+                x = oklab_convert_srgb(x, dim=0)
+
+            yield x, y, mask
+
+
+class HFVideoDataset(IterableDataset):
+    """IterableDataset over Hugging Face video datasets (Kinetics, UCF101).
+
+    Streams rows from ``datasets`` (parquet/zip-backed repos) and decodes
+    the video column with ``decord`` — no snapshot download of raw MP4s.
+    Useful as a regularization source (the "ImageNet of videos") alongside
+    the gaming MP4 pipeline.
+
+    Args:
+        repo_id: HF dataset id, e.g. ``"kiyoonkim/kinetics-400-splits"``.
+        video_column: name of the column holding the video (path or bytes).
+        split: HF split to stream.
+        num_frames: temporal chunk size T.
+        height, width: target resize resolution.
+        mask_ratio: fraction of spatio-temporal tokens to mask.
+        to_oklab: convert sRGB -> Oklab.
+        max_rows: cap rows per worker (prevents unbounded iteration).
+    """
+
+    def __init__(
+        self,
+        repo_id: str,
+        video_column: str = "0",
+        split: str = "train",
+        num_frames: int = 16,
+        height: int = 224,
+        width: int = 224,
+        mask_ratio: float = 0.25,
+        to_oklab: bool = True,
+        max_rows: int | None = None,
+        data_dir: str = "./data/jepa",
+    ):
+        self.repo_id = repo_id
+        self.video_column = video_column
+        self.split = split
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.mask_ratio = mask_ratio
+        self.to_oklab = to_oklab
+        self.max_rows = max_rows
+        self.data_dir = data_dir
+
+    def _load_frames(self, source) -> torch.Tensor:
+        """Decode ``source`` (path or bytes) into a ``(T, C, H, W)`` tensor."""
+        if _DecordVideoReader is None or _decord_cpu is None:
+            raise ImportError(
+                "decord is required for HFVideoDataset; install with `pip install decord`"
+            )
+        assert _DecordVideoReader is not None and _decord_cpu is not None
+        if isinstance(source, (bytes, bytearray)):
+            import io
+
+            vr = _DecordVideoReader(io.BytesIO(bytes(source)), ctx=_decord_cpu(0))
+        else:
+            vr = _DecordVideoReader(str(source), ctx=_decord_cpu(0))
+        total = len(vr)
+        total = min(total, 10_000)
+        if total < self.num_frames:
+            indices = list(range(total)) + [total - 1] * (self.num_frames - total)
+        else:
+            start = int(torch.randint(0, total - self.num_frames, (1,)).item())
+            indices = list(range(start, start + self.num_frames))
+        frames = vr.get_batch(indices).as_tensor()
+        frames = einops.rearrange(frames, "t h w c -> t c h w")
+        frames = frames.float() / 255.0
+        if frames.shape[-2:] != (self.height, self.width):
+            import torchvision.transforms.functional as TF
+
+            frames = torch.stack([TF.resize(f, [self.height, self.width]) for f in frames])
+        return frames
+
+    def __iter__(self):
+        import logging
+
+        import torch.utils.data as data_utils
+        from datasets import load_dataset
+
+        logger = logging.getLogger(__name__)
+        info = data_utils.get_worker_info()
+        worker_id = info.id if info is not None else 0
+        num_workers = info.num_workers if info is not None else 1
+
+        ds = load_dataset(self.repo_id, split=self.split, streaming=True)
+        if num_workers > 1:
+            ds = ds.shard(num_shards=num_workers, index=worker_id)
+        count = 0
+        for row in ds:
+            if self.max_rows is not None and count >= self.max_rows:
+                break
+            source = row.get(self.video_column, row.get("video"))
+            if source is None:
+                continue
+            try:
+                y = self._load_frames(source)
+            except Exception as error:
+                logger.warning("Skipping unreadable row %s (%s)", source, error)
+                continue
+
+            mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
+            x = y.clone()
+            c = y.shape[1]
+            x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
 
             if self.to_oklab:
                 y = oklab_convert_srgb(y, dim=1)
                 x = oklab_convert_srgb(x, dim=1)
 
+            y = einops.rearrange(y, "t c h w -> c t h w")
+            x = einops.rearrange(x, "t c h w -> c t h w")
+            count += 1
             yield x, y, mask
-
-
-class MixedGameDataset(IterableDataset):
-    """Interleave video clips and T=1 image views (Tier 1-3 combined).
-
-    Args:
-        video_dataset: Source ``GameVideoDataset`` shared with ``mode="video"``.
-        image_dataset: Source ``GameImageDataset`` shared with ``mode="mixed"``.
-        image_interval: Yield one image sample every ``image_interval`` samples.
-    """
-
-    def __init__(
-        self,
-        video_dataset: GameVideoDataset,
-        image_dataset: GameImageDataset,
-        image_interval: int = 5,
-    ):
-        self.video_dataset = video_dataset
-        self.image_dataset = image_dataset
-        self.image_interval = max(1, image_interval)
-
-    def __iter__(self):
-        video_iter = iter(self.video_dataset)
-        image_iter = iter(self.image_dataset)
-        step = 0
-        while True:
-            if step % self.image_interval == self.image_interval - 1:
-                step += 1
-                try:
-                    yield next(image_iter)
-                    continue
-                except StopIteration:
-                    break
-            step += 1
-            try:
-                yield next(video_iter)
-            except StopIteration:
-                break

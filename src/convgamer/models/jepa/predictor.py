@@ -86,20 +86,16 @@ class VJEPAPredictor(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor,
-        mask_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dense prediction on visible + masked tokens.
 
         Args:
             x: Encoder features ``(B, F, T, H, W)``.
             mask: Boolean mask ``(B, T, H, W)`` — True = masked (to be predicted).
-            mask_tokens: Optional pre-computed mask tokens ``(B, F', T, H, W)``.
-                If None, ``self.mask_token`` is broadcast to masked positions.
 
         Returns:
             Dense predictions ``(B, projection_dim, T, H, W)``.
         """
-        del mask_tokens  # mask tokens handled via input_proj + mask_token
         h = self.input_proj(x)  # (B, predictor_dim, T, H, W)
 
         # Resize mask to feature-map spatial dims

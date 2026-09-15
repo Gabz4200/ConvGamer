@@ -50,6 +50,8 @@ def compute_context_lambdas(
     if not has_mask.any():
         return lambdas.reshape(B, T, H, W)
 
+    # Vectorized: for every token, distance to its nearest masked token.
+    # O(N * M) worst case; masked tokens are typically sparse so M << N.
     for b in range(B):
         if not mask_flat[b].any():
             continue
@@ -75,12 +77,42 @@ class JEPALoss(nn.Module):
     Args:
         feature_dim: Channel dimension of features (for any proj layers).
         lambda_base: Base context-loss weight (0.5 video, 0.7 image per Appendix A).
+        lambda_image: Context weight for static-image (T=1) samples.
+        lambda_warmup_steps: Linear warmup steps for ``lambda`` (epochs 50-100
+            in the paper); 0 disables the schedule.
     """
 
-    def __init__(self, feature_dim: int, lambda_base: float = 0.5):
+    def __init__(
+        self,
+        feature_dim: int,
+        lambda_base: float = 0.5,
+        lambda_image: float = 0.7,
+        lambda_warmup_steps: int = 0,
+    ):
         super().__init__()
         self.feature_dim = feature_dim
         self.lambda_base = lambda_base
+        self.lambda_image = lambda_image
+        self.lambda_warmup_steps = max(0, int(lambda_warmup_steps))
+        # Running step counter for the warmup schedule (incremented by the
+        # LightningModule via ``set_step`` after each optimizer step).
+        self._step_counter: torch.Tensor
+        self.register_buffer("_step_counter", torch.zeros((), dtype=torch.long), persistent=False)
+
+    def set_step(self, step: int) -> None:
+        """Update the running step counter used by the lambda warmup."""
+        self._step_counter.fill_(int(step))
+
+    def _effective_lambda(self, mask: torch.Tensor) -> float:
+        """Pick per-modality lambda (video vs image) and apply warmup."""
+        # T=1 samples are static images; T>1 are video.
+        is_image = mask.shape[1] == 1
+        base = self.lambda_image if is_image else self.lambda_base
+        if self.lambda_warmup_steps <= 0:
+            return base
+        # Linear ramp from 0 to base over the warmup window (paper: epochs 50-100).
+        ramp = min(1.0, float(self._step_counter.item()) / float(self.lambda_warmup_steps))
+        return base * ramp
 
     def forward(
         self,
@@ -124,7 +156,9 @@ class JEPALoss(nn.Module):
         l_predict = pred_loss.sum() / n_masked
 
         # L_ctx: distance-weighted, only on context (visible) tokens
-        lambdas = self.compute_context_lambdas(mask_resized)  # (B, T, H, W)
+        lambdas = self.compute_context_lambdas(
+            mask_resized, lambda_base=self._effective_lambda(mask)
+        )  # (B, T, H, W)
         ctx_loss = token_loss * lambdas  # already 0 at masked
         n_ctx = (~mask_resized).sum().clamp(min=1)
         l_ctx = ctx_loss.sum() / n_ctx
@@ -142,4 +176,5 @@ class JEPALoss(nn.Module):
         Returns ``(B, T, H, W)`` floats; 0 at masked positions, decreasing
         with spatio-temporal distance to nearest mask token.
         """
-        return compute_context_lambdas(mask, lambda_base or self.lambda_base)
+        base = self.lambda_base if lambda_base is None else lambda_base
+        return compute_context_lambdas(mask, base)
