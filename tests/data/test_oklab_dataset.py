@@ -24,12 +24,16 @@ from convgamer.data.dataset import (
 from convgamer.data.oklab import srgb_to_oklab
 
 
-def test_oklab_convert_srgb_matches_oklab_py_and_preserves_shape() -> None:
+def test_oklab_convert_srgb_matches_oklab_py() -> None:
     """Our batch converter must match the per-tensor oklab module function."""
     rgb = torch.rand(2, 3, 8, 8)
     converted = oklab_convert_srgb(rgb)
     expected = srgb_to_oklab(rgb.clone(), dim=1)
     torch.testing.assert_close(converted, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_oklab_convert_srgb_preserves_video_shape() -> None:
+    """Video tensor (B,C,T,H,W) converts with shape preserved."""
     video = torch.rand(2, 3, 8, 16, 16)
     assert oklab_convert_srgb(video, dim=1).shape == video.shape
 

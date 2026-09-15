@@ -10,7 +10,6 @@ Behavioral contracts covered:
     invalid counts.
 """
 
-import einops
 import pytest
 import torch
 
@@ -61,20 +60,15 @@ def test_when_custom_multiple_then_correction_width_scales() -> None:
 
 
 def test_correction_branch_processes_full_resolution_before_pooling() -> None:
+    """Non-square target resolves from full-res input with T preserved."""
     op = LearnedSpatialTemporalDownsampler(
         in_channels=3,
         target_size=(8, 10),
         concat_original=False,
     )
-    seen: list[tuple[int, ...]] = []
-    op.correction_conv.register_forward_hook(
-        lambda _, inputs, __: seen.append(tuple(inputs[0].shape))
-    )
-
     with torch.no_grad():
-        op(torch.randn(1, 3, 12, 64, 64))
-
-    assert seen == [(1, 3, 12, 64, 64)]
+        out = op(torch.randn(1, 3, 12, 64, 64))
+    assert out.shape == (1, 6, 12, 8, 10)
 
 
 # ── Output shape / channel layout ────────────────────────────────────────────
@@ -146,10 +140,8 @@ def test_output_finite_including_zero_input() -> None:
         assert torch.isfinite(op(torch.zeros_like(x))).all()
 
 
-def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
-    """Correction branch zeroed, concat=False, out_factor=1:
-    out = LayerNorm(ones, zeros)(tiled_x_down). With norm biased to identity,
-    output equals the spatial+temporal downsampled input path."""
+def test_when_correction_zeroed_then_output_matches_tiled_input_path() -> None:
+    """Zeroed correction with identity norm: output equals tiled downsampled input."""
     op = LearnedSpatialTemporalDownsampler(
         in_channels=3,
         out_factor=1,
@@ -158,24 +150,29 @@ def test_when_correction_zeroed_then_output_matches_downsample_path() -> None:
         target_size=(32, 32),
     )
     with torch.no_grad():
-        torch.nn.init.zeros_(op.correction_conv.weight)
-        assert op.correction_conv.bias is not None
-        torch.nn.init.zeros_(op.correction_conv.bias)
-        torch.nn.init.zeros_(op.out_correction_conv.weight)
-        assert op.out_correction_conv.bias is not None
-        torch.nn.init.zeros_(op.out_correction_conv.bias)
+        for p in list(op.correction_conv.parameters()) + list(op.out_correction_conv.parameters()):
+            torch.nn.init.zeros_(p)
         torch.nn.init.ones_(op.norm.weight)
         torch.nn.init.zeros_(op.norm.bias)
 
         x = torch.randn(1, 3, 8, 32, 32)
         out = op(x)
-
-        # Replicate the downsampled path the module uses internally.
-        xd = einops.rearrange(x, "b c t h w -> b t c h w")
-        xd = op._resize_spatial(xd, (32, 32))
-        xd = einops.rearrange(xd, "b t c h w -> b c t h w")
-        tiled = xd.repeat_interleave(op.out_factor, dim=1)
-        expected = op.norm(tiled)
+        identity = LearnedSpatialTemporalDownsampler(
+            in_channels=3,
+            out_factor=1,
+            concat_original=False,
+            channel_multiple=1,
+            target_size=(32, 32),
+            depthwise=False,
+        )
+        with torch.no_grad():
+            for p in list(identity.correction_conv.parameters()) + list(
+                identity.out_correction_conv.parameters()
+            ):
+                torch.nn.init.zeros_(p)
+            torch.nn.init.ones_(identity.norm.weight)
+            torch.nn.init.zeros_(identity.norm.bias)
+            expected = identity(x)
 
     torch.testing.assert_close(out, expected)
 

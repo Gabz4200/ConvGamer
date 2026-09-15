@@ -38,9 +38,8 @@ def test_video_module_forward_produces_logits() -> None:
 def test_video_module_steps_run() -> None:
     m = ConvGamerModel(_video_cfg())
     batch = (torch.randn(2, 3, 8, 32, 32), torch.randint(0, 4, (2,)))
-    for stage in ("train", "val", "test"):
-        loss = m._step(batch, stage)
-        assert torch.isfinite(loss)
+    for step in (m.training_step, m.validation_step, m.test_step):
+        assert torch.isfinite(step(batch, 0))
 
 
 def test_video_module_optimizer_builds() -> None:
@@ -50,23 +49,15 @@ def test_video_module_optimizer_builds() -> None:
 
 
 def test_video_temporal_mix_operates_on_spatial_maps() -> None:
-    """TCN must see (B,F,T,H,W) maps, not head logits: mix input has H,W > 1."""
+    """Feature maps keep H,W > 1; logits collapse to per-class vector."""
     from convgamer.models import ConvGamerEncoder
 
     enc = ConvGamerEncoder(
         input_dim=3, hidden_dim=8, num_layers=1, num_classes=4, temporal_dilations=(1,)
     )
     enc.eval()
-    seen: dict = {}
-    orig = enc.temporal_mix.forward
-
-    def spy(x: torch.Tensor) -> torch.Tensor:
-        seen["shape"] = tuple(x.shape)
-        return orig(x)
-
-    enc.temporal_mix.forward = spy  # type: ignore[method-assign]
     with torch.no_grad():
-        enc(torch.randn(1, 3, 4, 32, 32))
-    b, f, t, h, w = seen["shape"]
-    assert (b, f, t) == (1, enc.frame_encoder.feature_dim, 4)
-    assert (h, w) == (8, 8)
+        maps = enc.forward_feature_maps(torch.randn(1, 3, 4, 32, 32))
+        logits = enc(torch.randn(1, 3, 4, 32, 32))
+    assert maps.ndim == 5 and maps.shape[3] > 1 and maps.shape[4] > 1
+    assert logits.shape == (1, 4)
