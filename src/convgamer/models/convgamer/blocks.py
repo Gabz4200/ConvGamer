@@ -218,6 +218,7 @@ class CausalTemporalMixer(nn.Module):
                 for d in dilations
             ]
         )
+        self.norms = nn.ModuleList([CausalLayerNorm(channels) for _ in dilations])
         self.act = nn.GELU()
         self.aggregator = MinConvExpLSTM(channels, channels, 3, bias=True)
         self.register_buffer(
@@ -227,8 +228,8 @@ class CausalTemporalMixer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for conv in self.layers:
-            x = x + self.act(conv(x))
+        for conv, norm in zip(self.layers, self.norms, strict=True):
+            x = x + self.act(conv(norm(x)))
         return self.aggregator(x)
 
     def reset_cache(
@@ -255,9 +256,9 @@ class CausalTemporalMixer(nn.Module):
         The aggregator state is held in ``self._agg_state`` and updated in place,
         so callers must use the returned ``next_state`` for chaining.
         """
-        for layer in self.layers:
-            assert isinstance(layer, CausalConv3d)
-            out = layer.step(x_t)
+        for conv, norm in zip(self.layers, self.norms, strict=True):
+            assert isinstance(conv, CausalConv3d)
+            out = conv.step(norm(x_t))
             x_t = x_t + self.act(out)
         x_t_4d = x_t.squeeze(2)
         out_t, self._agg_state = self.aggregator.step(x_t_4d, self._agg_state)
@@ -647,6 +648,15 @@ class MinConvLSTM(nn.Module):
         self.conv_f = nn.Conv2d(in_channels, hidden, kernel_size, padding=pad, bias=bias)
         self.conv_i = nn.Conv2d(in_channels, hidden, kernel_size, padding=pad, bias=bias)
         self.conv_h = nn.Conv2d(in_channels, hidden, kernel_size, padding=pad, bias=bias)
+        self._init_gates()
+
+    def _init_gates(self) -> None:
+        """Forget gate starts open (bias=1), input gate starts low (bias=0),
+        candidate gate zeroed — standard LSTM init for long-sequence stability."""
+        if self.conv_f.bias is not None:
+            nn.init.constant_(self.conv_f.bias, 1.0)
+        if self.conv_i.bias is not None:
+            nn.init.zeros_(self.conv_i.bias)
 
     def gates(self, x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalized forget/input gates for one frame."""
@@ -745,6 +755,15 @@ class MinConvExpLSTM(nn.Module):
         self.conv_f = nn.Conv2d(in_channels, hidden, kernel_size, padding=pad, bias=bias)
         self.conv_i = nn.Conv2d(in_channels, hidden, kernel_size, padding=pad, bias=bias)
         self.conv_h = nn.Conv2d(in_channels, hidden, kernel_size, padding=pad, bias=bias)
+        self._init_gates()
+
+    def _init_gates(self) -> None:
+        """Bias conv_f positive, conv_i zero so the forget gate starts open,
+        keeping the cell memory available for long sequences."""
+        if self.conv_f.bias is not None:
+            nn.init.constant_(self.conv_f.bias, 1.0)
+        if self.conv_i.bias is not None:
+            nn.init.zeros_(self.conv_i.bias)
 
     def gates(self, x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forget gate and its complement for one frame."""

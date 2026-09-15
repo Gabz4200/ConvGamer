@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn.init import trunc_normal_
 
 
 class InceptionDWConv2d(nn.Module):
@@ -107,6 +108,23 @@ class InceptionNeXtBlock(nn.Module):
             if layer_scale_init > 0
             else None
         )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Truncated-normal init (§3.3) for conv weights; defaults for MLP linears.
+
+        Only depthwise conv weights get trunc_normal(std=0.02) — the MLP
+        linears keep their default Kaiming-uniform init so the block is
+        not a near-identity when gamma > 0. LayerNorm starts as identity;
+        gamma is already set by the constructor (layer_scale_init).
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.ones_(self.norm.weight)
+        nn.init.zeros_(self.norm.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
