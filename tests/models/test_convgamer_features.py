@@ -36,7 +36,7 @@ def _cfg(num_classes: int = 4) -> DictConfig:
     return cfg
 
 
-def _enc(num_classes: int = 4) -> ConvGamerEncoder:
+def _enc(num_classes: int | None = 4) -> ConvGamerEncoder:
     return ConvGamerEncoder(
         input_dim=3,
         hidden_dim=16,
@@ -139,6 +139,25 @@ def test_forward_sequence_returns_per_frame_logits() -> None:
         seq = enc(torch.randn(1, 3, 8, 32, 32), return_sequence=True)
     assert seq.shape[-1] == 4
     assert seq.shape[1] == 8  # temporal preserved
+
+
+def test_foundation_seam_headless_then_attachable() -> None:
+    """Default encoder is headless; head attaches later for downstream tasks."""
+    import warnings
+
+    enc: ConvGamerEncoder = _enc(num_classes=None)
+    assert isinstance(enc.head, torch.nn.Identity)
+    with torch.no_grad():
+        pooled = enc(torch.randn(1, 3, 4, 32, 32))
+    assert pooled.shape[1] == enc.frame_encoder.feature_dim
+    enc.add_classification_head(4)
+    with torch.no_grad():
+        logits = enc(torch.randn(1, 3, 4, 32, 32))
+    assert logits.shape == (1, 4)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _enc(num_classes=4)
+    assert any(issubclass(w.category, FutureWarning) for w in caught)
 
 
 def test_module_forward_features_delegates_to_encoder() -> None:

@@ -128,10 +128,17 @@ def test_jepa_tiny_config_composition() -> None:
     assert cfg["model"]["encoder"]["num_layers"] == [3, 3, 9, 3]
     assert cfg["model"]["predictor"]["feature_dim"] == 768
     assert cfg["model"]["loss"]["feature_dim"] == 768
+    assert cfg["model"]["loss"]["lambda_base"] == 0.5
+    assert cfg["model"]["loss"]["lambda_image"] == 0.7
     assert cfg["model"]["ema_decay"] == 0.99925
     assert cfg["model"]["lr"] == 5.25e-4
     assert cfg["optimizer"]["lr"] == 5.25e-4
     assert cfg["optimizer"]["weight_decay"] == 0.04
     assert cfg["data"]["num_frames"] == 12
+    assert cfg["data"]["to_oklab"] is True
+    assert len(cfg["data"]["video_dataset_ids"]) == 7
+    assert len(cfg["data"]["archive_dataset_ids"]) == 4
+    assert len(cfg["data"]["image_dataset_ids"]) == 2
+    assert len(cfg["data"]["regularization_dataset_ids"]) == 1
     assert cfg["trainer"]["max_steps"] == 135000
     assert cfg["trainer"]["precision"] == "16-mixed"

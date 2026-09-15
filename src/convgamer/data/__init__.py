@@ -5,6 +5,7 @@ from .datamemodule import ConvGamerDataModule
 from .dataset import (
     GameImageDataset,
     GameVideoDataset,
+    HFVideoDataset,
     JEPADataset,
     RandomImageDataset,
     RandomSyntheticDataset,
@@ -16,6 +17,7 @@ __all__ = [
     "ConvGamerDataModule",
     "GameImageDataset",
     "GameVideoDataset",
+    "HFVideoDataset",
     "JEPADataset",
     "RandomImageDataset",
     "RandomSyntheticDataset",

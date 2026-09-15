@@ -61,6 +61,7 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
         self.use_amp = use_amp
+        self._train_step = 0  # manual counter for the lambda warmup schedule
 
         # EMA target encoder (shadow copy of encoder)
         self.ema_encoder = EMAEncoder(encoder, decay=ema_decay)
@@ -125,9 +126,12 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         # Dense predictive loss (L_predict + L_ctx)
         return self.loss_fn(pred, y_feat, mask)
 
-    def training_step(self, batch, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
+    def training_step(self, batch, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # noqa: ARG002
         x, y, mask = batch
         loss = self(x, y, mask)
+        # Feed the running step to the loss for the lambda warmup schedule.
+        self._train_step += 1
+        self.loss_fn.set_step(self._train_step)
         if self._trainer is not None:
             self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss

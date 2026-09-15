@@ -32,9 +32,9 @@ def _build_datamodule(cfg: DictConfig):
             to_oklab=cfg.data.to_oklab,
             video_dataset_ids=cfg.data.get("video_dataset_ids", []),
             image_dataset_ids=cfg.data.get("image_dataset_ids", []),
+            regularization_dataset_ids=cfg.data.get("regularization_dataset_ids", []),
             data_dir=cfg.data.get("data_dir", "./data/jepa"),
             mode=mode,
-            image_interval=cfg.data.get("image_interval", 5),
             sample_stride=cfg.data.get("sample_stride", 1),
             max_frames=cfg.data.get("max_frames", 10_000),
         )

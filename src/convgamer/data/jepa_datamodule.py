@@ -1,11 +1,13 @@
 """LightningDataModule for V-JEPA 2.1 ConvGamer pretraining.
 
-Wires together gaming video datasets (Tier 1/2/7) and static-image
-datasets (Tier 3) into a unified JEPA training pipeline.
+Wires together gaming video datasets (Tier 1/2/7), static-image
+datasets (Tier 3) and a regularization video dataset (Kinetics) into a
+unified JEPA training pipeline.
 
 Datasets configured in ``configs/data/jepa.yaml``:
     - video_datasets: list of HF dataset IDs or local paths
     - image_datasets: list of HF dataset IDs or local paths
+    - regularization_datasets: list of HF video datasets (Kinetics, UCF101)
     - num_frames: temporal chunk size (T=8-12 for T4)
     - mask_ratio: fraction of spatio-temporal tokens to mask
 """
@@ -18,8 +20,8 @@ from torch.utils.data import DataLoader
 from convgamer.data.dataset import (
     GameImageDataset,
     GameVideoDataset,
+    HFVideoDataset,
     JEPADataset,
-    MixedGameDataset,
 )
 
 
@@ -29,7 +31,11 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
     Supports three modes:
     - ``"synthetic"``: ``JEPADataset`` for smoke testing (no downloads).
     - ``"video"``: ``GameVideoDataset`` iterable over MP4 files.
-    - ``"mixed"``: video + image datasets interleaved (20% images).
+    - ``"mixed"``: separate video and image dataloaders (V-JEPA 2.1 §2.3.3).
+
+    In ``"mixed"`` mode the video and image dataloaders are returned as a
+    list from ``train_dataloader``; Lightning alternates between them so
+    each batch stays modality-homogeneous (all T=12 or all T=1).
     """
 
     def __init__(
@@ -44,10 +50,10 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         to_oklab: bool = True,
         video_dataset_ids: list[str] | None = None,
         image_dataset_ids: list[str] | None = None,
+        regularization_dataset_ids: list[str] | None = None,
         data_dir: str = "./data/jepa",
         mode: str = "synthetic",
         num_synthetic_samples: int = 64,
-        image_interval: int = 5,
         sample_stride: int = 1,
         max_frames: int = 10_000,
     ):
@@ -62,10 +68,10 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         self.to_oklab = to_oklab
         self.video_dataset_ids = video_dataset_ids or []
         self.image_dataset_ids = image_dataset_ids or []
+        self.regularization_dataset_ids = regularization_dataset_ids or []
         self.data_dir = data_dir
         self.mode = mode
         self.num_synthetic_samples = num_synthetic_samples
-        self.image_interval = image_interval  # inject 1 image every N video batches
         self.sample_stride = sample_stride
         self.max_frames = max_frames
 
@@ -91,6 +97,20 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
             data_dir=self.data_dir,
         )
 
+    def _build_regularization_dataset(self) -> HFVideoDataset | None:
+        if not self.regularization_dataset_ids:
+            return None
+        repo = self.regularization_dataset_ids[0]
+        return HFVideoDataset(
+            repo_id=repo,
+            num_frames=self.num_frames,
+            height=self.height,
+            width=self.width,
+            mask_ratio=self.mask_ratio,
+            to_oklab=self.to_oklab,
+            data_dir=self.data_dir,
+        )
+
     def setup(self, stage: str | None = None) -> None:  # noqa: ARG002
         if self.mode == "synthetic":
             self.train_ds = JEPADataset(
@@ -104,17 +124,39 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         elif self.mode == "video":
             self.train_ds = self._build_video_dataset()
         elif self.mode == "mixed":
-            self.train_ds = MixedGameDataset(
-                video_dataset=self._build_video_dataset(),
-                image_dataset=self._build_image_dataset(),
-                image_interval=self.image_interval,
-            )
+            self.video_ds = self._build_video_dataset()
+            self.image_ds = self._build_image_dataset()
+            self.reg_ds = self._build_regularization_dataset()
+            self.train_ds = self.video_ds
         else:
             raise ValueError(f"mode must be 'synthetic', 'video', or 'mixed', got {self.mode!r}")
 
-    def train_dataloader(self) -> DataLoader:
+    def train_dataloader(self) -> DataLoader | list[DataLoader]:
         if not hasattr(self, "train_ds"):
             raise RuntimeError("train_ds not initialized; call setup() first")
+        if self.mode == "mixed":
+            video_dl = DataLoader(
+                self.video_ds,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                drop_last=True,
+            )
+            image_dl = DataLoader(
+                self.image_ds,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                drop_last=True,
+            )
+            loaders = [video_dl, image_dl]
+            if self.reg_ds is not None:
+                reg_dl = DataLoader(
+                    self.reg_ds,
+                    batch_size=self.batch_size,
+                    num_workers=self.num_workers,
+                    drop_last=True,
+                )
+                loaders.append(reg_dl)
+            return loaders
         return DataLoader(
             self.train_ds,
             batch_size=self.batch_size,
