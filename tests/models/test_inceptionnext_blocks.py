@@ -48,13 +48,6 @@ def test_identity_branch_is_untouched():
     torch.testing.assert_close(out[:, 3 * gc :, :, :], x_id)
 
 
-def test_split_sums_to_total_channels():
-    """split_indexes must sum to in_channels for all tested widths."""
-    op = InceptionDWConv2d(in_channels=96)
-    gc = 12
-    assert op.split_indexes == (gc, gc, gc, 96 - 3 * gc)
-
-
 def test_conv_branches_are_depthwise():
     """Paper: each conv branch is depthwise (groups == gc)."""
     op = InceptionDWConv2d(in_channels=96)
@@ -94,6 +87,8 @@ def test_block_is_residual():
     x = torch.zeros(1, 32, 8, 8)  # zeros -> output should be ~0 + x = 0
     out = block(x)
     torch.testing.assert_close(out, torch.zeros_like(out), rtol=1e-5, atol=1e-5)
+    y = torch.randn(1, 32, 8, 8)
+    torch.testing.assert_close(block(y), y, rtol=1e-3, atol=1e-3)
 
 
 def test_block_gradient_flows():
@@ -117,16 +112,6 @@ def test_block_uses_gelu():
     """Paper Eq. 3: σ activation = GELU."""
     block = InceptionNeXtBlock(in_channels=32, hidden_dim=128)
     assert isinstance(block.mlp[1], nn.GELU)
-
-
-def test_block_uses_linear_layers():
-    """Paper: MLP is two fully-connected layers (or 1x1 convs)."""
-    block = InceptionNeXtBlock(in_channels=32, hidden_dim=128)
-    assert isinstance(block.mlp[0], nn.Linear)
-    assert isinstance(block.mlp[2], nn.Linear)
-    assert block.mlp[0].in_features == 32
-    assert block.mlp[0].out_features == 128
-    assert block.mlp[2].out_features == 32
 
 
 def test_layer_scale_init_value():

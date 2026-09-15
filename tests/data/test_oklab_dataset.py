@@ -24,19 +24,14 @@ from convgamer.data.dataset import (
 from convgamer.data.oklab import srgb_to_oklab
 
 
-def test_oklab_convert_srgb_matches_oklab_py() -> None:
+def test_oklab_convert_srgb_matches_oklab_py_and_preserves_shape() -> None:
     """Our batch converter must match the per-tensor oklab module function."""
     rgb = torch.rand(2, 3, 8, 8)
     converted = oklab_convert_srgb(rgb)
     expected = srgb_to_oklab(rgb.clone(), dim=1)
     torch.testing.assert_close(converted, expected, atol=1e-5, rtol=1e-4)
-
-
-def test_oklab_convert_srgb_video_shape() -> None:
-    """Video tensor (B,C,T,H,W) -> same shape oklab."""
     video = torch.rand(2, 3, 8, 16, 16)
-    converted = oklab_convert_srgb(video, dim=1)
-    assert converted.shape == video.shape
+    assert oklab_convert_srgb(video, dim=1).shape == video.shape
 
 
 def test_jepa_dataset_yields_masked_x_and_clean_y() -> None:
@@ -55,6 +50,7 @@ def test_jepa_dataset_yields_masked_x_and_clean_y() -> None:
     assert mask.shape == (8, 32, 32)
     assert mask.dtype == torch.bool
     assert mask.sum() > 0  # some tokens masked
+    assert not torch.equal(x, y)  # masked view differs from clean target
 
 
 def test_jepa_dataset_oklab_output() -> None:
@@ -70,6 +66,8 @@ def test_jepa_dataset_oklab_output() -> None:
     x, y, mask = dataset[0]
     # Oklab L channel should be in ~[0, 1] for sRGB inputs
     assert x.shape[0] == 3  # still 3 channels in oklab
+    assert torch.isfinite(x).all()
+    assert x[0].min() >= -0.05 and x[0].max() <= 1.05
 
 
 def test_jepa_dataset_image_mode_temporal_axis() -> None:

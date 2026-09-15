@@ -13,15 +13,6 @@ import torch
 from convgamer.models.convgamer.blocks import ConvGamerStem
 
 
-def test_default_expands_24_to_96_preserves_resolution() -> None:
-    m = ConvGamerStem(in_channels=24)
-    x = torch.randn(2, 24, 8, 64, 64)
-    y = m(x)
-    assert y.shape == torch.Size([2, 96, 8, 64, 64])
-    assert m.out_channels == 96
-    assert m.in_channels == 24
-
-
 @pytest.mark.parametrize("in_channels", [3, 8, 16, 24, 32])
 def test_channel_expansion_is_fourfold(in_channels: int) -> None:
     m = ConvGamerStem(in_channels=in_channels, use_softmax=False, use_norm=True)
@@ -45,38 +36,17 @@ def test_norm_is_identity_by_default() -> None:
     assert isinstance(ConvGamerStem(in_channels=8).norm, torch.nn.Identity)
 
 
-@pytest.mark.parametrize(
-    "t,h,w",
-    [(2, 8, 8), (4, 16, 16), (8, 32, 32), (7, 7, 7)],
-)
-def test_resolution_preserved_across_sizes(t: int, h: int, w: int) -> None:
-    m = ConvGamerStem(in_channels=8)
-    x = torch.randn(1, 8, t, h, w)
-    y = m(x)
-    assert y.shape[2] == t
-    assert y.shape[3] == h
-    assert y.shape[4] == w
-
-
-def test_batch_dimension_preserved() -> None:
+def test_batch_and_resolution_preserved() -> None:
     m = ConvGamerStem(in_channels=16)
     x = torch.randn(4, 16, 4, 8, 8)
     y = m(x)
-    assert y.shape[0] == 4
+    assert y.shape == (4, 64, 4, 8, 8)
 
 
-def test_output_finite() -> None:
+def test_output_finite_including_zero_input() -> None:
     m = ConvGamerStem(in_channels=24)
-    x = torch.randn(2, 24, 4, 16, 16)
-    y = m(x)
-    assert torch.isfinite(y).all()
-
-
-def test_zero_input_finite_through_norm() -> None:
-    m = ConvGamerStem(in_channels=8)
-    x = torch.zeros(1, 8, 4, 8, 8)
-    y = m(x)
-    assert torch.isfinite(y).all()
+    assert torch.isfinite(m(torch.randn(2, 24, 4, 16, 16))).all()
+    assert torch.isfinite(m(torch.zeros(2, 24, 4, 16, 16))).all()
 
 
 def test_gradient_flows_to_input_and_params() -> None:

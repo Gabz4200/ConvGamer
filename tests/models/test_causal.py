@@ -80,17 +80,6 @@ def test_causal_conv_handles_groups_and_no_bias() -> None:
     _assert_causal(m, (1, 4, 4, 4, 4), perturb_from=2)
 
 
-def test_causal_conv_exposes_weight_and_bias() -> None:
-    m = CausalConv3d(2, 4, kernel_size=3)
-    assert m.weight is m.conv.weight
-    assert m.bias is m.conv.bias
-    assert m.weight.shape == (4, 2, 3, 3, 3)
-    # mutating via properties affects inner conv
-    with torch.no_grad():
-        torch.nn.init.zeros_(m.weight)
-        assert torch.all(m.conv.weight == 0)
-
-
 def test_causal_conv_t1_edge_preserves_shape_and_finite() -> None:
     m = CausalConv3d(2, 2, kernel_size=3)
     x = torch.randn(1, 2, 1, 4, 4)

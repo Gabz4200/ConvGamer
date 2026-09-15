@@ -38,7 +38,12 @@ def test_jepa_model_training_step_runs() -> None:
 
     loss = model.training_step((x, y, mask), batch_idx=0)
     assert loss.dim() == 0  # scalar
+    assert torch.isfinite(loss)
     assert loss.item() > 0
+    loss.backward()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all() for p in model.encoder.parameters()
+    )
 
 
 def test_jepa_model_ema_encoder_exists() -> None:
