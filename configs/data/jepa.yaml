@@ -1,0 +1,40 @@
+# V-JEPA 2.1 ConvGamer pretraining data config
+# Tier 1: Direct MP4 datasets (no extraction needed)
+# Tier 2: Extracted archives (download + extract first)
+# Tier 3: Static images (T=1 spatial regularizer)
+
+mode: synthetic          # synthetic | video | mixed
+batch_size: 8            # per-GPU; effective = 8 × 2 (T4) = 16
+num_workers: 4
+num_frames: 12           # T — within T4 16GB VRAM budget
+height: 224
+width: 224
+mask_ratio: 0.25         # V-JEPA 2.1 spatial mask scale [0.15, 0.7]
+image_mask_ratio: 0.10   # lower mask for spatial regularizer
+to_oklab: true           # RGB -> Oklab conversion in dataset loading
+image_interval: 5        # inject 1 image batch every 5 video batches
+data_dir: ./data/jepa
+num_synthetic_samples: 64
+sample_stride: 1         # frames to skip when slicing long MP4s
+max_frames: 10000        # cap decoded frames per clip (prevents OOM)
+
+# Tier 1: Direct MP4 datasets
+video_dataset_ids:
+  # Primary workhorse — low res, high VRAM efficiency
+  - Infatoshi/terraria-gameplay-256x144-15fps
+  # Kinematic contrast — parallax, dynamic lighting
+  - Xiaokunfeng2022/hollow_knight_dataset
+  - teawhite/hollow-knight-boss-deaths
+  # Diversity injection — non-rigid animations
+  - markov-ai/gaming-500-hours
+  # Environmental diversity — map zones
+  - datasetter458/hollow-knight-diverse-dataset
+  # Grid-based physics
+  - DylanRiden/smb-worldmodel-data
+  # Hand-drawn 2D kinematics
+  - ch1415926/cuphead
+
+# Tier 3: Static images (T=1 spatial regularizer)
+image_dataset_ids:
+  - asgaardlab/VideoGameBunny-Dataset
+  - VideoGameBunny/Dataset

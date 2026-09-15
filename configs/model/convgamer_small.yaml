@@ -1,0 +1,14 @@
+target: convgamer.models.convgamer.encoder.ConvGamerEncoder
+
+# ConvGamer-Small: InceptionNeXt-Small backbone inside the causal ConvGamer wrapper.
+# 4 stages, [3,3,9,3] blocks, hidden_dim 96, wider stages (192, 384, 768, 1024)
+input_dim: 3
+hidden_dim: 96
+num_layers: [3, 3, 9, 3]
+num_classes: null  # Foundation model — no classification head
+layer_scale_init: 1.0e-6
+mlp_ratios: [4, 4, 4, 3]
+out_factor: 2
+use_softmax: false
+temporal_dilations: [1, 2, 4]
+widths: [192, 384, 768, 1024]

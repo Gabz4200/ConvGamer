@@ -1,0 +1,6 @@
+# V-JEPA 2.1 Appendix A optimizer config
+target: torch.optim.AdamW
+
+lr: 5.25e-4          # peak LR after warmup
+weight_decay: 0.04   # Appendix A
+betas: [0.9, 0.999]

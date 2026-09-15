@@ -1,0 +1,37 @@
+# V-JEPA 2.1 ConvGamer-Tiny model config
+# ConvGamerEncoder (InceptionNeXt-Tiny backbone) is a foundation model
+# (no classification head).
+target: convgamer.models.jepa  # marker for build_model() JEPA dispatch
+
+encoder:
+  _target_: convgamer.models.convgamer.encoder.ConvGamerEncoder
+  input_dim: 3
+  hidden_dim: 96
+  num_layers: [3, 3, 9, 3]   # InceptionNeXt-Tiny stage layout
+  num_classes: null          # Foundation model — no head (added later)
+  layer_scale_init: 1e-6
+  mlp_ratios: [4, 4, 4, 3]
+  out_factor: 2
+  use_softmax: false
+  temporal_dilations: [1, 2, 4]
+
+# V-JEPA 2.1 predictor (§2.3.1)
+predictor:
+  _target_: convgamer.models.jepa.VJEPAPredictor
+  feature_dim: 768           # 96 * 2^3 (4 stages, doubling each)
+  predictor_dim: 384
+  num_layers: 4              # reduced from 24 (ViT-G) for ConvNeXt-Tiny
+  num_levels: 1              # single level; deep self-supervision later
+
+# Loss
+loss:
+  _target_: convgamer.models.jepa.JEPALoss
+  feature_dim: 768
+  lambda_base: 0.5          # video lambda (0.5 video, 0.7 image per Appendix A)
+
+# Training hyperparameters (Appendix A)
+ema_decay: 0.99925
+lr: 5.25e-4
+weight_decay: 0.04
+warmup_steps: 12000
+total_steps: 135000

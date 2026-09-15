@@ -1,0 +1,12 @@
+target: convgamer.models.inception_next.encoder.InceptionNeXtEncoder
+
+# InceptionNeXt-Small (arXiv:2303.16900 Table 3)
+# Matches ConvNeXt-Small: 4 stages, [3,3,9,3] blocks, hidden_dim 96
+# with wider stages (192, 384, 768, 1024) for ~20M params
+input_dim: 3
+hidden_dim: 96
+num_layers: [3, 3, 9, 3]
+num_classes: 10
+layer_scale_init: 1.0e-6
+mlp_ratios: [4, 4, 4, 3]
+widths: [192, 384, 768, 1024]

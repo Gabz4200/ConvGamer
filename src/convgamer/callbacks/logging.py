@@ -6,7 +6,9 @@ from collections.abc import Callable
 from pytorch_lightning import Callback
 from pytorch_lightning.callbacks import (
     EarlyStopping,
+    LearningRateMonitor,
     ModelCheckpoint,
+    Timer,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,8 @@ _BUILDER_FOR_LAZY: dict[str, Callable[[], Callback]] = {
     "early_stopping": lambda: EarlyStopping(monitor="val/loss", mode="min", patience=5),
     "taichi_init": _taichi_init_callback,
     "logger": lambda: ConvGamerLogger(),
+    "lr_monitor": lambda: LearningRateMonitor(logging_interval="step"),
+    "timer": lambda: Timer(),
 }
 
 

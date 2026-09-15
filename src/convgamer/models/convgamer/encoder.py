@@ -7,6 +7,8 @@ frame influences any past output. Output for frame ``t`` pools only frames
 
 from __future__ import annotations
 
+import warnings
+
 import einops
 import torch
 from torch import nn
@@ -23,11 +25,15 @@ from convgamer.models.registry import register_model
 
 @register_model("ConvGamerEncoder")
 class ConvGamerEncoder(BaseModel):
-    """Video encoder: downsampler stem, per-frame maps, causal temporal mix.
+    """Video encoder: downsampler stem, per-frame InceptionNeXt, causal head.
 
     Per-frame path uses ``forward_feature_map`` (spatial maps, never the
     classification head): maps are stacked to (B, F, T, H, W), mixed
     causally across T at full resolution, then spatially pooled.
+
+    As a foundation model for JEPA pre-training this encoder exposes
+    ``forward_features`` as its public seam; the classification ``head``
+    is retained only for downstream fine-tuning.
     """
 
     def __init__(
@@ -35,13 +41,14 @@ class ConvGamerEncoder(BaseModel):
         input_dim: int = 3,
         hidden_dim: int = 96,
         num_layers: int | tuple[int, ...] = 3,
-        num_classes: int = 1000,
+        num_classes: int | None = None,
         layer_scale_init: float = 1e-6,
         mlp_ratios: tuple[int, int, int, int] = (4, 4, 4, 3),
         out_factor: int = 2,
         use_softmax: bool = False,
         target_size: tuple[int, int] | int | None = None,
         temporal_dilations: tuple[int, ...] = (1, 2, 4),
+        widths: tuple[int, int, int, int] | None = None,
     ):
         super().__init__()
 
@@ -61,16 +68,29 @@ class ConvGamerEncoder(BaseModel):
             num_classes=0,
             layer_scale_init=layer_scale_init,
             mlp_ratios=mlp_ratios,
+            widths=widths,
         )
         self.temporal_mix = CausalTemporalMixer(
             channels=self.frame_encoder.feature_dim, dilations=temporal_dilations
         )
         self.norm = nn.LayerNorm(self.frame_encoder.feature_dim)
-        self.head = (
-            nn.Linear(self.frame_encoder.feature_dim, num_classes)
-            if num_classes > 0
-            else nn.Identity()
-        )
+        # Foundation-model seam: no classification head by default.
+        # Callers may attach one later via ``add_classification_head``.
+        if num_classes is not None and num_classes != 0 and num_classes is not None:
+            warnings.warn(
+                "ConvGamerEncoder is now a foundation model without a classification "
+                "head. Pass ``num_classes=None`` (or omit). The head will be added "
+                "separately via ``add_classification_head`` for downstream tasks.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self.head = nn.Linear(self.frame_encoder.feature_dim, num_classes)
+        else:
+            self.head = nn.Identity()
+
+    def add_classification_head(self, num_classes: int) -> None:
+        """Attach a classification head after foundation pre-training."""
+        self.head = nn.Linear(self.frame_encoder.feature_dim, num_classes)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Per-frame video features ``(B, F, T)`` — no causal pooling, no head.
@@ -89,6 +109,22 @@ class ConvGamerEncoder(BaseModel):
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
         mixed = self.temporal_mix(video)
         return mixed.mean(dim=[3, 4])
+
+    def forward_feature_maps(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatial feature maps ``(B, F, T, H', W')`` for dense JEPA prediction.
+
+        Same pipeline as ``forward_features`` but without the final spatial
+        mean-pooling, preserving the 2D spatial structure needed by the
+        predictor to produce dense predictions.
+        """
+        x = self.stem(x)
+        b, _c, t, _h, _w = x.shape
+        frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
+        maps = self.frame_encoder.forward_feature_map(frames)
+        _, _, h, w = maps.shape
+        video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
+        mixed = self.temporal_mix(video)
+        return mixed
 
     def init_state(
         self,
@@ -136,6 +172,9 @@ class ConvGamerEncoder(BaseModel):
             (matching ``forward_features`` frame ``t``) and ``logits_t`` is
             ``(B, K)`` or ``(B, 1, K)`` (matching ``forward`` pooled at frame
             ``t``).
+
+            When no classification head is attached (``head`` is
+            ``nn.Identity``), ``logits`` is the pooled/normed feature directly.
         """
         b = x_t.shape[0]
         x_t = x_t.unsqueeze(2)  # (B, C, 1, H, W)
@@ -171,6 +210,9 @@ class ConvGamerEncoder(BaseModel):
         ``forward_features`` returns per-frame features; here we apply the
         causal cumulative-mean (frame ``t`` sees only ``<= t``) then the head.
         ``return_sequence=True`` skips pooling and emits per-frame logits.
+
+        As a foundation model with no head, returns the pooled feature
+        ``(B, F)`` instead of logits.
         """
         video = self.forward_features(x)
         if return_sequence:

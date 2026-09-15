@@ -1,0 +1,11 @@
+# V-JEPA 2.1 ConvGamer-Tiny experiment config
+# Implements: arXiv:2603.14482 "V-JEPA 2.1: Unlocking Dense Features"
+# ConvGamer-Tiny (InceptionNeXt-Tiny backbone, ~35M params) on 2x T4.
+#
+# Usage:
+#   uv run train experiment=jepa_tiny model=jepa_tiny data=jepa_tiny \
+#       trainer=jepa_tiny optimizer=jepa
+
+# Training
+seed: 42
+fast_dev_run: false

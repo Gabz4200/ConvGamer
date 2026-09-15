@@ -75,21 +75,26 @@ class InceptionNeXtEncoder(BaseModel):
         num_classes: int = 1000,
         layer_scale_init: float = 1e-6,
         mlp_ratios: tuple[int, int, int, int] = (4, 4, 4, 3),
+        widths: tuple[int, int, int, int] | None = None,
     ):
         super().__init__()
 
         if len(mlp_ratios) != 4:
             raise ValueError(f"mlp_ratios must have length 4, got {len(mlp_ratios)}")
-        self.stem = nn.Conv2d(input_dim, hidden_dim, kernel_size=4, stride=4)
-        self.stem_norm = nn.LayerNorm(hidden_dim)
+        if widths is None:
+            widths = (hidden_dim, hidden_dim * 2, hidden_dim * 4, hidden_dim * 8)
+        if len(widths) != 4:
+            raise ValueError(f"widths must have length 4, got {len(widths)}")
+        self.stem = nn.Conv2d(input_dim, widths[0], kernel_size=4, stride=4)
+        self.stem_norm = nn.LayerNorm(widths[0])
 
         layers_per_stage = _normalize_layer_count(num_layers, stages=4)
 
         stages: list[nn.Module] = []
-        last_out_ch = hidden_dim
+        last_out_ch = widths[0]
         for stage_idx in range(4):
-            in_ch = hidden_dim if stage_idx == 0 else hidden_dim * (2 ** (stage_idx - 1))
-            out_ch = hidden_dim * (2**stage_idx)
+            in_ch = widths[stage_idx] if stage_idx == 0 else widths[stage_idx - 1]
+            out_ch = widths[stage_idx]
             last_out_ch = out_ch
             stage: list[nn.Module] = []
             if stage_idx > 0:
