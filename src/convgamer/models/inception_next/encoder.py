@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn.init import trunc_normal_
 
 from ..base import BaseModel
 from ..registry import register_model
@@ -107,6 +108,26 @@ class InceptionNeXtEncoder(BaseModel):
         self.stages = nn.Sequential(*stages)
         self.feature_dim = last_out_ch
         self.head = nn.Linear(last_out_ch, num_classes) if num_classes > 0 else nn.Identity()
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Truncated-normal stem/downsample/head init; blocks self-init (§3.3)."""
+        trunc_normal_(self.stem.weight, std=0.02)
+        if self.stem.bias is not None:
+            nn.init.zeros_(self.stem.bias)
+        nn.init.ones_(self.stem_norm.weight)
+        nn.init.zeros_(self.stem_norm.bias)
+        # Stage-downsample 1x1 convs
+        for m in self.stages.modules():
+            if isinstance(m, nn.Conv2d) and m.kernel_size == (1, 1):
+                trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        # Classification head (when present)
+        if isinstance(self.head, nn.Linear):
+            trunc_normal_(self.head.weight, std=0.02)
+            nn.init.zeros_(self.head.bias)
 
     def _stem_forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)

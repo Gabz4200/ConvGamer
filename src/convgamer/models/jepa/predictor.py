@@ -19,12 +19,13 @@ __all__ = ["VJEPAPredictor"]
 class _ConvNeXtBlock(nn.Module):
     """Lightweight ConvNeXt-style block for the predictor."""
 
-    def __init__(self, dim: int, expansion: int = 4):
+    def __init__(self, dim: int, expansion: int = 4, layer_scale_init: float = 1e-6):
         super().__init__()
         self.dw = nn.Conv3d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = nn.LayerNorm(dim)
         self.pw1 = nn.Linear(dim, expansion * dim)
         self.pw2 = nn.Linear(expansion * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init * torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W)
@@ -36,7 +37,7 @@ class _ConvNeXtBlock(nn.Module):
         x = torch.nn.functional.gelu(x)
         x = self.pw2(x)
         x = x.permute(0, 4, 1, 2, 3)  # back to (B, C, T, H, W)
-        return residual + x
+        return residual + self.gamma.view(1, -1, 1, 1, 1) * x
 
 
 class VJEPAPredictor(nn.Module):
@@ -82,11 +83,24 @@ class VJEPAPredictor(nn.Module):
             ]
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Truncated-normal init for stable JEPA training (no large projections)."""
+        from torch.nn.init import trunc_normal_
+
+        all_convs = [self.input_proj, *self.heads]
+        for m in all_convs:
+            w = m.weight
+            assert isinstance(w, torch.Tensor)
+            trunc_normal_(w, std=0.02)
+            b = m.bias
+            if b is not None:
+                assert isinstance(b, torch.Tensor)
+                nn.init.zeros_(b)
+        nn.init.zeros_(self.mask_token)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Dense prediction on visible + masked tokens.
 
         Args:

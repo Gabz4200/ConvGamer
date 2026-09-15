@@ -105,3 +105,54 @@ def test_jepa_ema_checkpoint_round_trip() -> None:
     restored.on_load_checkpoint(checkpoint)
     restored_shadow = next(iter(restored.ema_encoder.state_dict().values()))
     torch.testing.assert_close(restored_shadow, torch.full_like(restored_shadow, 3.0))
+
+
+def test_jepa_training_step_output_is_finite() -> None:
+    """Full JEPA forward + backward: loss and gradients must be finite."""
+    model = _tiny_jepa_model(ema_decay=0.99)
+
+    x = torch.randn(1, 3, 4, 16, 16)
+    y = torch.randn(1, 3, 4, 16, 16)
+    mask = torch.zeros(1, 4, 16, 16, dtype=torch.bool)
+    mask[0, :, :8, :8] = True
+
+    loss = model.training_step((x, y, mask), batch_idx=0)
+    assert torch.isfinite(loss), "JEPA loss is NaN or Inf"
+    loss.backward()
+    # All encoder and predictor gradients must be finite
+    for p in model.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), "Non-finite gradient in parameter"
+
+
+def test_jepa_multi_step_training_stability() -> None:
+    """Multi-step JEPA training: gradients must not explode or vanish.
+
+    Runs 5 training steps and checks gradient norms stay healthy.
+    """
+    model = _tiny_jepa_model(ema_decay=0.99)
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
+
+    x = torch.randn(1, 3, 4, 16, 16)
+    y = torch.randn(1, 3, 4, 16, 16)
+    mask = torch.zeros(1, 4, 16, 16, dtype=torch.bool)
+    mask[0, :, :8, :8] = True
+
+    grad_norms: list[float] = []
+    for _ in range(5):
+        opt.zero_grad()
+        loss = model.training_step((x, y, mask), batch_idx=0)
+        assert torch.isfinite(loss), "Loss became non-finite"
+        loss.backward()
+        model.on_train_batch_end(None, (x, y, mask), 0)
+
+        total_norm = sum(
+            p.grad.abs().sum().item() ** 2 for p in model.parameters() if p.grad is not None
+        )
+        grad_norms.append(total_norm**0.5)
+        opt.step()
+
+    max_norm = max(grad_norms)
+    min_norm = min(grad_norms)
+    assert min_norm > 1e-6, f"Gradient vanishing: min norm = {min_norm}"
+    assert max_norm < 1e4, f"Gradient explosion: max norm = {max_norm}"
