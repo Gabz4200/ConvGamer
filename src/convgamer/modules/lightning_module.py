@@ -71,6 +71,8 @@ class InceptionNeXtModule(ClassificationLightningModule):
     not import or reference any ConvGamer-specific code.
     """
 
+    model: InceptionNeXtEncoder
+
     def __init__(self, cfg: DictConfig):
         super().__init__()
         container = (
@@ -97,6 +99,8 @@ class ConvGamerModel(ClassificationLightningModule):
     Batch is ``(video, label)`` with video shaped (B, C, T, H, W).
     Fully causal: pooled logits at frame ``t`` see only frames ``<= t``.
     """
+
+    model: ConvGamerEncoder
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
