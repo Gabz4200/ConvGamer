@@ -191,10 +191,9 @@ class CausalTemporalMixer(nn.Module):
 
     Stacks ``CausalConv3d(kernel=(3, 1, 1))`` layers with dilations
     ``(1, 2, 4)`` by default: receptive field 15 subsampled frames with
-    3 layers instead of 3 frames for a single conv. Each layer is
-    residual (``x + GELU(conv(x))``); all ops are pointwise or causal,
-    so no future frame leaks into the past. Residuals are unnormalized:
-    fine at the default depth, add a per-layer norm past ~6 layers.
+    3 layers instead of 3 frames for a single conv. Each layer is a pre-norm
+    residual (``x + GELU(conv(norm(x)))``); all ops are pointwise or causal,
+    so no future frame leaks into the past.
     """
 
     def __init__(
