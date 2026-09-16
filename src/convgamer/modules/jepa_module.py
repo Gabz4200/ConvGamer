@@ -36,7 +36,6 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         weight_decay: AdamW weight decay.
         warmup_steps: Linear warmup steps.
         total_steps: Total training steps for constant schedule.
-        use_amp: Mixed precision (FP16 for T4).
     """
 
     def __init__(
@@ -49,7 +48,6 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         weight_decay: float = 0.04,
         warmup_steps: int = 12_000,
         total_steps: int = 135_000,
-        use_amp: bool = True,
     ):
         super().__init__()
         self.encoder = encoder
@@ -60,7 +58,6 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
-        self.use_amp = use_amp
         self._train_step = 0  # manual counter for the lambda warmup schedule
 
         # EMA target encoder (shadow copy of encoder)
@@ -159,8 +156,9 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         state = checkpoint.get("ema_state_dict")
         if state is not None:
             self.ema_encoder.load_state_dict(state)
+        self._sync_ema_shadow()
 
-    def configure_optimizers(self):
+    def configure_optimizers(self):  # type: ignore[override]
         """AdamW with linear warmup + constant schedule (Appendix A)."""
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -174,7 +172,20 @@ class ConvGamerVJEPAModel(pl.LightningModule):
             return 1.0  # constant after warmup
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        return [optimizer], [scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
+
+    def _sync_ema_shadow(self) -> None:
+        """Move the non-module EMA shadow onto the online encoder's device/dtype."""
+        shadow = self.ema_encoder.shadow_module
+        ref = next(self.encoder.parameters(), None)
+        if shadow is None or ref is None:
+            return
+        if next(shadow.parameters(), None) is None:
+            return
+        shadow.to(device=ref.device, dtype=ref.dtype)
 
     def setup(self, stage: str | None = None) -> None:
         """Ensure EMA shadow matches encoder at the start of training.
@@ -185,3 +196,4 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         resumed = trainer is not None and getattr(trainer, "ckpt_path", None) not in (None, "")
         if stage == "fit" and not resumed:
             self.ema_encoder = EMAEncoder(self.encoder, decay=self.ema_decay)
+        self._sync_ema_shadow()

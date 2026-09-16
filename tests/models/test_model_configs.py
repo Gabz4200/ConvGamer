@@ -89,6 +89,11 @@ def test_convgamer_tiny_config_builds() -> None:
     x = torch.randn(1, 3, 4, 32, 32)
     out = enc.forward_feature_maps(x)
     assert out.shape[0] == 1
+    assert enc.feature_norm.num_channels == enc.frame_encoder.feature_dim
+    with torch.no_grad():
+        channel_mean = out.mean(dim=(0, 2, 3, 4))
+    assert torch.isfinite(channel_mean).all()
+    assert (channel_mean.abs() < 2.0).all()
 
 
 def test_convgamer_small_config_builds() -> None:

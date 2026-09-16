@@ -53,6 +53,9 @@ class VJEPAPredictor(nn.Module):
         num_levels: Number of encoder levels to predict (deep self-supervision).
         projection_dim: Output channel dim per level (must match target's
             per-level embedding dim, which equals ``feature_dim//2`` by default).
+        expansion: MLP expansion ratio inside each predictor block.
+        layer_scale_init: Initial value for the per-block ``gamma`` residual
+            scale. Small values start each block near identity.
     """
 
     def __init__(
@@ -62,18 +65,29 @@ class VJEPAPredictor(nn.Module):
         num_layers: int = 4,
         num_levels: int = 4,
         projection_dim: int | None = None,
+        expansion: int = 4,
+        layer_scale_init: float = 1e-6,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.predictor_dim = predictor_dim
         self.num_levels = num_levels
         self.projection_dim = projection_dim or feature_dim
+        self.expansion = expansion
+        self.layer_scale_init = layer_scale_init
 
         # Project encoder features to predictor working dimension
         self.input_proj = nn.Conv3d(feature_dim, predictor_dim, kernel_size=1)
         self.mask_token = nn.Parameter(torch.zeros(1, predictor_dim))
 
-        self.blocks = nn.Sequential(*[_ConvNeXtBlock(predictor_dim) for _ in range(num_layers)])
+        self.blocks = nn.Sequential(
+            *[
+                _ConvNeXtBlock(
+                    predictor_dim, expansion=expansion, layer_scale_init=layer_scale_init
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         # Per-level output heads (one 1×1×1 conv per encoder level)
         self.heads = nn.ModuleList(

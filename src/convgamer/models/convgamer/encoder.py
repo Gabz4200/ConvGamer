@@ -15,6 +15,7 @@ from torch import nn
 
 from convgamer.models.base import BaseModel
 from convgamer.models.convgamer.blocks import (
+    CausalLayerNorm,
     CausalTemporalMixer,
     ConvGamerStem,
     LearnedSpatialTemporalDownsampler,
@@ -73,6 +74,7 @@ class ConvGamerEncoder(BaseModel):
         self.temporal_mix = CausalTemporalMixer(
             channels=self.frame_encoder.feature_dim, dilations=temporal_dilations
         )
+        self.feature_norm = CausalLayerNorm(self.frame_encoder.feature_dim)
         self.norm = nn.LayerNorm(self.frame_encoder.feature_dim)
         # Foundation-model seam: no classification head by default.
         # Callers may attach one later via ``add_classification_head``.
@@ -96,10 +98,10 @@ class ConvGamerEncoder(BaseModel):
         """Per-frame video features ``(B, F, T)`` — no causal pooling, no head.
 
         Stem -> per-frame InceptionNeXt feature map -> causal temporal mix ->
-        spatial mean. Output frame ``t`` is a function of input frames ``<= t``
-        (the temporal mix is causal). The cumulative-mean pooling that makes
-        logits use only past context lives in ``forward``, keeping
-        ``forward_features`` a clean backbone seam.
+        feature norm -> spatial mean. Output frame ``t`` is a function of
+        input frames ``<= t`` (the temporal mix is causal). The
+        cumulative-mean pooling that makes logits use only past context lives
+        in ``forward``, keeping ``forward_features`` a clean backbone seam.
         """
         x = self.stem(x)
         b, _c, t, _h, _w = x.shape
@@ -107,7 +109,7 @@ class ConvGamerEncoder(BaseModel):
         maps = self.frame_encoder.forward_feature_map(frames)
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
-        mixed = self.temporal_mix(video)
+        mixed = self.feature_norm(self.temporal_mix(video))
         return mixed.mean(dim=[3, 4])
 
     def forward_feature_maps(self, x: torch.Tensor) -> torch.Tensor:
@@ -115,7 +117,8 @@ class ConvGamerEncoder(BaseModel):
 
         Same pipeline as ``forward_features`` but without the final spatial
         mean-pooling, preserving the 2D spatial structure needed by the
-        predictor to produce dense predictions.
+        predictor to produce dense predictions. Maps are channel-normalized
+        with the pre-norm ``feature_norm`` before returning.
         """
         x = self.stem(x)
         b, _c, t, _h, _w = x.shape
@@ -124,7 +127,7 @@ class ConvGamerEncoder(BaseModel):
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
         mixed = self.temporal_mix(video)
-        return mixed
+        return self.feature_norm(mixed)
 
     def init_state(
         self,
@@ -186,6 +189,7 @@ class ConvGamerEncoder(BaseModel):
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=1, h=h, w=w)
         mixed, _ = self.temporal_mix.step(video)
+        mixed = self.feature_norm(mixed)
         features = mixed.mean(dim=[3, 4])  # (B, F, 1)
 
         # Update streaming cumulative mean

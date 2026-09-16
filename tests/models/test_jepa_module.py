@@ -66,18 +66,16 @@ def test_jepa_model_ema_encoder_exists() -> None:
 
 
 def test_jepa_model_configure_optimizers() -> None:
-    """configure_optimizers must return optimizer and scheduler."""
+    """configure_optimizers must step the warmup scheduler every update."""
     model = _tiny_jepa_model(lr=1e-4, warmup_steps=10, total_steps=100)
     out = model.configure_optimizers()
-    assert isinstance(out, tuple)
-    opt, sched = out
-    # Lightning returns lists
-    if isinstance(opt, list):
-        opt = opt[0]
-    if isinstance(sched, list):
-        sched = sched[0]
-    assert isinstance(opt, torch.optim.Optimizer)
-    assert isinstance(sched, list) or callable(getattr(sched, "get_last_lr", None))
+    assert isinstance(out, dict)
+    assert isinstance(out["optimizer"], torch.optim.Optimizer)
+    scheduler_cfg = out["lr_scheduler"]
+    assert isinstance(scheduler_cfg, dict)
+    assert scheduler_cfg["interval"] == "step"
+    assert scheduler_cfg["frequency"] == 1
+    assert callable(getattr(scheduler_cfg["scheduler"], "get_last_lr", None))
 
 
 def test_jepa_ema_updates_shadow_weights() -> None:
