@@ -116,6 +116,9 @@ uv run train --multirun model.hidden_dim=48,96 trainer.max_epochs=10,20
 
 Available configuration groups: `model`, `optimizer`, `data`, `trainer`, `ops`, `experiment`, `debug`.
 
+Layout: `models/` holds raw `nn.Module` backbones, `modules/` holds the
+Lightning training wrappers around them.
+
 ## Development
 
 Run tests, formatting, and type checks:

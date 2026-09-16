@@ -94,10 +94,10 @@ class JEPALoss(nn.Module):
         self.lambda_base = lambda_base
         self.lambda_image = lambda_image
         self.lambda_warmup_steps = max(0, int(lambda_warmup_steps))
-        # Running step counter for the warmup schedule (incremented by the
-        # LightningModule via ``set_step`` after each optimizer step).
+        # Warmup schedule (V-JEPA 2.1 ramps lambda epochs 50-100): the step
+        # counter must survive resume, so the buffer stays persistent.
         self._step_counter: torch.Tensor
-        self.register_buffer("_step_counter", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer("_step_counter", torch.zeros((), dtype=torch.long))
 
     def set_step(self, step: int) -> None:
         """Update the running step counter used by the lambda warmup."""
@@ -133,14 +133,14 @@ class JEPALoss(nn.Module):
         # Stop-gradient on target (V-JEPA 2.1 §2.1)
         target = target.detach()
 
-        # Resize mask to feature-map spatial dims
+        # Resize mask to feature-map dims with nearest: mask is token-level
+        # (V-JEPA 2.1 masks patch tokens), so binary boundaries must survive.
         _, _, ft, fh, fw = pred.shape
         mask_resized = (
             nn.functional.interpolate(
                 mask.float().unsqueeze(1),
                 size=(ft, fh, fw),
-                mode="trilinear",
-                align_corners=False,
+                mode="nearest",
             )
             .bool()
             .squeeze(1)

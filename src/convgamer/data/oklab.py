@@ -7,40 +7,15 @@ import torch
 from torch import Tensor
 
 __all__ = [
-    "f",
-    "f_inv",
-    "srgb_transfer_function",
-    "srgb_transfer_function_inv",
-    "linear_srgb_to_oklab",
-    "oklab_to_linear_srgb",
-    "xyz_to_oklab",
-    "oklab_to_xyz",
-    "srgb_to_linear_srgb",
-    "linear_srgb_to_srgb",
     "srgb_to_oklab",
     "oklab_to_srgb",
     "convert_srgb_oklab",
-    "oklab_to_lch",
-    "lch_to_oklab",
-    "compute_max_saturation",
-    "find_cusp",
-    "find_gamut_intersection",
-    "toe",
-    "toe_inv",
-    "to_ST",
-    "get_ST_mid",
-    "get_Cs",
-    "okhsv_to_srgb",
-    "srgb_to_okhsv",
-    "okhsl_to_srgb",
-    "srgb_to_okhsl",
-    "gamut_clip_preserve_chroma",
-    "gamut_clip_project_to_0_5",
-    "gamut_clip_project_to_L_cusp",
-    "gamut_clip_adaptive_L0_0_5",
-    "gamut_clip_adaptive_L0_L_cusp",
-    "clamp",
-    "sgn",
+    "linear_srgb_to_oklab",
+    "oklab_to_linear_srgb",
+    "srgb_to_linear_srgb",
+    "linear_srgb_to_srgb",
+    "srgb_transfer_function",
+    "srgb_transfer_function_inv",
 ]
 
 pi = math.pi
@@ -85,10 +60,12 @@ def srgb_transfer_function_inv(x: Tensor) -> Tensor:
 
 
 def srgb_to_linear_srgb(x: Tensor) -> Tensor:
+    """Alias for srgb_transfer_function_inv."""
     return srgb_transfer_function_inv(x)
 
 
 def linear_srgb_to_srgb(x: Tensor) -> Tensor:
+    """Alias for srgb_transfer_function."""
     return srgb_transfer_function(x)
 
 

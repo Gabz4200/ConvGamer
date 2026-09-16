@@ -16,7 +16,8 @@ def create_trainer(cfg: DictConfig) -> pl.Trainer:
         from pytorch_lightning.callbacks import ModelCheckpoint
 
         container = OmegaConf.to_container(ckpt_cfg, resolve=True)
-        assert isinstance(container, dict)
+        if not isinstance(container, dict):
+            raise TypeError(f"checkpoint config must be a dict, got {type(container).__name__}")
         kwargs_ckpt = {str(k): v for k, v in container.items()}
         callbacks.append(ModelCheckpoint(**kwargs_ckpt))
     kwargs: dict[str, Any] = {

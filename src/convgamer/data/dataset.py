@@ -351,11 +351,8 @@ class GameVideoDataset(IterableDataset):
             indices += [indices[-1]] * (self.num_frames - len(indices))
         indices = indices[: self.num_frames]
 
-        frames = vr.get_batch(indices).as_tensor()  # (T, H, W, C) or (T, H, W, C)
-        if frames.ndim == 4:
-            frames = einops.rearrange(frames, "t h w c -> t c h w")
-        else:
-            frames = einops.rearrange(frames, "t h w c -> t c h w")
+        frames = vr.get_batch(indices).as_tensor()  # (T, H, W, C) from decord
+        frames = einops.rearrange(frames, "t h w c -> t c h w")
 
         frames = frames.float() / 255.0
         # Resize if needed
@@ -528,17 +525,18 @@ class HFVideoDataset(IterableDataset):
 
     def _load_frames(self, source) -> torch.Tensor:
         """Decode ``source`` (path or bytes) into a ``(T, C, H, W)`` tensor."""
-        if _DecordVideoReader is None or _decord_cpu is None:
+        reader = _DecordVideoReader
+        cpu = _decord_cpu
+        if reader is None or cpu is None:
             raise ImportError(
                 "decord is required for HFVideoDataset; install with `pip install decord`"
             )
-        assert _DecordVideoReader is not None and _decord_cpu is not None
         if isinstance(source, (bytes, bytearray)):
             import io
 
-            vr = _DecordVideoReader(io.BytesIO(bytes(source)), ctx=_decord_cpu(0))
+            vr = reader(io.BytesIO(bytes(source)), ctx=cpu(0))
         else:
-            vr = _DecordVideoReader(str(source), ctx=_decord_cpu(0))
+            vr = reader(str(source), ctx=cpu(0))
         total = len(vr)
         total = min(total, 10_000)
         if total < self.num_frames:
