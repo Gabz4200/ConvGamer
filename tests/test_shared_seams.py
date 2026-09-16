@@ -12,10 +12,30 @@ from pytorch_lightning.callbacks import (
 )
 
 from convgamer.callbacks.logging import ConvGamerLogger, _build_callback
-from convgamer.logging.metrics import accuracy
-from convgamer.losses.classification import ClassificationLoss
 from convgamer.models.base import BaseModel
 from convgamer.models.registry import MODEL_REGISTRY, get_model, register_model
+
+
+class ClassificationLoss(torch.nn.Module):
+    """Test-only loss wrapper (no production module consumes it)."""
+
+    def __init__(self, loss_type: str = "cross_entropy"):
+        super().__init__()
+        if loss_type == "cross_entropy":
+            self._loss = torch.nn.CrossEntropyLoss()
+        elif loss_type == "mse":
+            self._loss = torch.nn.MSELoss()
+        else:
+            raise ValueError(f"Unknown loss_type '{loss_type}'")
+
+    def forward(self, pred, target):
+        return self._loss(pred, target)
+
+
+def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    """Test-only mean correctness fraction over argmax predictions."""
+    preds = logits.argmax(dim=-1)
+    return float((preds == targets).float().mean().item())
 
 
 def test_when_unknown_model_then_key_error() -> None:

@@ -1,4 +1,7 @@
-"""Model package — re-exports backbones (triggers registry as a side effect)."""
+"""Model package — raw nn.Module backbones (no training logic).
+
+Training loops live in modules/ (Lightning wrappers around these backbones).
+Re-exports backbones (triggers registry as a side effect)."""
 
 from .convgamer.encoder import ConvGamerEncoder  # noqa: F401 — triggers @register_model
 from .inception_next.blocks import InceptionDWConv2d, InceptionNeXtBlock  # noqa: F401 — re-export

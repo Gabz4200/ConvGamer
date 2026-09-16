@@ -12,6 +12,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="exported_model")
+    parser.add_argument(
+        "--ckpt-kind",
+        type=str,
+        choices=("video", "image"),
+        default="video",
+        help="video loads ConvGamerModel.frame_encoder; image loads InceptionNeXtModule.",
+    )
     args = parser.parse_args()
 
     from convgamer import __version__
@@ -19,18 +26,29 @@ def main() -> None:
         ConvGamerConfig,
         ConvGamerModel,
     )
+    from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
     from convgamer.modules.lightning_module import ConvGamerModel as PLModel
+    from convgamer.modules.lightning_module import InceptionNeXtModule
 
-    ckpt = PLModel.load_from_checkpoint(args.checkpoint)
+    if args.ckpt_kind == "image":
+        image_ckpt = InceptionNeXtModule.load_from_checkpoint(args.checkpoint, strict=False)
+        native_state = image_ckpt.model.state_dict()  # type: ignore[attr-defined]  # nn.Module
+        model_cfg = image_ckpt.hparams["model"]
+    else:
+        video_ckpt: PLModel = PLModel.load_from_checkpoint(args.checkpoint, strict=False)
+        frame_encoder: InceptionNeXtEncoder = video_ckpt.model.frame_encoder  # type: ignore[attr-defined]
+        native_state = frame_encoder.state_dict()
+        model_cfg = video_ckpt.hparams["model"]
     config = ConvGamerConfig(
-        hidden_dim=ckpt.hparams["model"]["hidden_dim"],
-        num_layers=ckpt.hparams["model"]["num_layers"],
-        num_classes=ckpt.hparams["model"]["num_classes"],
-        input_dim=ckpt.hparams["model"]["input_dim"],
-        layer_scale_init=ckpt.hparams["model"]["layer_scale_init"],
+        hidden_dim=model_cfg["hidden_dim"],
+        num_layers=model_cfg["num_layers"],
+        num_classes=model_cfg["num_classes"],
+        input_dim=model_cfg["input_dim"],
+        layer_scale_init=model_cfg["layer_scale_init"],
+        mlp_ratios=tuple(model_cfg.get("mlp_ratios", (4, 4, 4, 3))),
     )
     wrapper = ConvGamerModel(config)
-    wrapper.native.load_state_dict(ckpt.model.state_dict())
+    wrapper.native.load_state_dict(native_state)
     wrapper.save_pretrained(args.output_dir)
     config.save_pretrained(args.output_dir)
     print(f"Exported to {args.output_dir} (v{__version__})")

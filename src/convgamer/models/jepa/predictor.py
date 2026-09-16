@@ -16,8 +16,24 @@ from torch import nn
 __all__ = ["VJEPAPredictor"]
 
 
+class _GRN(nn.Module):
+    """Global Response Normalization (ConvNeXt V2): L2 aggregate, divisive norm."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gx = torch.norm(x, p=2, dim=(1, 2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)
+        shape = (1, *[1] * (x.ndim - 2), -1)
+        out = self.gamma.view(shape) * (x * nx) + self.beta.view(shape) + x
+        return out
+
+
 class _ConvNeXtBlock(nn.Module):
-    """Lightweight ConvNeXt-style block for the predictor."""
+    """ConvNeXt V2-style block: depthwise conv, LayerNorm, MLP, GRN."""
 
     def __init__(self, dim: int, expansion: int = 4, layer_scale_init: float = 1e-6):
         super().__init__()
@@ -25,6 +41,7 @@ class _ConvNeXtBlock(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.pw1 = nn.Linear(dim, expansion * dim)
         self.pw2 = nn.Linear(expansion * dim, dim)
+        self.grn = _GRN(expansion * dim)
         self.gamma = nn.Parameter(layer_scale_init * torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -35,6 +52,7 @@ class _ConvNeXtBlock(nn.Module):
         x = self.norm(x)
         x = self.pw1(x)
         x = torch.nn.functional.gelu(x)
+        x = self.grn(x)
         x = self.pw2(x)
         x = x.permute(0, 4, 1, 2, 3)  # back to (B, C, T, H, W)
         return residual + self.gamma.view(1, -1, 1, 1, 1) * x
@@ -43,8 +61,10 @@ class _ConvNeXtBlock(nn.Module):
 class VJEPAPredictor(nn.Module):
     """Dense predictor for V-JEPA 2.1 latent target prediction.
 
-    Processes the x-encoder features (with mask tokens already injected by
-    the caller) and produces predictions at ``num_levels`` encoder stages.
+    Single-level output: ``num_levels`` heads exist for the planned deep
+    self-supervision (§2.3.2, one loss per encoder level), but the current
+    encoder exposes only its final feature map, so ``forward`` returns the
+    last head. Wire intermediate maps before raising ``num_levels`` above 1.
 
     Args:
         feature_dim: Channel dimension of encoder output (B, F, T, H, W).
@@ -106,11 +126,13 @@ class VJEPAPredictor(nn.Module):
         all_convs = [self.input_proj, *self.heads]
         for m in all_convs:
             w = m.weight
-            assert isinstance(w, torch.Tensor)
+            if not isinstance(w, torch.Tensor):
+                raise TypeError(f"Conv weight must be a Tensor, got {type(w).__name__}")
             trunc_normal_(w, std=0.02)
             b = m.bias
             if b is not None:
-                assert isinstance(b, torch.Tensor)
+                if not isinstance(b, torch.Tensor):
+                    raise TypeError(f"Conv bias must be a Tensor, got {type(b).__name__}")
                 nn.init.zeros_(b)
         nn.init.zeros_(self.mask_token)
 
@@ -126,14 +148,13 @@ class VJEPAPredictor(nn.Module):
         """
         h = self.input_proj(x)  # (B, predictor_dim, T, H, W)
 
-        # Resize mask to feature-map spatial dims
+        # Nearest resize: mask marks discrete tokens, not a smooth field.
         _, _, ft, fh, fw = h.shape
         mask_resized = (
             nn.functional.interpolate(
                 mask.float().unsqueeze(1),
                 size=(ft, fh, fw),
-                mode="trilinear",
-                align_corners=False,
+                mode="nearest",
             )
             .bool()
             .squeeze(1)

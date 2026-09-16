@@ -15,12 +15,15 @@ naturally handling both video (T>1) and static frames (T=1).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytorch_lightning as pl
 import torch
-from torch import nn
 
-from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.jepa import EMAEncoder, JEPALoss, VJEPAPredictor
+
+if TYPE_CHECKING:
+    from convgamer.models.convgamer.encoder import ConvGamerEncoder
 
 
 class ConvGamerVJEPAModel(pl.LightningModule):
@@ -58,7 +61,6 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
-        self._train_step = 0  # manual counter for the lambda warmup schedule
 
         # EMA target encoder (shadow copy of encoder)
         self.ema_encoder = EMAEncoder(encoder, decay=ema_decay)
@@ -73,7 +75,6 @@ class ConvGamerVJEPAModel(pl.LightningModule):
 
         Args:
             x: ``(B, C, T, H, W)`` masked video in oklab space.
-            mask: ``(B, T, H, W)`` boolean mask.
 
         Returns:
             Encoder features ``(B, F, T', H', W')``.
@@ -90,12 +91,19 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         Returns:
             Target features ``(B, F, T', H', W')``.
         """
-        from convgamer.models.convgamer.encoder import ConvGamerEncoder
-
         shadow = self.ema_encoder.shadow_module
-        if isinstance(shadow, ConvGamerEncoder):
-            return shadow.forward_feature_maps(y)
-        raise TypeError(f"EMA shadow module is not a ConvGamerEncoder: {type(shadow).__name__}")
+        forward_maps = getattr(shadow, "forward_feature_maps", None)
+        if not callable(forward_maps):
+            raise TypeError(
+                "EMA shadow module must expose forward_feature_maps(y); "
+                f"got {type(shadow).__name__}"
+            )
+        out = forward_maps(y)
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(
+                f"EMA shadow forward_feature_maps must return a Tensor; got {type(out).__name__}"
+            )
+        return out
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Single V-JEPA 2.1 training step.
@@ -111,13 +119,9 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         # Predictor: predict target features from context + mask
         pred = self.predictor(x_feat, mask)
 
-        # Resize pred to match y_feat spatial dims if needed
         if pred.shape != y_feat.shape:
-            pred = nn.functional.interpolate(
-                pred,
-                size=y_feat.shape[2:],
-                mode="trilinear",
-                align_corners=False,
+            raise ValueError(
+                f"Predictor output {tuple(pred.shape)} must match target {tuple(y_feat.shape)}"
             )
 
         # Dense predictive loss (L_predict + L_ctx)
@@ -126,9 +130,9 @@ class ConvGamerVJEPAModel(pl.LightningModule):
     def training_step(self, batch, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # noqa: ARG002
         x, y, mask = batch
         loss = self(x, y, mask)
-        # Feed the running step to the loss for the lambda warmup schedule.
-        self._train_step += 1
-        self.loss_fn.set_step(self._train_step)
+        # V-JEPA 2.1 ramps lambda over early epochs: global_step survives
+        # resume via the checkpoint, unlike a manual Python counter.
+        self.loss_fn.set_step(int(self.global_step) + 1)
         if self._trainer is not None:
             self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss

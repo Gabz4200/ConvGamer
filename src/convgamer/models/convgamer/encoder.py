@@ -147,11 +147,13 @@ class ConvGamerEncoder(BaseModel):
         ref = self.frame_encoder.stem.weight
         dev = ref.device if device is None else device
         dt = ref.dtype if dtype is None else dtype
-        # Downsampler + stem caches use input H/W
+        # Downsampler correction cache sees full-res input; stem and mixer
+        # see the downsampled spatial size.
+        h_out, w_out = self.downsampler.resolve_spatial_size(height, width)
         self.downsampler.reset_cache(batch_size, height, width, device=dev, dtype=dt)
-        self.spatial_stem.reset_cache(batch_size, height, width, device=dev, dtype=dt)
-        fe_h = max(1, height // 4)
-        fe_w = max(1, width // 4)
+        self.spatial_stem.reset_cache(batch_size, h_out, w_out, device=dev, dtype=dt)
+        fe_h = max(1, h_out // 4)
+        fe_w = max(1, w_out // 4)
         self.temporal_mix.reset_cache(batch_size, fe_h, fe_w, device=dev, dtype=dt)
         # Streaming cumulative-mean state
         state: dict = {

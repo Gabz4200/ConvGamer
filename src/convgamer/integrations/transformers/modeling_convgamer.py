@@ -23,6 +23,7 @@ class ConvGamerModel(PreTrainedModel):
             num_layers=config.num_layers,
             num_classes=config.num_classes,
             layer_scale_init=config.layer_scale_init,
+            mlp_ratios=tuple(config.mlp_ratios),
         )
         self.post_init()
 
