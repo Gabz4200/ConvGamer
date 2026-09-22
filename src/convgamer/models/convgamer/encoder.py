@@ -21,6 +21,7 @@ from convgamer.models.convgamer.blocks import (
     LearnedSpatialTemporalDownsampler,
 )
 from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
+from convgamer.models.io import StepOutput, StreamingState
 from convgamer.models.registry import register_model
 
 
@@ -31,6 +32,9 @@ class ConvGamerEncoder(BaseModel):
     Per-frame path uses ``forward_feature_map`` (spatial maps, never the
     classification head): maps are stacked to (B, F, T, H, W), mixed
     causally across T at full resolution, then spatially pooled.
+
+    ``step`` mirrors that pipeline one frame at a time with all history carried
+    in an explicit :class:`~convgamer.models.io.StreamingState`.
 
     As a foundation model for JEPA pre-training this encoder exposes
     ``forward_features`` as its public seam; the classification ``head``
@@ -136,79 +140,75 @@ class ConvGamerEncoder(BaseModel):
         width: int = 32,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> dict:
-        """Streaming state with caches for all temporal components.
+    ) -> StreamingState:
+        """Fresh streaming state for every temporal component.
 
         ``height``/``width`` are the **input** spatial dims.  The downsampler
-        and stem caches use these directly; the temporal mixer cache uses the
-        post-frame-encoder-stem spatial size (input // 4 from the stride-4
-        Conv2d in ``InceptionNeXtEncoder``).
+        conv runs at full resolution so it gets these directly; the stem and the
+        temporal mixer see the downsampled spatial size, with the mixer one
+        frame-encoder stride (4x) below that (matching
+        ``InceptionNeXtEncoder``'s stride-4 stem conv).
         """
         ref = self.frame_encoder.stem.weight
         dev = ref.device if device is None else device
         dt = ref.dtype if dtype is None else dtype
-        # Downsampler correction cache sees full-res input; stem and mixer
-        # see the downsampled spatial size.
         h_out, w_out = self.downsampler.resolve_spatial_size(height, width)
-        self.downsampler.reset_cache(batch_size, height, width, device=dev, dtype=dt)
-        self.spatial_stem.reset_cache(batch_size, h_out, w_out, device=dev, dtype=dt)
         fe_h = max(1, h_out // 4)
         fe_w = max(1, w_out // 4)
-        self.temporal_mix.reset_cache(batch_size, fe_h, fe_w, device=dev, dtype=dt)
-        # Streaming cumulative-mean state
-        state: dict = {
-            "batch_size": batch_size,
-            "device": dev,
-            "dtype": dt,
-            "fe_spatial": (fe_h, fe_w),
-            "feature_dim": self.frame_encoder.feature_dim,
-            "step_idx": 0,
-            "cumsum": None,  # (B, F) running sum of frame features
-        }
-        return state
+        return StreamingState(
+            downsampler=self.downsampler.init_state(
+                batch_size, height, width, device=dev, dtype=dt
+            ),
+            stem=self.spatial_stem.init_state(batch_size, h_out, w_out, device=dev, dtype=dt),
+            mixer=self.temporal_mix.init_state(batch_size, fe_h, fe_w, device=dev, dtype=dt),
+        )
 
-    def step(
-        self, x_t: torch.Tensor, state: dict | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stream one frame ``(B, C, H, W)`` -> ``(features, logits)``.
+    def step(self, x_t: torch.Tensor, state: StreamingState) -> StepOutput:
+        """Stream one frame ``(B, C, H, W)``; returns a :class:`StepOutput`.
 
-        Returns:
-            ``(features_t, logits_t)`` where ``features_t`` is ``(B, F, 1)``
-            (matching ``forward_features`` frame ``t``) and ``logits_t`` is
-            ``(B, K)`` or ``(B, 1, K)`` (matching ``forward`` pooled at frame
-            ``t``).
+        ``features`` is ``(B, F, 1)`` (matching ``forward_features`` at that
+        frame index) and ``logits`` is ``(B, K)`` or ``(B, 1, K)`` (matching
+        ``forward`` pooled at that frame index).  When no classification head is
+        attached (``head`` is ``nn.Identity``) ``logits`` is the pooled, normed
+        feature directly.
 
-            When no classification head is attached (``head`` is
-            ``nn.Identity``), ``logits`` is the pooled/normed feature directly.
+        State is passed in and returned — the module keeps no history, so two
+        streams can run concurrently and prefixes can be discarded at will.
         """
         b = x_t.shape[0]
         x_t = x_t.unsqueeze(2)  # (B, C, 1, H, W)
-        x = self.downsampler.step(x_t)
-        x = self.spatial_stem.step(x)
+        x, downsampler_state = self.downsampler.step(x_t, state.downsampler)
+        x, stem_state = self.spatial_stem.step(x, state.stem)
         # Per-frame feature map (spatial, no temporal mixing yet)
         frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
         maps = self.frame_encoder.forward_feature_map(frames)
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=1, h=h, w=w)
-        mixed, _ = self.temporal_mix.step(video)
+        mixed, mixer_state = self.temporal_mix.step(video, state.mixer)
         mixed = self.feature_norm(mixed)
         features = mixed.mean(dim=[3, 4])  # (B, F, 1)
 
-        # Update streaming cumulative mean
-        if state is not None:
-            idx = state["step_idx"]
-            if state["cumsum"] is None:
-                state["cumsum"] = features.squeeze(2).clone()  # (B, F)
-            else:
-                state["cumsum"] = state["cumsum"] + features.squeeze(2)
-            state["step_idx"] = idx + 1
-            count = idx + 1
-            pooled = state["cumsum"] / count
-            logits = self.head(self.norm(pooled))
-        else:
-            logits = self.head(self.norm(features.squeeze(2)))
+        # Causal cumulative mean: frame t is pooled over frames <= t only.
+        step_idx = state.step_idx + 1
+        cumsum = (
+            features.squeeze(2).clone()
+            if state.cumsum is None
+            else state.cumsum + features.squeeze(2)
+        )
+        logits = self.head(self.norm(cumsum / step_idx))
 
-        return features, logits.unsqueeze(1) if logits.dim() == 2 else logits
+        next_state = StreamingState(
+            downsampler=downsampler_state,
+            stem=stem_state,
+            mixer=mixer_state,
+            cumsum=cumsum,
+            step_idx=step_idx,
+        )
+        return StepOutput(
+            features=features,
+            logits=logits.unsqueeze(1) if logits.dim() == 2 else logits,
+            new_state=next_state,
+        )
 
     def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         """Encode video to logits, causally pooled over past frames only.

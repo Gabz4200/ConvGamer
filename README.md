@@ -45,12 +45,16 @@ import torch
 from convgamer.models.registry import get_model
 
 # InceptionNeXt (image)
-model = get_model("InceptionNeXtEncoder", input_dim=3, hidden_dim=96, num_layers=3, num_classes=1000)
+model = get_model(
+    "InceptionNeXtEncoder", input_dim=3, hidden_dim=96, num_layers=3, num_classes=1000
+)
 x = torch.randn(2, 3, 224, 224)
 logits = model(x)  # (2, 1000)
 
 # ConvGamer (video)
-model = get_model("ConvGamerEncoder", input_dim=3, hidden_dim=96, num_layers=[3,3,9,3], num_classes=0)
+model = get_model(
+    "ConvGamerEncoder", input_dim=3, hidden_dim=96, num_layers=[3, 3, 9, 3], num_classes=0
+)
 video = torch.randn(2, 3, 16, 224, 224)  # (B, C, T, H, W)
 logits = model(video)  # (2, num_classes)
 

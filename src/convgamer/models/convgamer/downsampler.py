@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import v2
 
+from convgamer.models.io import DownsamplerState
+
 from .causal import CausalConv3d, CausalLayerNorm
 
 
@@ -167,23 +169,37 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         out = self.norm(out)
         return out
 
-    def reset_cache(
+    def init_state(
         self,
         batch_size: int,
         h: int,
         w: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> None:
-        """Reset temporal cache for the correction conv layers."""
-        self.correction_conv.reset_cache(batch_size, h, w, device=device, dtype=dtype)
-        self.out_correction_conv.reset_cache(batch_size, h, w, device=device, dtype=dtype)
+    ) -> DownsamplerState:
+        """Fresh streaming state for both correction convs.
 
-    def step(self, x_t: torch.Tensor) -> torch.Tensor:
-        """Stream one frame ``(B, C, 1, H, W)`` through the downsampler.
+        ``h``/``w`` are the **input** frame's spatial dims: the correction conv
+        runs at full resolution before pooling, so it is the one that needs
+        history.  ``out_correction_conv`` is a 1x1x1 conv and keeps an empty
+        window.
+        """
+        return DownsamplerState(
+            correction=self.correction_conv.init_state(
+                batch_size, h, w, device=device, dtype=dtype
+            ),
+            out_correction=self.out_correction_conv.init_state(
+                batch_size, h, w, device=device, dtype=dtype
+            ),
+        )
+
+    def step(
+        self, x_t: torch.Tensor, state: DownsamplerState
+    ) -> tuple[torch.Tensor, DownsamplerState]:
+        """Stream one frame ``(B, C, 1, H, W)``; returns ``(out_t, next_state)``.
 
         Matches ``forward`` frame-by-frame: spatial resize, causal correction
-        conv with cached history, channel repeat, residual, norm.
+        conv carrying explicit history, channel repeat, residual, norm.
         """
         b, c, _t, h, w = x_t.shape
         h_out, w_out = self._resolve_spatial_size(h, w)
@@ -198,19 +214,21 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
 
         tiled_x_down = x_down.repeat(1, self.out_factor, 1, 1, 1)
 
-        # Correction branch: step through cached convs
-        correct = self.correction_conv.step(x_t)
+        # Correction branch: step through the causal convs with explicit state
+        correct, correction_state = self.correction_conv.step(x_t, state.correction)
         correct = self.act(correct)
         correct = einops.rearrange(correct, "b c t h w -> (b t) c h w")
         correct = F.adaptive_avg_pool2d(correct, output_size=(h_out, w_out))
         correct = einops.rearrange(correct, "(b t) c h w -> b c t h w", b=b, t=1)
-        correct = self.out_correction_conv.step(correct)
+        correct, out_correction_state = self.out_correction_conv.step(correct, state.out_correction)
 
         out = tiled_x_down + correct
         if self.concat_original:
             out = torch.cat((x_down, out), dim=1)
         out = self.norm(out)
-        return out
+        return out, DownsamplerState(
+            correction=correction_state, out_correction=out_correction_state
+        )
 
 
 def spatial_softmax(x: torch.Tensor) -> torch.Tensor:

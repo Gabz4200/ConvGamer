@@ -1,42 +1,56 @@
-"""Shared Hydra/CLI helpers for the train and eval entrypoints."""
+"""Shared Hydra/CLI helpers for the train and eval entrypoints.
+
+Composition root: configs describe *what* to build, and this module builds the
+pure backbone with ``hydra.utils.instantiate`` and wraps it in its training
+system.  Backbones never see a config object; adding one means registering a
+model class and picking it in a model YAML — nothing here needs to change.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from convgamer.data.datamemodule import ConvGamerDataModule
 from convgamer.data.jepa_datamodule import VJEPAGamingDataModule
+from convgamer.models.convgamer.encoder import ConvGamerEncoder
+from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
 from convgamer.modules.jepa_module import ConvGamerVJEPAModel
-from convgamer.modules.lightning_module import ConvGamerModel, InceptionNeXtModule
+from convgamer.modules.lightning_module import (
+    ClassificationLightningModule,
+    ConvGamerModel,
+    InceptionNeXtModule,
+)
 
 # Absolute config path so Hydra finds configs regardless of CWD or __main__.
 CONFIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "configs"
 
-# Exact target strings from configs/model/*.yaml. Substring matching
-# misroutes future names (e.g. "jepalike"), so dispatch is exact.
+# Marker target for the JEPA pretraining stack: it does not name a backbone
+# class, so it is kept out of the ``instantiate`` path and handled explicitly.
 _JEPA_TARGET = "convgamer.models.jepa"
-_MODEL_CLASS_BY_TARGET: dict[str, type] = {
-    _JEPA_TARGET: ConvGamerVJEPAModel,
-    "convgamer.models.inception_next.encoder": InceptionNeXtModule,
-    "convgamer.models.inception_next.encoder.InceptionNeXtEncoder": InceptionNeXtModule,
-    "convgamer.models.convgamer.encoder": ConvGamerModel,
-    "convgamer.models.convgamer.encoder.ConvGamerEncoder": ConvGamerModel,
-}
 
 
-def model_class(
-    cfg: DictConfig,
-) -> type[InceptionNeXtModule] | type[ConvGamerModel] | type[ConvGamerVJEPAModel]:
-    """Select the Lightning module class from the configured model target."""
-    target = str(cfg.model.get("target", ""))
-    try:
-        return _MODEL_CLASS_BY_TARGET[target]
-    except KeyError:
-        valid = sorted(_MODEL_CLASS_BY_TARGET)
-        raise ValueError(f"Unknown model target {target!r}. Valid: {valid}") from None
+def _backbone_kwargs_for_checkpoint(target: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Metadata the system records under its ``model`` hyperparameters.
+
+    Saved checkpoints carry the backbone's construction parameters (resolved,
+    config-type free) so ``export-hf`` can rebuild the HF config from any
+    checkpoint — including ones written before the shell refactor.  The config
+    value of ``num_layers`` is normalized because Hydra hands us a plain list.
+    """
+    kwargs = {"target": target, **params}
+    if isinstance(kwargs.get("num_layers"), list):
+        kwargs["num_layers"] = tuple(kwargs["num_layers"])
+    if isinstance(kwargs.get("temporal_dilations"), list):
+        kwargs["temporal_dilations"] = tuple(kwargs["temporal_dilations"])
+    if isinstance(kwargs.get("mlp_ratios"), list):
+        kwargs["mlp_ratios"] = tuple(kwargs["mlp_ratios"])
+    if kwargs.get("target_size") is not None and not isinstance(kwargs["target_size"], tuple):
+        kwargs["target_size"] = tuple(kwargs["target_size"])
+    return kwargs
 
 
 def _build_jepa_model(cfg: DictConfig) -> ConvGamerVJEPAModel:
@@ -56,19 +70,77 @@ def _build_jepa_model(cfg: DictConfig) -> ConvGamerVJEPAModel:
     )
 
 
+def backbone_kwargs(cfg: DictConfig) -> tuple[str, dict[str, Any]]:
+    """Split ``cfg.model`` into (target string, backbone kwargs).
+
+    The ``target`` key is composition metadata, never a backbone argument; so
+    are the JEPA sub-object keys (``encoder``/``predictor``/``loss``), which the
+    JEPA branch of :func:`build_model` consumes directly.
+    """
+    container = OmegaConf.to_container(cfg.model, resolve=True)
+    if not isinstance(container, dict):
+        raise TypeError(f"model config must be a dict, got {type(container).__name__}")
+    params = {str(k): v for k, v in container.items()}
+    try:
+        target = str(params.pop("target"))
+    except KeyError:
+        raise ValueError(f"model config needs a 'target' key, got {sorted(params)}") from None
+    return target, params
+
+
+def system_for_backbone(
+    backbone: object,
+) -> type[InceptionNeXtModule] | type[ConvGamerModel]:
+    """Pick the classification system by what the backbone *is*, not by strings."""
+    if isinstance(backbone, InceptionNeXtEncoder):
+        return InceptionNeXtModule
+    if isinstance(backbone, ConvGamerEncoder):
+        return ConvGamerModel
+    raise ValueError(
+        f"No classification system for backbone type {type(backbone).__name__}; "
+        "register it in system_for_backbone."
+    )
+
+
+def build_backbone(cfg: DictConfig) -> InceptionNeXtEncoder | ConvGamerEncoder:
+    """Instantiate the pure backbone from ``cfg.model`` (JEPA targets excluded)."""
+    target, params = backbone_kwargs(cfg)
+    if target == _JEPA_TARGET:
+        raise TypeError(
+            f"model target {target!r} names the JEPA pretraining stack, not a "
+            "backbone class; build the JEPA system with build_model() instead"
+        )
+    backbone = instantiate({"_target_": target, **params})
+    if not isinstance(backbone, (InceptionNeXtEncoder, ConvGamerEncoder)):
+        raise TypeError(
+            f"model target {target!r} must instantiate an InceptionNeXtEncoder or "
+            f"ConvGamerEncoder, got {type(backbone).__name__}"
+        )
+    return backbone
+
+
 def build_model(
     cfg: DictConfig,
-) -> InceptionNeXtModule | ConvGamerModel | ConvGamerVJEPAModel:
-    """Instantiate the Lightning module selected by ``model_class``.
+) -> ClassificationLightningModule:
+    """Instantiate the training system selected by ``cfg.model.target``.
 
-    For JEPA modules, instantiate encoder/predictor/loss as sub-objects
-    from the config, then pass them to the module constructor.
+    Classification backbones are built with ``instantiate`` and injected into
+    their system wrapper.  JEPA modules instantiate encoder/predictor/loss as
+    sub-objects from the config, then receive them the same way.
     """
-    target = str(cfg.model.get("target", ""))
+    target, params = backbone_kwargs(cfg)
     if target == _JEPA_TARGET:
-        return _build_jepa_model(cfg)
-    non_jepa_cls: type[InceptionNeXtModule] | type[ConvGamerModel] = model_class(cfg)  # type: ignore[assignment]
-    return non_jepa_cls(cfg)
+        return cast(ClassificationLightningModule, _build_jepa_model(cfg))
+    backbone = cast(Any, build_backbone(cfg))
+    system_cls = system_for_backbone(backbone)
+    optimizer = cfg.get("optimizer", {})
+    system: ClassificationLightningModule = system_cls(  # type: ignore[call-overload]
+        backbone,
+        lr=float(optimizer.get("lr", 1e-3)),
+        weight_decay=float(optimizer.get("weight_decay", 0.0)),
+        model_kwargs=_backbone_kwargs_for_checkpoint(target, params),
+    )
+    return system
 
 
 def build_datamodule(

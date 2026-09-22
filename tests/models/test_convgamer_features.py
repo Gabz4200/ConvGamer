@@ -12,13 +12,18 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from convgamer.models.convgamer.encoder import ConvGamerEncoder
+from convgamer.models.io import StepOutput, StreamingState
 from convgamer.modules.lightning_module import ConvGamerModel
+from convgamer.scripts.common import build_backbone, system_for_backbone
+
+from typing import Any, cast
 
 
 def _cfg(num_classes: int = 4) -> DictConfig:
     cfg = OmegaConf.create(
         {
             "model": {
+                "target": "convgamer.models.convgamer.encoder.ConvGamerEncoder",
                 "input_dim": 3,
                 "hidden_dim": 16,
                 "num_layers": 1,
@@ -34,6 +39,22 @@ def _cfg(num_classes: int = 4) -> DictConfig:
     )
     assert isinstance(cfg, DictConfig)
     return cfg
+
+
+def _mod(num_classes: int = 4) -> ConvGamerModel:
+    """Compose the video system exactly like the train entrypoint does."""
+    cfg = _cfg(num_classes)
+    backbone = cast(Any, build_backbone(cfg))
+    system_cls = system_for_backbone(backbone)
+    optimizer = cfg["optimizer"]
+    return cast(
+        ConvGamerModel,
+        system_cls(
+            backbone,
+            lr=float(optimizer["lr"]),
+            weight_decay=float(optimizer["weight_decay"]),
+        ),
+    )
 
 
 def _enc(num_classes: int | None = 4) -> ConvGamerEncoder:
@@ -99,22 +120,27 @@ def test_forward_features_streaming_parity() -> None:
     with torch.no_grad():
         feats_par: torch.Tensor = enc.forward_features(video)
         state = enc.init_state(1, 32, 32)
-        outs = [enc.step(video[:, :, t], state)[0] for t in range(video.shape[2])]
+        outs = []
+        for t in range(video.shape[2]):
+            out = enc.step(video[:, :, t], state)
+            outs.append(out.features)
+            state = out.new_state
         feats_step = torch.cat(outs, dim=2)  # (B, F, T)
     assert feats_step.shape == feats_par.shape
     torch.testing.assert_close(feats_step, feats_par, atol=1e-5, rtol=1e-4)
 
 
 def test_step_returns_features_and_logits() -> None:
-    """step() returns (features, logits) tuple when head exists."""
+    """step() returns a StepOutput carrying features and logits."""
     enc: ConvGamerEncoder = _enc(num_classes=4)
     enc.eval()
     video = torch.randn(1, 3, 8, 32, 32)
     with torch.no_grad():
         state = enc.init_state(1, 32, 32)
-        feat, logits = enc.step(video[:, :, 0], state)
-    assert feat.shape == (1, enc.frame_encoder.feature_dim, 1)
-    assert logits.shape[0] == 1
+        out = enc.step(video[:, :, 0], state)
+    assert isinstance(out, StepOutput)
+    assert out.features.shape == (1, enc.frame_encoder.feature_dim, 1)
+    assert out.logits.shape[0] == 1
 
 
 def test_step_logits_match_forward_causal_pooling() -> None:
@@ -124,11 +150,37 @@ def test_step_logits_match_forward_causal_pooling() -> None:
     video = torch.randn(1, 3, 6, 32, 32)
     with torch.no_grad():
         logits_par = enc(video)  # causal cumsum pool + head
-        state = enc.init_state(1, 32, 32)
-        last_logits: torch.Tensor = enc.step(video[:, :, 0], state)[1]
+        out = enc.step(video[:, :, 0], enc.init_state(1, 32, 32))
         for t in range(1, video.shape[2]):
-            last_logits = enc.step(video[:, :, t], state)[1]
-    torch.testing.assert_close(last_logits.flatten(), logits_par.flatten(), atol=1e-5, rtol=1e-4)
+            # State must be threaded explicitly: step() never mutates its input.
+            out = enc.step(video[:, :, t], out.new_state)
+    torch.testing.assert_close(out.logits.flatten(), logits_par.flatten(), atol=1e-5, rtol=1e-4)
+
+
+def test_streaming_state_continuity_across_chunks() -> None:
+    """State threaded through step() is complete: chunked streaming == one-shot.
+
+    This is the payoff of explicit state routing — the same property that
+    truncated backprop and per-stream evaluation depend on.
+    """
+    enc: ConvGamerEncoder = _enc(num_classes=4)
+    enc.eval()
+    video = torch.randn(1, 3, 6, 32, 32)
+
+    def run(state: StreamingState, frames: range) -> tuple[list[torch.Tensor], StreamingState]:
+        feats = []
+        for t in frames:
+            out = enc.step(video[:, :, t], state)
+            feats.append(out.features)
+            state = out.new_state
+        return feats, state
+
+    with torch.no_grad():
+        one_shot, _ = run(enc.init_state(1, 32, 32), range(6))
+        first, mid_state = run(enc.init_state(1, 32, 32), range(3))
+        rest, _ = run(mid_state, range(3, 6))
+
+    torch.testing.assert_close(torch.cat(one_shot, dim=2), torch.cat(first + rest, dim=2))
 
 
 def test_forward_sequence_returns_per_frame_logits() -> None:
@@ -162,7 +214,7 @@ def test_foundation_seam_headless_then_attachable() -> None:
 
 def test_module_forward_features_delegates_to_encoder() -> None:
     """ConvGamerModel.forward_features calls encoder.forward_features."""
-    mod: ConvGamerModel = ConvGamerModel(_cfg(num_classes=4))
+    mod: ConvGamerModel = _mod(num_classes=4)
     mod.eval()
     with torch.no_grad():
         feats = mod.forward_features(torch.randn(1, 3, 8, 32, 32))

@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from convgamer.models.io import StemState
+
 from .causal import CausalConv3d, CausalLayerNorm
 from .downsampler import spatial_softmax
 
@@ -73,27 +75,36 @@ class ConvGamerStem(nn.Module):
 
         return self.norm(x)
 
-    def reset_cache(
+    def init_state(
         self,
         batch_size: int,
         h: int,
         w: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> None:
-        """Reset temporal cache for all conv layers in the stem."""
-        for conv in [self.near_conv, self.far_conv, self.local_conv, self.fuse_conv]:
-            conv.reset_cache(batch_size, h, w, device=device, dtype=dtype)
+    ) -> StemState:
+        """Fresh streaming state: one past-frame window per branch conv.
 
-    def step(self, x_t: torch.Tensor) -> torch.Tensor:
-        """Stream one frame ``(B, C, 1, H, W)`` through the stem."""
-        near = self.near_conv.step(x_t)
-        local = self.local_conv.step(x_t)
-        far = self.far_conv.step(x_t)
+        ``h``/``w`` are the spatial dims the stem sees (post-downsample).
+        """
+        return StemState(
+            near=self.near_conv.init_state(batch_size, h, w, device=device, dtype=dtype),
+            local=self.local_conv.init_state(batch_size, h, w, device=device, dtype=dtype),
+            far=self.far_conv.init_state(batch_size, h, w, device=device, dtype=dtype),
+            fuse=self.fuse_conv.init_state(batch_size, h, w, device=device, dtype=dtype),
+        )
+
+    def step(self, x_t: torch.Tensor, state: StemState) -> tuple[torch.Tensor, StemState]:
+        """Stream one frame ``(B, C, 1, H, W)``; returns ``(out_t, next_state)``."""
+        near, near_state = self.near_conv.step(x_t, state.near)
+        local, local_state = self.local_conv.step(x_t, state.local)
+        far, far_state = self.far_conv.step(x_t, state.far)
         new = torch.cat((near, local, far), dim=1)
         new = self.act(new)
-        new = self.fuse_conv.step(new)
+        new, fuse_state = self.fuse_conv.step(new, state.fuse)
         x = torch.cat((x_t, new), dim=1)
         if self.use_softmax:
             x = torch.cat((x, spatial_softmax(x)), dim=1)
-        return self.norm(x)
+        return self.norm(x), StemState(
+            near=near_state, local=local_state, far=far_state, fuse=fuse_state
+        )

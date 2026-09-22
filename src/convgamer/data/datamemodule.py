@@ -46,6 +46,9 @@ class ConvGamerDataModule(pl.LightningDataModule):
         self.num_classes = num_classes
         self.modality = modality
         self.num_frames = num_frames
+        self.train_ds: RandomImageDataset | RandomVideoDataset | None = None
+        self.val_ds: RandomImageDataset | RandomVideoDataset | None = None
+        self.test_ds: RandomImageDataset | RandomVideoDataset | None = None
 
     def _params(self) -> dict:
         return {
@@ -61,19 +64,23 @@ class ConvGamerDataModule(pl.LightningDataModule):
             val_samples = max(1, self.num_samples // 4)
             self.val_ds = _dataset(self.modality, num_samples=val_samples, **self._params())
         if stage in (None, "test", "validate"):
-            if not hasattr(self, "val_ds"):
+            if self.val_ds is None:
                 val_samples = max(1, self.num_samples // 4)
                 self.val_ds = _dataset(self.modality, num_samples=val_samples, **self._params())
             self.test_ds = self.val_ds
 
     def train_dataloader(self) -> DataLoader:
+        if self.train_ds is None:
+            raise RuntimeError("train_ds not initialized; call setup() first")
         return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers)
 
     def val_dataloader(self) -> DataLoader:
+        if self.val_ds is None:
+            raise RuntimeError("val_ds not initialized; call setup() first")
         return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers)
 
     def test_dataloader(self) -> DataLoader:
-        ds = getattr(self, "test_ds", getattr(self, "val_ds", None))
+        ds = self.test_ds if self.test_ds is not None else self.val_ds
         if ds is None:
             raise RuntimeError("test_ds/val_ds not initialized; call setup() first")
         return DataLoader(ds, batch_size=self.batch_size, num_workers=self.num_workers)

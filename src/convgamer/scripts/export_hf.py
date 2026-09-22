@@ -39,6 +39,10 @@ def main() -> None:
         frame_encoder: InceptionNeXtEncoder = video_ckpt.model.frame_encoder  # type: ignore[attr-defined]
         native_state = frame_encoder.state_dict()
         model_cfg = video_ckpt.hparams["model"]
+    if isinstance(model_cfg.get("num_layers"), list):
+        model_cfg["num_layers"] = tuple(model_cfg["num_layers"])
+    if isinstance(model_cfg.get("mlp_ratios"), list):
+        model_cfg["mlp_ratios"] = tuple(model_cfg.get("mlp_ratios", (4, 4, 4, 3)))
     config = ConvGamerConfig(
         hidden_dim=model_cfg["hidden_dim"],
         num_layers=model_cfg["num_layers"],

@@ -12,6 +12,8 @@ Key deviations from the paper are intentional design choices:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 from torch.nn.init import trunc_normal_
@@ -21,21 +23,18 @@ from ..registry import register_model
 from .blocks import InceptionNeXtBlock
 
 
-def _normalize_layer_count(
-    num_layers: int | list[int] | tuple[int, ...], stages: int = 4
-) -> list[int]:
+def _normalize_layer_count(num_layers: int | Sequence[int], stages: int = 4) -> list[int]:
     """Broadcast ``num_layers`` to a per-stage list of length *stages*.
 
     Accepts OmegaConf ListConfig (Hydra) as well as plain list/tuple.
     """
-    if isinstance(num_layers, int) and not isinstance(num_layers, bool):
+    if isinstance(num_layers, bool):
+        raise ValueError(f"num_layers must be int or sequence, got {type(num_layers).__name__}")
+    if isinstance(num_layers, int):
         return [num_layers] * stages
-    try:
-        layers = list(num_layers)  # type: ignore[arg-type]
-    except TypeError:
-        raise ValueError(
-            f"num_layers must be int or sequence, got {type(num_layers).__name__}"
-        ) from None
+    if not isinstance(num_layers, Sequence):
+        raise ValueError(f"num_layers must be int or sequence, got {type(num_layers).__name__}")
+    layers = list(num_layers)
     if len(layers) != stages:
         raise ValueError(f"num_layers tuple must have length {stages}, got {len(layers)}")
     return layers
@@ -53,9 +52,9 @@ class InceptionNeXtEncoder(BaseModel):
         Channel width for the first stage; doubles each subsequent stage.
         Default 96 matches the paper's Tiny/Small configs (Table 3).
     num_layers:
-        Number of ``InceptionNeXtBlock`` per stage.  Pass an ``int`` to use
-        the same count in every stage, or a 4-tuple to match the paper's
-        stage layout (e.g. ``(3, 3, 9, 3)`` for Tiny/Small).
+        Number of ``InceptionNeXtBlock`` per stage. Pass an ``int`` to use
+        the same count in every stage, or a 4-element sequence to match the
+        paper's stage layout (e.g. ``(3, 3, 9, 3)`` for Tiny/Small).
     num_classes:
         Output dimension of the classification head.  ``0`` omits the head
         so the model can be used as a pure feature extractor.
@@ -72,7 +71,7 @@ class InceptionNeXtEncoder(BaseModel):
         self,
         input_dim: int = 3,
         hidden_dim: int = 96,
-        num_layers: int | tuple[int, ...] = 3,
+        num_layers: int | Sequence[int] = 3,
         num_classes: int = 1000,
         layer_scale_init: float = 1e-6,
         mlp_ratios: tuple[int, int, int, int] = (4, 4, 4, 3),
