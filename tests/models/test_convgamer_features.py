@@ -8,6 +8,8 @@ Seams:
 - ConvGamerModel.forward_features: delegates to encoder.forward_features.
 """
 
+from typing import Any, cast
+
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -15,8 +17,6 @@ from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.io import StepOutput, StreamingState
 from convgamer.modules.lightning_module import ConvGamerModel
 from convgamer.scripts.common import build_backbone, system_for_backbone
-
-from typing import Any, cast
 
 
 def _cfg(num_classes: int = 4) -> DictConfig:

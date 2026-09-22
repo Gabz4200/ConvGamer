@@ -6,25 +6,14 @@ from typing import Any
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Callback
-from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, Timer
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Timer
 
 from convgamer.callbacks.ema_update import EMAUpdateCallback
-from convgamer.callbacks.logging import ConvGamerLogger
-
-
-def _taichi_init_callback() -> Callback:
-    from convgamer.callbacks.taichi_init import TaichiInitCallback
-
-    return TaichiInitCallback()
-
 
 _BUILDER_FOR_LAZY: dict[str, Callable[[], Callback]] = {
     "model_checkpoint": lambda: ModelCheckpoint(
         monitor="val/loss", save_last=True, save_top_k=1, mode="min"
     ),
-    "early_stopping": lambda: EarlyStopping(monitor="val/loss", mode="min", patience=5),
-    "taichi_init": _taichi_init_callback,
-    "logger": lambda: ConvGamerLogger(),
     "ema_update": lambda: EMAUpdateCallback(),
     "lr_monitor": lambda: LearningRateMonitor(logging_interval="step"),
     "timer": lambda: Timer(),

@@ -35,4 +35,3 @@ class EMAUpdateCallback(pl.Callback):
                 "EMAUpdateCallback requires a module exposing ema_encoder.update()"
             )
         ema_encoder.update()
-

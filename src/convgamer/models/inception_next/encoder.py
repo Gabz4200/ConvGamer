@@ -18,7 +18,6 @@ import torch
 from torch import nn
 from torch.nn.init import trunc_normal_
 
-from ..base import BaseModel
 from ..registry import register_model
 from .blocks import InceptionNeXtBlock
 
@@ -41,7 +40,7 @@ def _normalize_layer_count(num_layers: int | Sequence[int], stages: int = 4) -> 
 
 
 @register_model("InceptionNeXtEncoder")
-class InceptionNeXtEncoder(BaseModel):
+class InceptionNeXtEncoder(nn.Module):
     """InceptionNeXt backbone.
 
     Parameters

@@ -77,16 +77,15 @@ def test_when_unknown_backbone_then_system_selection_fails() -> None:
         system_for_backbone(object())
 
 
-def test_when_jepa_tiny_config_then_build_model_runs() -> None:
-    """JEPA tiny config instantiates encoder/predictor/loss end to end."""
+def test_when_jepa_config_then_build_model_runs() -> None:
+    """JEPA config instantiates encoder/predictor/loss end to end."""
     with initialize_config_dir(config_dir=str(Path("configs").resolve()), version_base=None):
         cfg = compose(
             config_name="config",
             overrides=[
-                "experiment=jepa_tiny",
-                "model=jepa_tiny",
-                "data=jepa_tiny",
-                "trainer=jepa_tiny",
+                "model=jepa",
+                "data=jepa",
+                "trainer=jepa",
                 "optimizer=jepa",
             ],
         )
@@ -116,7 +115,7 @@ def test_when_default_trainer_cfg_then_trainer_builds() -> None:
                 "precision": "32-true",
                 "log_every_n_steps": 10,
                 "max_epochs": 1,
-                "callbacks": ["logger"],
+                "callbacks": ["model_checkpoint"],
             },
             "fast_dev_run": True,
         }

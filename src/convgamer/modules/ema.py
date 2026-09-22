@@ -19,7 +19,7 @@ __all__ = ["EMAEncoder", "EncoderT"]
 EncoderT = TypeVar("EncoderT", bound=DenseFeatureEncoder)
 
 
-class EMAEncoder(Generic[EncoderT]):
+class EMAEncoder(Generic[EncoderT]):  # noqa: UP046
     """Maintains a shadow copy of an encoder updated via EMA.
 
     Generic over the swappable dense-feature seam: any backbone conforming to

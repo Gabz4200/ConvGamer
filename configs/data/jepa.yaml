@@ -34,13 +34,6 @@ video_dataset_ids:
   # Hand-drawn 2D kinematics
   - ch1415926/cuphead
 
-# Tier 2: Extracted archives (download + extract first; ignored during JEPA phase)
-archive_dataset_ids:
-  - elefantai/p2p-full-data
-  - KlingTeam/GameFactory-Dataset
-  - zizhaotong/CrossFPS-train
-  - quchenyuan/UCF101-ZIP
-
 # Tier 3: Static images (T=1 spatial regularizer)
 image_dataset_ids:
   - asgaardlab/VideoGameBunny-Dataset

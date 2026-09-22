@@ -61,18 +61,17 @@ class _ConvNeXtBlock(nn.Module):
 class VJEPAPredictor(nn.Module):
     """Dense predictor for V-JEPA 2.1 latent target prediction.
 
-    Single-level output: ``num_levels`` heads exist for the planned deep
-    self-supervision (§2.3.2, one loss per encoder level), but the current
-    encoder exposes only its final feature map, so ``forward`` returns the
-    last head. Wire intermediate maps before raising ``num_levels`` above 1.
+    Single-level output: the encoder exposes only its final feature map, so
+    ``forward`` returns a dense prediction over the full spatial-temporal grid.
+    Deep multi-level supervision (§2.3.2) can be added when intermediate
+    encoder levels are wired in.
 
     Args:
         feature_dim: Channel dimension of encoder output (B, F, T, H, W).
         predictor_dim: Hidden width of predictor blocks.
         num_layers: Number of ConvNeXt-style blocks in the predictor trunk.
-        num_levels: Number of encoder levels to predict (deep self-supervision).
-        projection_dim: Output channel dim per level (must match target's
-            per-level embedding dim, which equals ``feature_dim//2`` by default).
+        projection_dim: Output channel dim of the prediction head (must match
+            the target encoder's feature dim).
         expansion: MLP expansion ratio inside each predictor block.
         layer_scale_init: Initial value for the per-block ``gamma`` residual
             scale. Small values start each block near identity.
@@ -83,7 +82,6 @@ class VJEPAPredictor(nn.Module):
         feature_dim: int = 384,
         predictor_dim: int = 384,
         num_layers: int = 4,
-        num_levels: int = 4,
         projection_dim: int | None = None,
         expansion: int = 4,
         layer_scale_init: float = 1e-6,
@@ -91,7 +89,6 @@ class VJEPAPredictor(nn.Module):
         super().__init__()
         self.feature_dim = feature_dim
         self.predictor_dim = predictor_dim
-        self.num_levels = num_levels
         self.projection_dim = projection_dim or feature_dim
         self.expansion = expansion
         self.layer_scale_init = layer_scale_init
@@ -109,13 +106,8 @@ class VJEPAPredictor(nn.Module):
             ]
         )
 
-        # Per-level output heads (one 1×1×1 conv per encoder level)
-        self.heads = nn.ModuleList(
-            [
-                nn.Conv3d(predictor_dim, self.projection_dim, kernel_size=1)
-                for _ in range(num_levels)
-            ]
-        )
+        # Single prediction head (V-JEPA 2.1 §2.3.2: dense 1×1×1 conv).
+        self.head = nn.Conv3d(predictor_dim, self.projection_dim, kernel_size=1)
 
         self._init_weights()
 
@@ -123,7 +115,7 @@ class VJEPAPredictor(nn.Module):
         """Truncated-normal init for stable JEPA training (no large projections)."""
         from torch.nn.init import trunc_normal_
 
-        all_convs = [self.input_proj, *self.heads]
+        all_convs = [self.input_proj, self.head]
         for m in all_convs:
             w = m.weight
             if not isinstance(w, torch.Tensor):
@@ -165,6 +157,4 @@ class VJEPAPredictor(nn.Module):
         h = torch.where(mask_b, self.mask_token.view(1, -1, 1, 1, 1), h)
 
         h = self.blocks(h)
-        # Use the last head for the dense output (matching the encoder's
-        # final-level features that the target encoder produces).
-        return self.heads[-1](h)
+        return self.head(h)

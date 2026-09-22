@@ -151,32 +151,29 @@ def build_datamodule(
         return ConvGamerDataModule(**cfg.data)
     mode = cfg.data.get("mode", "synthetic")
     workers = cfg.data.num_workers if num_workers is None else num_workers
+    shared = {
+        "batch_size": cfg.data.batch_size,
+        "num_workers": workers,
+        "num_frames": cfg.data.num_frames,
+        "height": cfg.data.height,
+        "width": cfg.data.width,
+        "mask_ratio": cfg.data.mask_ratio,
+        "to_oklab": cfg.data.to_oklab,
+    }
     if mode == "synthetic":
         return VJEPAGamingDataModule(
-            batch_size=cfg.data.batch_size,
-            num_workers=workers,
-            num_frames=cfg.data.num_frames,
-            height=cfg.data.height,
-            width=cfg.data.width,
-            mask_ratio=cfg.data.mask_ratio,
-            to_oklab=cfg.data.to_oklab,
+            **shared,
             mode=mode,
             num_synthetic_samples=cfg.data.get("num_synthetic_samples", 64),
         )
     return VJEPAGamingDataModule(
-        batch_size=cfg.data.batch_size,
-        num_workers=workers,
-        num_frames=cfg.data.num_frames,
-        height=cfg.data.height,
-        width=cfg.data.width,
-        mask_ratio=cfg.data.mask_ratio,
+        **shared,
+        mode=mode,
         image_mask_ratio=cfg.data.get("image_mask_ratio", 0.1),
-        to_oklab=cfg.data.to_oklab,
         video_dataset_ids=cfg.data.get("video_dataset_ids", []),
         image_dataset_ids=cfg.data.get("image_dataset_ids", []),
         regularization_dataset_ids=cfg.data.get("regularization_dataset_ids", []),
         data_dir=cfg.data.get("data_dir", "./data/jepa"),
-        mode=mode,
         sample_stride=cfg.data.get("sample_stride", 1),
         max_frames=cfg.data.get("max_frames", 10_000),
     )

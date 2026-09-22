@@ -20,7 +20,6 @@ predictor:
   feature_dim: 768           # 96 * 2^3 (4 stages, doubling each)
   predictor_dim: 384
   num_layers: 4              # reduced from 24 (ViT-G) for ConvNeXt-Tiny
-  num_levels: 1              # single level; deep self-supervision later
   expansion: 4               # ConvNeXt-style MLP expansion in predictor blocks
   layer_scale_init: 1e-6     # start predictor residual blocks near identity
 
