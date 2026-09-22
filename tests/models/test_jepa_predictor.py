@@ -13,8 +13,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from typing import Any, cast
+
 from convgamer.models.jepa import JEPALoss, VJEPAPredictor
-from convgamer.models.jepa.ema import EMAEncoder
+from convgamer.modules.ema import EMAEncoder
 
 
 def test_predictor_outputs_mask_and_context_tokens() -> None:
@@ -82,7 +84,7 @@ def test_loss_zero_when_all_visible() -> None:
 def test_ema_encoder_shadows_source() -> None:
     """EMA encoder weights must be copies that diverge as source trains."""
     encoder = nn.Linear(4, 4)
-    ema = EMAEncoder(module=encoder, decay=0.999)
+    ema = EMAEncoder(module=cast(Any, encoder), decay=0.999)  # type: ignore[arg-type]
 
     # Initially identical
     with torch.no_grad():

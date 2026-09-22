@@ -1,8 +1,0 @@
-batch_size: 2
-num_workers: 0
-num_samples: 16
-channels: 3
-image_size: 32
-num_classes: 10
-modality: video
-num_frames: 8

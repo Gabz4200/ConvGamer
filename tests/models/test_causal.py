@@ -11,6 +11,7 @@ from convgamer.models.convgamer.blocks import (
     ConvGamerStem,
     LearnedSpatialTemporalDownsampler,
 )
+from convgamer.models.io import MixerState
 
 
 # helper: assert temporal causality – future perturbation does not leak to past
@@ -174,29 +175,53 @@ def test_downsampler_is_causal() -> None:
 
 def test_causal_conv_streaming_parity() -> None:
     """step() one frame at a time must match forward() over the full sequence."""
-    for use_caching in [True]:
-        torch.manual_seed(42)
-        m = CausalConv3d(
-            in_channels=3, out_channels=6, kernel_size=(3, 3, 3), use_caching=use_caching
-        )
-        m.eval()
-        x = torch.randn(2, 3, 5, 8, 8)
-        with torch.no_grad():
-            y_par = m(x)
-            m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
-            outs = [m.step(x[:, :, t : t + 1]) for t in range(x.shape[2])]
-            y_step = torch.cat(outs, dim=2)
-        assert y_par.shape == y_step.shape
-        torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
-
-
-def test_causal_conv_step_requires_caching() -> None:
-    """step() without use_caching must error."""
-    m = CausalConv3d(3, 6, kernel_size=3, use_caching=False)
+    torch.manual_seed(42)
+    m = CausalConv3d(in_channels=3, out_channels=6, kernel_size=(3, 3, 3))
     m.eval()
+    x = torch.randn(2, 3, 5, 8, 8)
+    with torch.no_grad():
+        y_par = m(x)
+        state = m.init_state(x.shape[0], x.shape[3], x.shape[4])
+        outs = []
+        for t in range(x.shape[2]):
+            out_t, state = m.step(x[:, :, t : t + 1], state)
+            outs.append(out_t)
+        y_step = torch.cat(outs, dim=2)
+    assert y_par.shape == y_step.shape
+    torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
+
+
+def test_causal_conv_step_state_is_explicit() -> None:
+    """step() carries history in its argument: the module holds no cache buffer."""
+    m = CausalConv3d(3, 6, kernel_size=3)
+    m.eval()
+    assert not any("cache" in name for name, _ in m.named_buffers())
     x_t = torch.randn(1, 3, 1, 8, 8)
-    with pytest.raises(RuntimeError, match="use_caching=True"):
-        m.step(x_t)
+    m.step(x_t, m.init_state(1, 8, 8))
+    # A wrong-shaped state is rejected instead of being silently accepted.
+    with pytest.raises(RuntimeError, match="Cache mismatch"):
+        m.step(x_t, m.init_state(1, 4, 4))
+
+
+def test_causal_conv_two_streams_do_not_interfere() -> None:
+    """Explicit state makes concurrent streams independent."""
+    torch.manual_seed(0)
+    m = CausalConv3d(2, 2, kernel_size=3).eval()
+    a = torch.randn(1, 2, 4, 4, 4)
+    b = torch.randn(1, 2, 4, 4, 4)
+    with torch.no_grad():
+        ref_a = m(a)
+        ref_b = m(b)
+        state_a = m.init_state(1, 4, 4)
+        state_b = m.init_state(1, 4, 4)
+        outs_a, outs_b = [], []
+        for t in range(4):
+            out_a, state_a = m.step(a[:, :, t : t + 1], state_a)
+            out_b, state_b = m.step(b[:, :, t : t + 1], state_b)
+            outs_a.append(out_a)
+            outs_b.append(out_b)
+    torch.testing.assert_close(torch.cat(outs_a, dim=2), ref_a, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(torch.cat(outs_b, dim=2), ref_b, atol=1e-6, rtol=1e-6)
 
 
 def test_downsampler_streaming_parity() -> None:
@@ -209,12 +234,12 @@ def test_downsampler_streaming_parity() -> None:
     x = torch.randn(1, 3, 6, 16, 16)
     with torch.no_grad():
         y_par = m(x)
-        m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
-        outs = [m.step(x[:, :, t : t + 1]) for t in range(x.shape[2])]
+        state = m.init_state(x.shape[0], x.shape[3], x.shape[4])
+        outs = []
+        for t in range(x.shape[2]):
+            out_t, state = m.step(x[:, :, t : t + 1], state)
+            outs.append(out_t)
         y_step = torch.cat(outs, dim=2)
-    assert y_par.shape == y_step.shape
-    torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
-
     assert y_par.shape == y_step.shape
     torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
 
@@ -240,18 +265,28 @@ def test_causal_temporal_mixer_streaming_parity() -> None:
     x = torch.randn(2, 4, 6, 8, 8)
     with torch.no_grad():
         y_par = m(x)
-        m.reset_cache(x.shape[0], x.shape[3], x.shape[4])
-        outs = [m.step(x[:, :, t : t + 1])[0] for t in range(x.shape[2])]
+        state = m.init_state(x.shape[0], x.shape[3], x.shape[4])
+        outs = []
+        for t in range(x.shape[2]):
+            out_t, state = m.step(x[:, :, t : t + 1], state)
+            outs.append(out_t)
         y_step = torch.cat(outs, dim=2)
     assert y_par.shape == y_step.shape
     torch.testing.assert_close(y_par, y_step, atol=1e-6, rtol=1e-6)
 
 
-def test_causal_temporal_mixer_step_requires_reset_cache() -> None:
-    """step() without reset_cache must error (state buffer is empty)."""
+def test_causal_temporal_mixer_state_is_explicit() -> None:
+    """Mixer state travels through init_state/step, not through module attributes."""
     torch.manual_seed(42)
     m = CausalTemporalMixer(channels=4, dilations=(1,))
     m.eval()
-    x_t = torch.randn(1, 4, 1, 8, 8)
-    with pytest.raises(RuntimeError, match="Cache mismatch"):
-        m.step(x_t)
+    assert not any("agg" in name for name, _ in m.named_buffers())
+    state = m.init_state(1, 8, 8)
+    assert isinstance(state, MixerState)
+    assert len(state.conv) == 1
+    out_t, next_state = m.step(torch.randn(1, 4, 1, 8, 8), state)
+    assert out_t.shape == (1, 4, 1, 8, 8)
+    assert isinstance(next_state, MixerState)
+    # A state carrying the wrong number of windows is rejected.
+    with pytest.raises(IndexError):
+        m.step(torch.randn(1, 4, 1, 8, 8), MixerState(conv=(), aggregator=next_state.aggregator))

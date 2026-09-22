@@ -74,6 +74,10 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         self.num_synthetic_samples = num_synthetic_samples
         self.sample_stride = sample_stride
         self.max_frames = max_frames
+        self.train_ds: JEPADataset | GameVideoDataset | None = None
+        self.video_ds: GameVideoDataset | None = None
+        self.image_ds: GameImageDataset | None = None
+        self.reg_ds: HFVideoDataset | None = None
 
     def _build_video_dataset(self) -> GameVideoDataset:
         return GameVideoDataset(
@@ -132,9 +136,13 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
             raise ValueError(f"mode must be 'synthetic', 'video', or 'mixed', got {self.mode!r}")
 
     def train_dataloader(self) -> DataLoader | list[DataLoader]:
-        if not hasattr(self, "train_ds"):
+        if self.train_ds is None:
             raise RuntimeError("train_ds not initialized; call setup() first")
         if self.mode == "mixed":
+            if self.video_ds is None:
+                raise RuntimeError("video_ds not initialized; call setup() first")
+            if self.image_ds is None:
+                raise RuntimeError("image_ds not initialized; call setup() first")
             video_dl = DataLoader(
                 self.video_ds,
                 batch_size=self.batch_size,

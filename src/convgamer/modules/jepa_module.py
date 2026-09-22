@@ -11,19 +11,24 @@ Architecture (§2.3, §4):
 
 The encoder processes (B, C, T, H, W) video directly via 3D convolutions,
 naturally handling both video (T>1) and static frames (T=1).
+
+Target-encoder maintenance (EMA update) is not this module's job: attach
+``convgamer.callbacks.ema_update.EMAUpdateCallback`` to the trainer and it
+drives ``self.ema_encoder.update()`` after every optimizer step.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, cast
 
 import pytorch_lightning as pl
 import torch
+from torch import nn
 
-from convgamer.models.jepa import EMAEncoder, JEPALoss, VJEPAPredictor
+from convgamer.models.jepa import JEPALoss, VJEPAPredictor
+from convgamer.models.protocols import DenseFeatureEncoder
 
-if TYPE_CHECKING:
-    from convgamer.models.convgamer.encoder import ConvGamerEncoder
+from .ema import EMAEncoder
 
 
 class ConvGamerVJEPAModel(pl.LightningModule):
@@ -43,7 +48,7 @@ class ConvGamerVJEPAModel(pl.LightningModule):
 
     def __init__(
         self,
-        encoder: ConvGamerEncoder,
+        encoder: nn.Module,
         predictor: VJEPAPredictor,
         loss: JEPALoss,
         ema_decay: float = 0.99925,
@@ -57,13 +62,13 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         self.predictor = predictor
         self.loss_fn = loss
         self.ema_decay = ema_decay
-        self.lr = lr
-        self.weight_decay = weight_decay
+        self.lr: float = lr
+        self.weight_decay: float = weight_decay
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
 
         # EMA target encoder (shadow copy of encoder)
-        self.ema_encoder = EMAEncoder(encoder, decay=ema_decay)
+        self.ema_encoder = EMAEncoder(cast(Any, encoder), decay=ema_decay)
 
         # Save hyperparameters (encoder is a module, not a config dict)
         # We don't save encoder/predictor/loss as hparams since they are
@@ -79,11 +84,14 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         Returns:
             Encoder features ``(B, F, T', H', W')``.
         """
-        return self.encoder.forward_feature_maps(x)
+        return cast(DenseFeatureEncoder, self.encoder).forward_feature_maps(x)
 
     @torch.no_grad()
     def encode_y(self, y: torch.Tensor) -> torch.Tensor:
         """Encode the y-view (target encoder on clean input, no grad).
+
+        The shadow is a deepcopy of the injected encoder, so the checker
+        already knows it satisfies the dense-feature seam — no runtime probe.
 
         Args:
             y: ``(B, C, T, H, W)`` clean video in oklab space.
@@ -91,19 +99,7 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         Returns:
             Target features ``(B, F, T', H', W')``.
         """
-        shadow = self.ema_encoder.shadow_module
-        forward_maps = getattr(shadow, "forward_feature_maps", None)
-        if not callable(forward_maps):
-            raise TypeError(
-                "EMA shadow module must expose forward_feature_maps(y); "
-                f"got {type(shadow).__name__}"
-            )
-        out = forward_maps(y)
-        if not isinstance(out, torch.Tensor):
-            raise TypeError(
-                f"EMA shadow forward_feature_maps must return a Tensor; got {type(out).__name__}"
-            )
-        return out
+        return cast(DenseFeatureEncoder, self.ema_encoder.shadow_module).forward_feature_maps(y)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Single V-JEPA 2.1 training step.
@@ -136,10 +132,6 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         if self._trainer is not None:
             self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx, dataloader_idx=0) -> None:  # noqa: ANN001
-        """Update EMA after the optimizer step (V-JEPA 2.1 protocol)."""
-        self.ema_encoder.update()
 
     def validation_step(self, batch, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
         x, y, mask = batch

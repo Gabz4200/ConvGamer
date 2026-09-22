@@ -12,9 +12,10 @@ limit_val_batches: 100          # 100 val batches for fast eval
 accumulate_grad_batches: 2     # Effective batch: 8 * 2 * 2 = 32
 gradient_clip_val: 1.0
 
-# Callbacks (built by convgamer.callbacks.logging._build_callback)
+# Callbacks (built by convgamer.training.engine._build_callback)
 callbacks:
   - model_checkpoint
+  - ema_update
   - lr_monitor
   - timer
 

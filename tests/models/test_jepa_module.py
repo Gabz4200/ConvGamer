@@ -9,8 +9,10 @@ Seams tested:
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from convgamer.callbacks.ema_update import EMAUpdateCallback
 from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.jepa import JEPALoss, VJEPAPredictor
 from convgamer.modules.jepa_module import ConvGamerVJEPAModel
@@ -78,17 +80,37 @@ def test_jepa_model_configure_optimizers() -> None:
     assert callable(getattr(scheduler_cfg["scheduler"], "get_last_lr", None))
 
 
-def test_jepa_ema_updates_shadow_weights() -> None:
-    """on_train_batch_end must move the shadow toward the online encoder."""
+def test_jepa_ema_callback_updates_shadow_weights() -> None:
+    """EMAUpdateCallback moves the shadow toward the online encoder."""
     model = _tiny_jepa_model(ema_decay=0.0)
     online = next(model.encoder.parameters())
     with torch.no_grad():
         online.fill_(1.0)
         for p in model.ema_encoder.state_dict().values():
             p.fill_(0.0)
-    model.on_train_batch_end(None, None, 0)
+    EMAUpdateCallback().on_train_batch_end(
+        trainer=None,
+        pl_module=model,
+        outputs=None,
+        batch=None,
+        batch_idx=0,  # type: ignore[arg-type]
+    )
     shadow_first = next(iter(model.ema_encoder.state_dict().values()))
     assert torch.allclose(shadow_first, online)
+
+
+def test_jepa_ema_callback_requires_ema_encoder() -> None:
+    """A module without an EMA target fails loudly, not silently."""
+    model = _tiny_jepa_model()
+    del model.ema_encoder
+    with pytest.raises(AttributeError, match="ema_encoder"):
+        EMAUpdateCallback().on_train_batch_end(
+            trainer=None,
+            pl_module=model,
+            outputs=None,
+            batch=None,
+            batch_idx=0,  # type: ignore[arg-type]
+        )
 
 
 def test_jepa_ema_checkpoint_round_trip() -> None:
@@ -142,7 +164,14 @@ def test_jepa_multi_step_training_stability() -> None:
         loss = model.training_step((x, y, mask), batch_idx=0)
         assert torch.isfinite(loss), "Loss became non-finite"
         loss.backward()
-        model.on_train_batch_end(None, (x, y, mask), 0)
+        # EMA maintenance is a trainer-level observer, not a module hook.
+        EMAUpdateCallback().on_train_batch_end(
+            trainer=None,
+            pl_module=model,
+            outputs=None,
+            batch=(x, y, mask),
+            batch_idx=0,  # type: ignore[arg-type]
+        )
 
         total_norm = sum(
             p.grad.abs().sum().item() ** 2 for p in model.parameters() if p.grad is not None

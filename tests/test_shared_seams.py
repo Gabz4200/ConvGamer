@@ -11,9 +11,11 @@ from pytorch_lightning.callbacks import (
     Timer,
 )
 
-from convgamer.callbacks.logging import ConvGamerLogger, _build_callback
+from convgamer.callbacks.ema_update import EMAUpdateCallback
+from convgamer.callbacks.logging import ConvGamerLogger
 from convgamer.models.base import BaseModel
 from convgamer.models.registry import MODEL_REGISTRY, get_model, register_model
+from convgamer.training.engine import _build_callback
 
 
 class ClassificationLoss(torch.nn.Module):
@@ -99,6 +101,7 @@ def test_when_known_callback_then_builds_expected_type() -> None:
     assert isinstance(_build_callback("model_checkpoint"), ModelCheckpoint)
     assert isinstance(_build_callback("early_stopping"), EarlyStopping)
     assert isinstance(_build_callback("logger"), ConvGamerLogger)
+    assert isinstance(_build_callback("ema_update"), EMAUpdateCallback)
     assert isinstance(_build_callback("lr_monitor"), LearningRateMonitor)
     assert isinstance(_build_callback("timer"), Timer)
 

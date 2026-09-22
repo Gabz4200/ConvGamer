@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import cast
+
+from convgamer.models.io import MixerState
+
 from .minconv import MinConvExpLSTM
 
 
@@ -14,6 +18,10 @@ class CausalConv3d(nn.Module):
     Temporal causality via left-only padding on depth (T) dimension.
     Spatial dims are padded symmetrically for odd kernels. Even spatial kernels
     use one extra pixel on the right/bottom to preserve the output shape.
+
+    ``forward`` maps a whole clip ``(B, C_in, T, H, W)``.  ``step`` streams one
+    frame, taking its past-frame window as an explicit ``state`` argument and
+    returning the updated window — the module keeps no history of its own.
     """
 
     def __init__(
@@ -25,7 +33,6 @@ class CausalConv3d(nn.Module):
         dilation: tuple[int, int, int] | int = 1,
         groups: int = 1,
         bias: bool = True,
-        use_caching: bool = True,
     ) -> None:
         super().__init__()
 
@@ -37,7 +44,6 @@ class CausalConv3d(nn.Module):
         self._kernel_t = kt
         self._stride = _triple(stride)
         self._dilation = (dt, dh, dw)
-        self._use_caching = use_caching
 
         pt = dt * (kt - 1)
         ph = dh * (kh - 1)
@@ -58,18 +64,6 @@ class CausalConv3d(nn.Module):
             bias=bias,
         )
 
-        if use_caching:
-            # Cache: sliding window of past frames (B, C_in, pt, H, W)
-            # Registered as buffer so it moves with .to(device)/.to(dtype)
-            self.register_buffer(
-                "_cache",
-                torch.empty(0, in_channels, pt, 1, 1),
-                persistent=False,
-            )
-        else:
-            # Non-caching: still need a placeholder so step() can detect it
-            self.register_buffer("_cache", torch.empty(0), persistent=False)
-
     @property
     def weight(self) -> torch.Tensor:
         return self.conv.weight
@@ -78,38 +72,30 @@ class CausalConv3d(nn.Module):
     def bias(self) -> torch.Tensor | None:
         return self.conv.bias
 
-    def reset_cache(
+    def init_state(
         self,
         batch_size: int,
         spatial_h: int,
         spatial_w: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> None:
-        """Allocate the cache buffer for streaming step.
+    ) -> torch.Tensor:
+        """Fresh streaming state: ``pt`` zero frames ``(B, C_in, pt, H, W)``.
 
-        ``spatial_h``/``spatial_w`` are the H/W of the **input** frame
-        (i.e., before any spatial padding).  The cache stores raw frames;
-        spatial padding is applied per-frame at ``step`` time so it matches
-        ``forward`` semantics exactly.
+        ``spatial_h``/``spatial_w`` are the H/W of the **input** frame (before
+        any spatial padding).  The state stores raw frames; spatial padding is
+        applied per-frame in :meth:`step` so streaming matches :meth:`forward`
+        exactly.
         """
-        if not self._use_caching:
-            raise RuntimeError(
-                f"CausalConv3d({self.conv.kernel_size}) requires use_caching=True "
-                "to use streaming step()"
-            )
-        c_in = self.conv.in_channels
         ref = self.conv.weight
-        dev = ref.device if device is None else device
-        dt = ref.dtype if dtype is None else dtype
-        self._cache = torch.zeros(
+        return torch.zeros(
             batch_size,
-            c_in,
+            self.conv.in_channels,
             self._pt,
             spatial_h,
             spatial_w,
-            device=dev,
-            dtype=dt,
+            device=ref.device if device is None else device,
+            dtype=ref.dtype if dtype is None else dtype,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -117,53 +103,46 @@ class CausalConv3d(nn.Module):
             x = F.pad(x, self._pad)
         return self.conv(x)
 
-    def step(self, x_t: torch.Tensor) -> torch.Tensor:
-        """Process one frame ``(B, C_in, 1, H, W)`` using cached history.
+    def step(self, x_t: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process one frame ``(B, C_in, 1, H, W)``; returns ``(out_t, next_state)``.
 
-        The cache is a sliding window of ``pt`` past **raw** frames.  At
-        each step the current frame is spatially padded (symmetric), prepended
-        to the cache, and the convolution runs on the full padded window —
-        mirroring ``forward`` exactly.  The cache slides by one (drop oldest).
-        Returns ``(B, C_out, 1, H_out, W_out)``.
+        ``state`` is the sliding window of ``pt`` past **raw** frames
+        (``init_state`` output).  The current frame is spatially padded, appended
+        to the window, and the convolution runs over the whole padded window —
+        mirroring :meth:`forward` exactly.  ``next_state`` drops the oldest
+        frame and appends the current one (detached: cache history is not a
+        gradient path).
         """
-        if self._pt == 0 and all(p == 0 for p in self._pad[:4]):
-            # Kernel 1x1x1 with no padding — frame independent
-            return self.conv(x_t)
-
-        if not self._use_caching:
-            raise RuntimeError(
-                f"CausalConv3d({self.conv.kernel_size}) requires use_caching=True "
-                "to use streaming step()"
-            )
+        if self._pt == 0:
+            # Temporal extent 1: the output at t depends on frame t alone, so
+            # the window is empty and travels through untouched.
+            return self.conv(x_t), state
 
         b, c_in, _, h, w = x_t.shape
-        cache = self._cache
 
         # Apply spatial padding to current frame only (symmetric on H, W).
-        # Temporal left padding is supplied by the cache.
+        # Temporal left padding is supplied by the state window.
         sp_pad = (self._pad[0], self._pad[1], self._pad[2], self._pad[3])
         x_t_padded = F.pad(x_t, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else x_t
 
-        if cache.shape[2] != self._pt or cache.shape[3] != h or cache.shape[4] != w:
+        if state.shape != (b, c_in, self._pt, h, w):
             raise RuntimeError(
                 f"Cache mismatch: expected (B, {c_in}, {self._pt}, {h}, {w}), "
-                f"got {tuple(cache.shape)}"
+                f"got {tuple(state.shape)}"
             )
 
-        # Pad cache spatially too (so cached frames see the same border behavior)
-        cache_padded = F.pad(cache, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else cache
+        # Pad the window spatially too (so cached frames see the same border behavior)
+        state_padded = F.pad(state, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else state
 
         # Full window: [pt padded past frames, 1 padded current frame]
-        # Spatial pad gives hp/h_out and wp/w_out matching forward()
-        window = torch.cat([cache_padded, x_t_padded], dim=2)  # (B, C, pt+1, hp, wp)
-        # Conv with padding=0 (no temporal pad — cache handles it)
+        window = torch.cat([state_padded, x_t_padded], dim=2)  # (B, C, pt+1, hp, wp)
+        # Conv with padding=0 (no temporal pad — the window supplies history)
         out = self.conv(window)
         out_t = out[:, :, -1:]  # (B, C_out, 1, H_out, W_out)
 
-        # Slide window: drop oldest frame from cache.  Store raw frame (pre-spatial-pad)
-        # so the cache keeps original H/W.
-        self._cache = torch.cat([cache[:, :, 1:], x_t], dim=2).detach()
-        return out_t
+        # Slide the window: drop the oldest frame, store the raw (unpadded) frame.
+        next_state = torch.cat([state[:, :, 1:], x_t], dim=2).detach()
+        return out_t, next_state
 
 
 class CausalLayerNorm(nn.LayerNorm):
@@ -221,48 +200,44 @@ class CausalTemporalMixer(nn.Module):
         self.norms = nn.ModuleList([CausalLayerNorm(channels) for _ in dilations])
         self.act = nn.GELU()
         self.aggregator = MinConvExpLSTM(channels, channels, 3, bias=True)
-        self.register_buffer(
-            "_agg_state",
-            torch.empty(0, channels, 1, 1),
-            persistent=False,
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for conv, norm in zip(self.layers, self.norms, strict=True):
             x = x + self.act(conv(norm(x)))
         return self.aggregator(x)
 
-    def reset_cache(
+    def init_state(
         self,
         batch_size: int,
         spatial_h: int = 1,
         spatial_w: int = 1,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-    ) -> None:
-        """Reset cache for all temporal conv layers and the LSTM aggregator."""
-        for layer in self.layers:
-            if not isinstance(layer, CausalConv3d):
-                raise TypeError(f"Expected CausalConv3d, got {type(layer).__name__}")
-            layer.reset_cache(batch_size, spatial_h, spatial_w, device=device, dtype=dtype)
-        self._agg_state = self.aggregator.init_state(
-            batch_size, spatial_h, spatial_w, device=device, dtype=dtype
+    ) -> MixerState:
+        """Fresh streaming state: one window per dilated conv plus the LSTM hidden."""
+        return MixerState(
+            conv=tuple(
+                cast(CausalConv3d, conv).init_state(
+                    batch_size, spatial_h, spatial_w, device=device, dtype=dtype
+                )
+                for conv in self.layers
+            ),
+            aggregator=self.aggregator.init_state(
+                batch_size, spatial_h, spatial_w, device=device, dtype=dtype
+            ),
         )
 
-    def step(self, x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process one frame ``(B, F, 1, H, W)`` through the stacked dilated convs.
+    def step(self, x_t: torch.Tensor, state: MixerState) -> tuple[torch.Tensor, MixerState]:
+        """Stream one frame ``(B, F, 1, H, W)``; returns ``(output_t, next_state)``.
 
-        Returns ``(output_t, next_state)`` where ``output_t`` is ``(B, F, 1, H, W)``
-        and ``next_state`` is the updated aggregator state ``(B, Hid, H, W)``.
-        The aggregator state is held in ``self._agg_state`` and updated in place,
-        so callers must use the returned ``next_state`` for chaining.
+        Both the dilated-conv windows and the aggregator hidden are carried in
+        ``state``; nothing is written back onto the module.
         """
+        windows: list[torch.Tensor] = []
         for conv, norm in zip(self.layers, self.norms, strict=True):
-            if not isinstance(conv, CausalConv3d):
-                raise TypeError(f"Expected CausalConv3d, got {type(conv).__name__}")
-            out = conv.step(norm(x_t))
+            conv_c = cast(CausalConv3d, conv)
+            out, window = conv_c.step(norm(x_t), state.conv[len(windows)])
             x_t = x_t + self.act(out)
-        x_t_4d = x_t.squeeze(2)
-        out_t, self._agg_state = self.aggregator.step(x_t_4d, self._agg_state)
-        out_t = out_t.unsqueeze(2)
-        return out_t, self._agg_state
+            windows.append(window)
+        out_t, hidden = self.aggregator.step(x_t.squeeze(2), state.aggregator)
+        return out_t.unsqueeze(2), MixerState(conv=tuple(windows), aggregator=hidden)
