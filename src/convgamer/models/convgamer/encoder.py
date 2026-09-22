@@ -13,20 +13,16 @@ import einops
 import torch
 from torch import nn
 
-from convgamer.models.base import BaseModel
-from convgamer.models.convgamer.blocks import (
-    CausalLayerNorm,
-    CausalTemporalMixer,
-    ConvGamerStem,
-    LearnedSpatialTemporalDownsampler,
-)
+from convgamer.models.convgamer.causal import CausalLayerNorm, CausalTemporalMixer
+from convgamer.models.convgamer.downsampler import LearnedSpatialTemporalDownsampler
+from convgamer.models.convgamer.stem import ConvGamerStem
 from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
 from convgamer.models.io import StepOutput, StreamingState
 from convgamer.models.registry import register_model
 
 
 @register_model("ConvGamerEncoder")
-class ConvGamerEncoder(BaseModel):
+class ConvGamerEncoder(nn.Module):
     """Video encoder: downsampler stem, per-frame InceptionNeXt, causal head.
 
     Per-frame path uses ``forward_feature_map`` (spatial maps, never the

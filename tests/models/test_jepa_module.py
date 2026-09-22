@@ -32,7 +32,7 @@ def _tiny_jepa_model(
             target_size=(8, 8),
             temporal_dilations=(1,),
         ),
-        predictor=VJEPAPredictor(feature_dim=256, predictor_dim=256, num_layers=1, num_levels=1),
+        predictor=VJEPAPredictor(feature_dim=256, predictor_dim=256, num_layers=1),
         loss=JEPALoss(feature_dim=256, lambda_base=0.5),
         ema_decay=ema_decay,
         lr=lr,

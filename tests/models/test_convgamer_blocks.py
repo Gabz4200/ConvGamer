@@ -13,7 +13,7 @@ Behavioral contracts covered:
 import pytest
 import torch
 
-from convgamer.models.convgamer.blocks import (
+from convgamer.models.convgamer.downsampler import (
     LearnedSpatialTemporalDownsampler,
     spatial_softmax,
     uniform_temporal_subsample,

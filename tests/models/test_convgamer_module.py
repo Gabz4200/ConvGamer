@@ -1,11 +1,11 @@
 """Behavior tests for ConvGamerModel video Lightning module."""
 
+from typing import Any, cast
+
 import torch
 
 from convgamer.modules.lightning_module import ConvGamerModel
 from convgamer.scripts.common import build_backbone, system_for_backbone
-
-from typing import Any, cast
 
 
 def _video_cfg():

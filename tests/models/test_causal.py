@@ -4,13 +4,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from convgamer.models.convgamer.blocks import (
+from convgamer.models.convgamer.causal import (
     CausalConv3d,
     CausalLayerNorm,
     CausalTemporalMixer,
-    ConvGamerStem,
-    LearnedSpatialTemporalDownsampler,
 )
+from convgamer.models.convgamer.downsampler import LearnedSpatialTemporalDownsampler
+from convgamer.models.convgamer.stem import ConvGamerStem
 from convgamer.models.io import MixerState
 
 

@@ -156,7 +156,7 @@ class JEPALoss(nn.Module):
         l_predict = pred_loss.sum() / n_masked
 
         # L_ctx: distance-weighted, only on context (visible) tokens
-        lambdas = self.compute_context_lambdas(
+        lambdas = compute_context_lambdas(
             mask_resized, lambda_base=self._effective_lambda(mask)
         )  # (B, T, H, W)
         ctx_loss = token_loss * lambdas  # already 0 at masked
@@ -164,17 +164,3 @@ class JEPALoss(nn.Module):
         l_ctx = ctx_loss.sum() / n_ctx
 
         return l_predict + l_ctx
-
-    def compute_context_lambdas(
-        self,
-        mask: torch.Tensor,
-        lambda_base: float | None = None,
-    ) -> torch.Tensor:
-        """Distance-weighted context lambda (Eq. 3).
-
-        ``mask`` is ``(B, T, H, W)`` boolean — True at masked positions.
-        Returns ``(B, T, H, W)`` floats; 0 at masked positions, decreasing
-        with spatio-temporal distance to nearest mask token.
-        """
-        base = self.lambda_base if lambda_base is None else lambda_base
-        return compute_context_lambdas(mask, base)

@@ -2,29 +2,12 @@ from __future__ import annotations
 
 import einops
 import torch
+from decord import VideoReader as _DecordVideoReader
+from decord import cpu as _decord_cpu
 from torch.utils.data import Dataset, IterableDataset
 
 from convgamer.data.oklab import srgb_to_oklab
-from convgamer.data.sources import (
-    _expand_archive_globs as _expand_archive_globs,
-)
-from convgamer.data.sources import (
-    _extract_archive as _extract_archive,
-)
-from convgamer.data.sources import (
-    _looks_like_hf_id as _looks_like_hf_id,
-)
-from convgamer.data.sources import (
-    _resolve_image_paths,
-    _resolve_video_paths,
-)
-
-try:  # decord is an optional dependency (only needed for video loading)
-    from decord import VideoReader as _DecordVideoReader
-    from decord import cpu as _decord_cpu
-except ImportError:  # pragma: no cover - decord absent
-    _DecordVideoReader = None  # type: ignore[assignment]
-    _decord_cpu = None  # type: ignore[assignment]
+from convgamer.data.sources import _resolve_image_paths, _resolve_video_paths
 
 
 class RandomSyntheticDataset(Dataset):
@@ -101,14 +84,6 @@ class RandomVideoDataset(RandomSyntheticDataset):
         )
 
 
-def oklab_convert_srgb(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
-    """Convert sRGB tensor to Oklab along channel dim ``dim`` (default: C in ``(B, C, ...)``).
-
-    Supports both image ``(B, C, H, W)`` and video ``(B, C, T, H, W)`` tensors.
-    """
-    return srgb_to_oklab(x, dim=dim)
-
-
 class JEPADataset(Dataset):
     """Synthetic JEPA dataset for smoke testing.
 
@@ -157,8 +132,8 @@ class JEPADataset(Dataset):
         x[mask.unsqueeze(1).expand(-1, self.channels, -1, -1)] = 0.0
 
         if self.to_oklab:
-            y = oklab_convert_srgb(y, dim=1)
-            x = oklab_convert_srgb(x, dim=1)
+            y = srgb_to_oklab(y, dim=1)
+            x = srgb_to_oklab(x, dim=1)
 
         # Rearrange to (C, T, H, W)
         y = einops.rearrange(y, "t c h w -> c t h w")
@@ -279,8 +254,8 @@ class GameVideoDataset(IterableDataset):
             x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
 
             if self.to_oklab:
-                y = oklab_convert_srgb(y, dim=1)
-                x = oklab_convert_srgb(x, dim=1)
+                y = srgb_to_oklab(y, dim=1)
+                x = srgb_to_oklab(x, dim=1)
 
             # (C, T, H, W)
             y = einops.rearrange(y, "t c h w -> c t h w")
@@ -363,8 +338,8 @@ class GameImageDataset(IterableDataset):
 
             if self.to_oklab:
                 # Single sample (C, T, H, W): channel lives at dim 0.
-                y = oklab_convert_srgb(y, dim=0)
-                x = oklab_convert_srgb(x, dim=0)
+                y = srgb_to_oklab(y, dim=0)
+                x = srgb_to_oklab(x, dim=0)
 
             yield x, y, mask
 
@@ -475,8 +450,8 @@ class HFVideoDataset(IterableDataset):
             x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
 
             if self.to_oklab:
-                y = oklab_convert_srgb(y, dim=1)
-                x = oklab_convert_srgb(x, dim=1)
+                y = srgb_to_oklab(y, dim=1)
+                x = srgb_to_oklab(x, dim=1)
 
             y = einops.rearrange(y, "t c h w -> c t h w")
             x = einops.rearrange(x, "t c h w -> c t h w")

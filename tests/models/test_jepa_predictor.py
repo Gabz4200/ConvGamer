@@ -10,12 +10,12 @@ Seams tested:
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 from torch import nn
 
-from typing import Any, cast
-
-from convgamer.models.jepa import JEPALoss, VJEPAPredictor
+from convgamer.models.jepa import JEPALoss, VJEPAPredictor, compute_context_lambdas
 from convgamer.modules.ema import EMAEncoder
 
 
@@ -30,7 +30,6 @@ def test_predictor_outputs_mask_and_context_tokens() -> None:
         feature_dim=F,
         predictor_dim=64,
         num_layers=2,
-        num_levels=1,
     )
     out = predictor(feat, mask)
     # Dense prediction preserves batch/time/space: (B, F, T, H, W).
@@ -42,8 +41,7 @@ def test_predictor_context_loss_weighting_decays_with_distance() -> None:
     mask = torch.zeros(1, 4, 4, 4, dtype=torch.bool)
     mask[0, 1, :, :] = True  # mask middle frame
 
-    loss_fn = JEPALoss(feature_dim=16)
-    lambdas = loss_fn.compute_context_lambdas(mask, lambda_base=0.5)
+    lambdas = compute_context_lambdas(mask, lambda_base=0.5)
 
     # Masked frame (index 1) has lambda 0 (no ctx loss on masked)
     assert lambdas[0, 1, :, :].max() == 0.0

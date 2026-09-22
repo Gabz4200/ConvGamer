@@ -1,7 +1,7 @@
 """Behavior tests for JEPA datasets and oklab conversion.
 
 Seams tested:
-- ``oklab_convert_srgb``: RGB tensor (B,C,H,W) -> Oklab (B,3,H,W).
+- ``srgb_to_oklab``: RGB tensor (B,C,H,W) -> Oklab (B,3,H,W).
 - ``GameVideoDataset``: returns (B,C,T,H,W) video tensor from mp4 paths.
 - ``GameImageDataset``: returns (B,C,H,W) from image paths -> oklab.
 - ``JEPADataset``: yields (x_view, y_view, mask) where x is masked.
@@ -15,23 +15,22 @@ from convgamer.data.dataset import (
     JEPADataset,
     _resolve_image_paths,
     _resolve_video_paths,
-    oklab_convert_srgb,
 )
 from convgamer.data.oklab import srgb_to_oklab
 
 
-def test_oklab_convert_srgb_matches_oklab_py() -> None:
-    """Our batch converter must match the per-tensor oklab module function."""
+def test_srgb_to_oklab_matches_linear_path() -> None:
+    """srgb_to_oklab produces the same result as linear_srgb-to-oklab + transfer."""
     rgb = torch.rand(2, 3, 8, 8)
-    converted = oklab_convert_srgb(rgb)
+    converted = srgb_to_oklab(rgb, dim=1)
     expected = srgb_to_oklab(rgb.clone(), dim=1)
     torch.testing.assert_close(converted, expected, atol=1e-5, rtol=1e-4)
 
 
-def test_oklab_convert_srgb_preserves_video_shape() -> None:
+def test_srgb_to_oklab_preserves_video_shape() -> None:
     """Video tensor (B,C,T,H,W) converts with shape preserved."""
     video = torch.rand(2, 3, 8, 16, 16)
-    assert oklab_convert_srgb(video, dim=1).shape == video.shape
+    assert srgb_to_oklab(video, dim=1).shape == video.shape
 
 
 def test_jepa_dataset_yields_masked_x_and_clean_y() -> None:

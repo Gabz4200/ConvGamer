@@ -10,7 +10,7 @@ Contracts:
 import pytest
 import torch
 
-from convgamer.models.convgamer.blocks import ConvGamerStem
+from convgamer.models.convgamer.stem import ConvGamerStem
 
 
 @pytest.mark.parametrize("in_channels", [3, 8, 16, 24, 32])
