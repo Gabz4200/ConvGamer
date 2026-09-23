@@ -64,11 +64,7 @@ def _expand_archive_globs(pattern: str, recursive: bool = True) -> list[str]:
         ext = os.path.splitext(match)[1].lower()
         # Tier 2 archives arrive as .tar, .tar.gz, .tgz, or .zip.
         name = os.path.basename(match).lower()
-        if (
-            ext in {".tar", ".zip", ".tgz"}
-            or name.endswith((".tar.gz", ".tgz"))
-            or (ext == ".gz" and ".tar" in name)
-        ):
+        if ext in {".tar", ".zip", ".tgz"} or (ext == ".gz" and ".tar" in name):
             out.extend(_extract_archive(match))
         elif ext == ".mp4":
             out.append(match)
@@ -78,8 +74,7 @@ def _expand_archive_globs(pattern: str, recursive: bool = True) -> list[str]:
 def _extract_archive(archive_path: str) -> list[str]:
     """Extract ``.tar``/``.zip`` to a sibling cache dir and return MP4 paths."""
     extract_dir = archive_path + ".extracted"
-    if not os.path.isdir(extract_dir):
-        os.makedirs(extract_dir, exist_ok=True)
+    os.makedirs(extract_dir, exist_ok=True)
     if archive_path.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as zf:
             zf.extractall(extract_dir)
