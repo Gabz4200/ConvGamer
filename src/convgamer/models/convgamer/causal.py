@@ -241,3 +241,94 @@ class CausalTemporalMixer(nn.Module):
             windows.append(window)
         out_t, hidden = self.aggregator.step(x_t.squeeze(2), state.aggregator)
         return out_t.unsqueeze(2), MixerState(conv=tuple(windows), aggregator=hidden)
+
+
+class MultiHeadCausalTemporalMixer(nn.Module):
+    """``CausalTemporalMixer`` applied independently per head.
+
+    V-JEPA 2.1 (§2.3.2) attaches one prediction head per encoder level. Each
+    level is a distinct feature modality, so the temporal mixer should be
+    allowed to model its own per-head dynamics rather than being forced to
+    share one. This wrapper instantiates ``num_heads`` independent
+    :class:`~convgamer.models.convgamer.causal.CausalTemporalMixer` instances
+    and applies each to its own ``(B, C, T, H, W)`` head slice.
+
+    Input ``x`` is ``(B, num_heads, C, T, H, W)``; output is the same shape.
+    Streaming mirrors the single-head seam: :meth:`init_state` returns a tuple
+    of :class:`~convgamer.models.io.MixerState` (one per head) and
+    :meth:`step` threads frame ``t`` through every head's pipeline
+    independently.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int,
+        kernel_size: int = 3,
+        dilations: tuple[int, ...] = (1, 2, 4),
+    ) -> None:
+        super().__init__()
+        if num_heads < 1:
+            raise ValueError(f"num_heads must be >= 1, got {num_heads}")
+        self.num_heads = num_heads
+        self.mixers = nn.ModuleList(
+            [
+                CausalTemporalMixer(channels, kernel_size=kernel_size, dilations=dilations)
+                for _ in range(num_heads)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply each head's mixer independently.
+
+        Args:
+            x: ``(B, num_heads, C, T, H, W)``.
+
+        Returns:
+            ``(B, num_heads, C, T, H, W)`` — each head mixed independently.
+        """
+        if x.ndim != 6:
+            raise ValueError(f"Expected (B, num_heads, C, T, H, W) input (6D), got {x.ndim}D")
+        if x.shape[1] != self.num_heads:
+            raise ValueError(f"Head axis size {x.shape[1]} != num_heads={self.num_heads}")
+        return torch.stack([m(x[:, i]) for i, m in enumerate(self.mixers)], dim=1)
+
+    def init_state(
+        self,
+        batch_size: int,
+        spatial_h: int = 1,
+        spatial_w: int = 1,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[MixerState, ...]:
+        """One fresh :class:`MixerState` per head."""
+        return tuple(
+            cast(CausalTemporalMixer, mixer).init_state(
+                batch_size, spatial_h, spatial_w, device=device, dtype=dtype
+            )
+            for mixer in self.mixers
+        )
+
+    def step(
+        self, x_t: torch.Tensor, state: tuple[MixerState, ...]
+    ) -> tuple[torch.Tensor, tuple[MixerState, ...]]:
+        """Stream one frame through every head independently.
+
+        Args:
+            x_t: ``(B, num_heads, C, 1, H, W)``.
+            state: Tuple of per-head :class:`MixerState`, in head order.
+
+        Returns:
+            ``(output_t, next_state)`` where ``output_t`` is
+            ``(B, num_heads, C, 1, H, W)`` and ``next_state`` is a tuple of
+            updated per-head states.
+        """
+        if len(state) != self.num_heads:
+            raise ValueError(f"state must have {self.num_heads} per-head states, got {len(state)}")
+        heads: list[torch.Tensor] = []
+        next_states: list[MixerState] = []
+        for i, mixer in enumerate(self.mixers):
+            out_i, next_i = cast(CausalTemporalMixer, mixer).step(x_t[:, i], state[i])
+            heads.append(out_i)
+            next_states.append(next_i)
+        return torch.stack(heads, dim=1), tuple(next_states)
