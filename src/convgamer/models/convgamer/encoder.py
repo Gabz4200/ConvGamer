@@ -8,16 +8,21 @@ frame influences any past output. Output for frame ``t`` pools only frames
 from __future__ import annotations
 
 import warnings
+from typing import cast
 
 import einops
 import torch
 from torch import nn
 
-from convgamer.models.convgamer.causal import CausalLayerNorm, CausalTemporalMixer
+from convgamer.models.convgamer.causal import (
+    CausalLayerNorm,
+    CausalTemporalMixer,
+    MultiHeadCausalTemporalMixer,
+)
 from convgamer.models.convgamer.downsampler import LearnedSpatialTemporalDownsampler
 from convgamer.models.convgamer.stem import ConvGamerStem
 from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
-from convgamer.models.io import StepOutput, StreamingState
+from convgamer.models.io import MixerState, StepOutput, StreamingState
 from convgamer.models.registry import register_model
 
 
@@ -35,6 +40,23 @@ class ConvGamerEncoder(nn.Module):
     As a foundation model for JEPA pre-training this encoder exposes
     ``forward_features`` as its public seam; the classification ``head``
     is retained only for downstream fine-tuning.
+
+    Args:
+        input_dim: Input channel count (oklab RGB = 3).
+        hidden_dim: Per-stage base channel count.
+        num_layers: Per-stage block counts.
+        num_classes: Deprecated; kept as ``None`` (foundation model). Ignored
+            with a warning if a positive value is supplied.
+        layer_scale_init: InceptionNeXt layer-scale init value.
+        mlp_ratios: Per-stage MLP expansion ratios.
+        out_factor: Channel multiplier applied by the downsampler stem.
+        use_softmax: Whether the multi-scale stem fuses branches with softmax.
+        target_size: Optional forced output spatial size for the downsampler.
+        temporal_dilations: Dilations for the causal temporal mixer.
+        widths: Optional explicit per-stage width overrides.
+        num_heads: Number of independent temporal mixers (one per encoder
+            level for V-JEPA 2.1 §2.3.2). ``1`` (default) keeps the legacy
+            single-feature-map contract; ``>1`` returns a head axis at dim 1.
     """
 
     def __init__(
@@ -50,8 +72,12 @@ class ConvGamerEncoder(nn.Module):
         target_size: tuple[int, int] | int | None = None,
         temporal_dilations: tuple[int, ...] = (1, 2, 4),
         widths: tuple[int, int, int, int] | None = None,
+        num_heads: int = 1,
     ):
         super().__init__()
+        if num_heads < 1:
+            raise ValueError(f"num_heads must be >= 1, got {num_heads}")
+        self.num_heads = num_heads
 
         downsampler = LearnedSpatialTemporalDownsampler(
             in_channels=input_dim, out_factor=out_factor, target_size=target_size
@@ -71,9 +97,17 @@ class ConvGamerEncoder(nn.Module):
             mlp_ratios=mlp_ratios,
             widths=widths,
         )
-        self.temporal_mix = CausalTemporalMixer(
-            channels=self.frame_encoder.feature_dim, dilations=temporal_dilations
-        )
+        self.temporal_mix: CausalTemporalMixer | MultiHeadCausalTemporalMixer
+        if num_heads > 1:
+            self.temporal_mix = MultiHeadCausalTemporalMixer(
+                channels=self.frame_encoder.feature_dim,
+                num_heads=num_heads,
+                dilations=temporal_dilations,
+            )
+        else:
+            self.temporal_mix = CausalTemporalMixer(
+                channels=self.frame_encoder.feature_dim, dilations=temporal_dilations
+            )
         self.feature_norm = CausalLayerNorm(self.frame_encoder.feature_dim)
         self.norm = nn.LayerNorm(self.frame_encoder.feature_dim)
         # Foundation-model seam: no classification head by default.
@@ -89,19 +123,23 @@ class ConvGamerEncoder(nn.Module):
             self.head = nn.Linear(self.frame_encoder.feature_dim, num_classes)
         else:
             self.head = nn.Identity()
+        self.num_heads = num_heads
 
     def add_classification_head(self, num_classes: int) -> None:
         """Attach a classification head after foundation pre-training."""
         self.head = nn.Linear(self.frame_encoder.feature_dim, num_classes)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-frame video features ``(B, F, T)`` — no causal pooling, no head.
+        """Per-frame video features — no causal pooling, no head.
 
         Stem -> per-frame InceptionNeXt feature map -> causal temporal mix ->
         feature norm -> spatial mean. Output frame ``t`` is a function of
-        input frames ``<= t`` (the temporal mix is causal). The
-        cumulative-mean pooling that makes logits use only past context lives
-        in ``forward``, keeping ``forward_features`` a clean backbone seam.
+        input frames ``<= t`` (the temporal mix is causal).
+
+        Returns ``(B, F, T)`` for ``num_heads=1`` or
+        ``(B, num_heads, F, T)`` for multi-head. The cumulative-mean pooling
+        that makes logits use only past context lives in ``forward``, keeping
+        ``forward_features`` a clean backbone seam.
         """
         x = self.stem(x)
         b, _c, t, _h, _w = x.shape
@@ -109,16 +147,21 @@ class ConvGamerEncoder(nn.Module):
         maps = self.frame_encoder.forward_feature_map(frames)
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
-        mixed = self.feature_norm(self.temporal_mix(video))
-        return mixed.mean(dim=[3, 4])
+        if self.num_heads > 1:
+            video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
+        mixed = self._normalize_features(self.temporal_mix(video))
+        return mixed.mean(dim=[-2, -1])
 
     def forward_feature_maps(self, x: torch.Tensor) -> torch.Tensor:
-        """Spatial feature maps ``(B, F, T, H', W')`` for dense JEPA prediction.
+        """Spatial feature maps for dense JEPA prediction.
 
         Same pipeline as ``forward_features`` but without the final spatial
         mean-pooling, preserving the 2D spatial structure needed by the
         predictor to produce dense predictions. Maps are channel-normalized
         with the pre-norm ``feature_norm`` before returning.
+
+        Returns ``(B, F, T, H', W')`` for ``num_heads=1`` or
+        ``(B, num_heads, F, T, H', W')`` for multi-head.
         """
         x = self.stem(x)
         b, _c, t, _h, _w = x.shape
@@ -126,7 +169,18 @@ class ConvGamerEncoder(nn.Module):
         maps = self.frame_encoder.forward_feature_map(frames)
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
+        if self.num_heads > 1:
+            video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
         mixed = self.temporal_mix(video)
+        return self._normalize_features(mixed)
+
+    def _normalize_features(self, mixed: torch.Tensor) -> torch.Tensor:
+        """Apply ``feature_norm`` to (B, F, T, H, W) or (B, H, F, T, H, W)."""
+        if self.num_heads > 1:
+            b, h = mixed.shape[0], self.num_heads
+            flat = mixed.reshape(b * h, *mixed.shape[2:])
+            norm = self.feature_norm(flat)
+            return norm.reshape(b, h, *norm.shape[1:])
         return self.feature_norm(mixed)
 
     def init_state(
@@ -180,18 +234,26 @@ class ConvGamerEncoder(nn.Module):
         maps = self.frame_encoder.forward_feature_map(frames)
         _, _, h, w = maps.shape
         video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=1, h=h, w=w)
-        mixed, mixer_state = self.temporal_mix.step(video, state.mixer)
-        mixed = self.feature_norm(mixed)
-        features = mixed.mean(dim=[3, 4])  # (B, F, 1)
+        if self.num_heads > 1:
+            video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
+            mh_mixer = cast(MultiHeadCausalTemporalMixer, self.temporal_mix)
+            mixed, mixer_state = mh_mixer.step(video, cast(tuple, state.mixer))
+        else:
+            st_mixer = cast(CausalTemporalMixer, self.temporal_mix)
+            mixed, mixer_state = st_mixer.step(video, cast(MixerState, state.mixer))
+        mixed = self._normalize_features(mixed)
+        # Spatial mean over (H, W): (B, [H,] F, 1).
+        features = mixed.mean(dim=[-2, -1])
 
         # Causal cumulative mean: frame t is pooled over frames <= t only.
         step_idx = state.step_idx + 1
-        cumsum = (
-            features.squeeze(2).clone()
-            if state.cumsum is None
-            else state.cumsum + features.squeeze(2)
-        )
-        logits = self.head(self.norm(cumsum / step_idx))
+        feat_for_pool = features  # (B, [H,] F, 1)
+        cumsum = feat_for_pool.clone() if state.cumsum is None else state.cumsum + feat_for_pool
+        if self.num_heads > 1:
+            # No shared classification head per level; return pooled features.
+            logits = cumsum / step_idx  # (B, H, F, 1)
+        else:
+            logits = self.head(self.norm((cumsum / step_idx).squeeze(2)))
 
         next_state = StreamingState(
             downsampler=downsampler_state,
@@ -200,9 +262,14 @@ class ConvGamerEncoder(nn.Module):
             cumsum=cumsum,
             step_idx=step_idx,
         )
+        if self.num_heads > 1:
+            # Already (B, H, F, 1) from cumsum/step_idx.
+            pass
+        else:
+            logits = logits.unsqueeze(1) if logits.dim() == 2 else logits
         return StepOutput(
             features=features,
-            logits=logits.unsqueeze(1) if logits.dim() == 2 else logits,
+            logits=logits,
             new_state=next_state,
         )
 
@@ -217,6 +284,9 @@ class ConvGamerEncoder(nn.Module):
         ``(B, F)`` instead of logits.
         """
         video = self.forward_features(x)
+        if self.num_heads > 1:
+            # (B, H, F, T) — no shared classification head per level.
+            return video
         if return_sequence:
             b, _, t = video.shape
             flat = einops.rearrange(video, "b f t -> (b t) f")

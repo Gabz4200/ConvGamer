@@ -115,13 +115,20 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         # Predictor: predict target features from context + mask
         pred = self.predictor(x_feat, mask)
 
-        if pred.shape != y_feat.shape:
-            raise ValueError(
-                f"Predictor output {tuple(pred.shape)} must match target {tuple(y_feat.shape)}"
-            )
+        # Align target to multi-head layout: each head is compared to the
+        # same encoder feature level, so broadcast the target across heads.
+        y_for_loss = y_feat
+        if pred.ndim == 6:
+            if y_feat.ndim == 5:
+                y_for_loss = y_feat.unsqueeze(1).expand(-1, pred.shape[1], -1, -1, -1, -1)
+            elif y_for_loss.shape[1] != pred.shape[1]:
+                raise ValueError(
+                    f"Predictor head axis {pred.shape[1]} must match target "
+                    f"head axis {y_for_loss.shape[1]}"
+                )
 
         # Dense predictive loss (L_predict + L_ctx)
-        return self.loss_fn(pred, y_feat, mask)
+        return self.loss_fn(pred, y_for_loss, mask)
 
     def training_step(self, batch, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # noqa: ARG002
         x, y, mask = batch

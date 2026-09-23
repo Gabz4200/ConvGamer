@@ -74,7 +74,9 @@ class StreamingState:
     downsampler, stem, mixer:
         The per-composite states, in pipeline order.  ``stem`` and ``mixer``
         operate at the post-downsample spatial size; ``downsampler`` sees the
-        full-resolution input.
+        full-resolution input. ``mixer`` is a single
+        :class:`~convgamer.models.io.MixerState` for the single-head path or a
+        tuple of them for the multi-head mixer.
     cumsum:
         Running sum of streamed frame features ``(B, F)`` driving the causal
         cumulative-mean pooling; ``None`` before the first frame.
@@ -85,7 +87,7 @@ class StreamingState:
 
     downsampler: DownsamplerState
     stem: StemState
-    mixer: MixerState
+    mixer: MixerState | tuple[MixerState, ...]
     cumsum: torch.Tensor | None = None
     step_idx: int = 0
 

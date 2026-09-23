@@ -13,6 +13,8 @@ encoder:
   out_factor: 2
   use_softmax: false
   temporal_dilations: [1, 2, 4]
+  num_heads: 1                 # 1 = single-level (foundation features);
+                               # >1 enables per-level multi-head JEPA (§2.3.2)
 
 # V-JEPA 2.1 predictor (§2.3.1)
 predictor:
@@ -20,6 +22,8 @@ predictor:
   feature_dim: 768           # 96 * 2^3 (4 stages, doubling each)
   predictor_dim: 384
   num_layers: 4              # reduced from 24 (ViT-G) for ConvNeXt-Tiny
+  num_heads: 4               # attention heads (default 4)
+  num_levels: 1              # must match encoder.num_heads
   expansion: 4               # ConvNeXt-style MLP expansion in predictor blocks
   layer_scale_init: 1e-6     # start predictor residual blocks near identity
 
@@ -27,6 +31,7 @@ predictor:
 loss:
   _target_: convgamer.models.jepa.JEPALoss
   feature_dim: 768
+  num_levels: 1              # must match predictor.num_levels
   lambda_base: 0.5          # video lambda (0.5 video, 0.7 image per Appendix A)
   lambda_image: 0.7         # static-image (T=1) context weight
   lambda_warmup_steps: 0    # 0 disables; set ~30000 for the paper's epochs 50-100 ramp

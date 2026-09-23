@@ -80,6 +80,11 @@ class JEPALoss(nn.Module):
         lambda_image: Context weight for static-image (T=1) samples.
         lambda_warmup_steps: Linear warmup steps for ``lambda`` (epochs 50-100
             in the paper); 0 disables the schedule.
+        num_levels: Number of prediction levels (one per encoder level). When
+            ``> 1``, ``pred`` is ``(B, num_levels, F, T, H, W)`` and ``target``
+            is ``(B, F, T, H, W)``, with every level compared to the same
+            target level. ``num_levels=1`` preserves the legacy
+            ``(B, F, T, H, W)`` prediction layout.
     """
 
     def __init__(
@@ -88,12 +93,16 @@ class JEPALoss(nn.Module):
         lambda_base: float = 0.5,
         lambda_image: float = 0.7,
         lambda_warmup_steps: int = 0,
+        num_levels: int = 1,
     ):
         super().__init__()
+        if num_levels < 1:
+            raise ValueError(f"num_levels must be >= 1, got {num_levels}")
         self.feature_dim = feature_dim
         self.lambda_base = lambda_base
         self.lambda_image = lambda_image
         self.lambda_warmup_steps = max(0, int(lambda_warmup_steps))
+        self.num_levels = num_levels
         # Warmup schedule (V-JEPA 2.1 ramps lambda epochs 50-100): the step
         # counter must survive resume, so the buffer stays persistent.
         self._step_counter: torch.Tensor
@@ -123,19 +132,36 @@ class JEPALoss(nn.Module):
         """Compute L_dense = L_predict + L_ctx.
 
         Args:
-            pred: Predicted features ``(B, F, T, H, W)``.
-            target: Target encoder features ``(B, F, T, H, W)`` (already stop-grad'd).
+            pred: Predicted features ``(B, F, T, H, W)`` (single head) or
+                ``(B, num_heads, F, T, H, W)`` (multi-head).
+            target: Target encoder features ``(B, F, T, H, W)`` (already
+                stop-grad'd). Multi-head predictions are each compared to the
+                same target level.
             mask: Boolean mask ``(B, T, H, W)`` — True at masked positions.
 
         Returns:
-            Scalar loss.
+            Scalar loss (averaged across heads when ``num_heads > 1``).
         """
         # Stop-gradient on target (V-JEPA 2.1 §2.1)
         target = target.detach()
 
+        # Normalize multi-level predictions to the single-level layout
+        # (B, F, T, H, W) so the rest of the loss is shared.
+        if pred.ndim == 6:
+            if pred.shape[1] != self.num_levels:
+                raise ValueError(f"pred level axis {pred.shape[1]} != num_levels={self.num_levels}")
+            if target.ndim == 5:
+                target = target.unsqueeze(1).expand(-1, self.num_levels, -1, -1, -1, -1)
+            if target.ndim != 6:
+                raise ValueError(f"target must be 5D (B,F,T,H,W); got {target.ndim}D")
+            flat_pred = pred.reshape(-1, *pred.shape[2:])
+            flat_target = target.reshape(-1, *target.shape[2:])
+        else:
+            flat_pred, flat_target = pred, target
+
         # Resize mask to feature-map dims with nearest: mask is token-level
         # (V-JEPA 2.1 masks patch tokens), so binary boundaries must survive.
-        _, _, ft, fh, fw = pred.shape
+        _, _, ft, fh, fw = flat_pred.shape
         mask_resized = (
             nn.functional.interpolate(
                 mask.float().unsqueeze(1),
@@ -147,8 +173,8 @@ class JEPALoss(nn.Module):
         )
 
         # Per-token L1 distance
-        l1 = (pred - target).abs()  # (B, F, T, H, W)
-        token_loss = l1.mean(dim=1)  # (B, T, H, W)
+        l1 = (flat_pred - flat_target).abs()  # (N, F, T, H, W)
+        token_loss = l1.mean(dim=1)  # (N, T, H, W)
 
         # L_predict: only on masked tokens
         pred_loss = token_loss.masked_fill(~mask_resized, 0.0)
@@ -158,9 +184,14 @@ class JEPALoss(nn.Module):
         # L_ctx: distance-weighted, only on context (visible) tokens
         lambdas = compute_context_lambdas(
             mask_resized, lambda_base=self._effective_lambda(mask)
-        )  # (B, T, H, W)
+        )  # (N, T, H, W)
         ctx_loss = token_loss * lambdas  # already 0 at masked
         n_ctx = (~mask_resized).sum().clamp(min=1)
         l_ctx = ctx_loss.sum() / n_ctx
 
-        return l_predict + l_ctx
+        loss = l_predict + l_ctx
+        # Multi-level losses pool the level axis into the batch fold; divide by
+        # the level count so the result is the per-level average.
+        if pred.ndim == 6:
+            loss = loss / self.num_levels
+        return loss

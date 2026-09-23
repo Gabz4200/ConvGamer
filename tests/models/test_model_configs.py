@@ -105,8 +105,12 @@ def test_jepa_config_composition() -> None:
     assert cfg["model"]["encoder"]["num_classes"] is None
     assert cfg["model"]["encoder"]["hidden_dim"] == 96
     assert cfg["model"]["encoder"]["num_layers"] == [3, 3, 9, 3]
+    assert cfg["model"]["encoder"]["num_heads"] == 1
     assert cfg["model"]["predictor"]["feature_dim"] == 768
+    assert cfg["model"]["predictor"]["num_levels"] == 1
+    assert cfg["model"]["predictor"]["num_heads"] == 4
     assert cfg["model"]["loss"]["feature_dim"] == 768
+    assert cfg["model"]["loss"]["num_levels"] == 1
     assert cfg["model"]["loss"]["lambda_base"] == 0.5
     assert cfg["model"]["loss"]["lambda_image"] == 0.7
     assert cfg["model"]["ema_decay"] == 0.99925
