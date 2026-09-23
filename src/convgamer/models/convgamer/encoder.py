@@ -123,11 +123,21 @@ class ConvGamerEncoder(nn.Module):
             self.head = nn.Linear(self.frame_encoder.feature_dim, num_classes)
         else:
             self.head = nn.Identity()
-        self.num_heads = num_heads
 
     def add_classification_head(self, num_classes: int) -> None:
         """Attach a classification head after foundation pre-training."""
         self.head = nn.Linear(self.frame_encoder.feature_dim, num_classes)
+
+    def _forward_pipeline(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, int]:
+        x = self.stem(x)
+        b, _c, t, _h, _w = x.shape
+        frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
+        maps = self.frame_encoder.forward_feature_map(frames)
+        _, _, h, w = maps.shape
+        video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
+        if self.num_heads > 1:
+            video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
+        return video, b, t, h, w
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Per-frame video features — no causal pooling, no head.
@@ -141,14 +151,7 @@ class ConvGamerEncoder(nn.Module):
         that makes logits use only past context lives in ``forward``, keeping
         ``forward_features`` a clean backbone seam.
         """
-        x = self.stem(x)
-        b, _c, t, _h, _w = x.shape
-        frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
-        maps = self.frame_encoder.forward_feature_map(frames)
-        _, _, h, w = maps.shape
-        video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
-        if self.num_heads > 1:
-            video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
+        video, *_ = self._forward_pipeline(x)
         mixed = self._normalize_features(self.temporal_mix(video))
         return mixed.mean(dim=[-2, -1])
 
@@ -163,14 +166,7 @@ class ConvGamerEncoder(nn.Module):
         Returns ``(B, F, T, H', W')`` for ``num_heads=1`` or
         ``(B, num_heads, F, T, H', W')`` for multi-head.
         """
-        x = self.stem(x)
-        b, _c, t, _h, _w = x.shape
-        frames = einops.rearrange(x, "b c t h w -> (b t) c h w")
-        maps = self.frame_encoder.forward_feature_map(frames)
-        _, _, h, w = maps.shape
-        video = einops.rearrange(maps, "(b t) f h w -> b f t h w", b=b, t=t, h=h, w=w)
-        if self.num_heads > 1:
-            video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
+        video, *_ = self._forward_pipeline(x)
         mixed = self.temporal_mix(video)
         return self._normalize_features(mixed)
 
@@ -262,10 +258,7 @@ class ConvGamerEncoder(nn.Module):
             cumsum=cumsum,
             step_idx=step_idx,
         )
-        if self.num_heads > 1:
-            # Already (B, H, F, 1) from cumsum/step_idx.
-            pass
-        else:
+        if self.num_heads == 1:
             logits = logits.unsqueeze(1) if logits.dim() == 2 else logits
         return StepOutput(
             features=features,

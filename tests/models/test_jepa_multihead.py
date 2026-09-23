@@ -12,6 +12,7 @@ Seams tested:
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from convgamer.models.convgamer.causal import (
@@ -89,29 +90,20 @@ def test_predictor_attention_heads_default() -> None:
 
 def test_predictor_rejects_bad_num_levels() -> None:
     """num_levels<1 is a programming error."""
-    try:
+    with pytest.raises(ValueError, match="num_levels"):
         VJEPAPredictor(num_levels=0)
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for num_levels=0")
 
 
 def test_predictor_rejects_bad_attention_heads() -> None:
     """num_heads<1 is a programming error."""
-    try:
+    with pytest.raises(ValueError, match="num_heads"):
         VJEPAPredictor(num_heads=0)
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for num_heads=0")
 
 
 def test_predictor_rejects_non_divisible_dim() -> None:
     """predictor_dim must be divisible by num_heads."""
-    try:
+    with pytest.raises(ValueError, match="divisible"):
         VJEPAPredictor(predictor_dim=65, num_heads=4)
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for non-divisible dim")
 
 
 def test_loss_accepts_multi_level_predictions() -> None:

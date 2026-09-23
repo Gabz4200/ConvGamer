@@ -10,6 +10,23 @@ from convgamer.data.oklab import srgb_to_oklab
 from convgamer.data.sources import _resolve_image_paths, _resolve_video_paths
 
 
+def _resize_video_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    if frames.shape[-2:] != (height, width):
+        import torchvision.transforms.functional as TF
+
+        frames = torch.stack([TF.resize(f, [height, width]) for f in frames])
+    return frames
+
+
+def _worker_info() -> tuple[int, int]:
+    import torch.utils.data as data_utils
+
+    info = data_utils.get_worker_info()
+    worker_id = info.id if info is not None else 0
+    num_workers = info.num_workers if info is not None else 1
+    return worker_id, num_workers
+
+
 class RandomSyntheticDataset(Dataset):
     """Synthetic smoke dataset for images and video.
 
@@ -196,15 +213,10 @@ class GameVideoDataset(IterableDataset):
             start = 0
             stride = 1
         else:
-            start = (
-                0
-                if total == self.num_frames * self.sample_stride
-                else (
-                    torch.randint(0, total - self.num_frames * self.sample_stride, (1,)).item()
-                    if total > self.num_frames * self.sample_stride
-                    else 0
-                )
-            )
+            if total == self.num_frames * self.sample_stride:
+                start = 0
+            else:
+                start = torch.randint(0, total - self.num_frames * self.sample_stride, (1,)).item()
             stride = self.sample_stride
 
         indices = list(
@@ -219,22 +231,14 @@ class GameVideoDataset(IterableDataset):
         frames = einops.rearrange(frames, "t h w c -> t c h w")
 
         frames = frames.float() / 255.0
-        # Resize if needed
-        if frames.shape[-2:] != (self.height, self.width):
-            import torchvision.transforms.functional as TF
-
-            frames = torch.stack([TF.resize(f, [self.height, self.width]) for f in frames])
+        frames = _resize_video_frames(frames, self.height, self.width)
         return frames
 
     def __iter__(self):
         import logging
 
-        import torch.utils.data as data_utils
-
         logger = logging.getLogger(__name__)
-        info = data_utils.get_worker_info()
-        worker_id = info.id if info is not None else 0
-        num_workers = info.num_workers if info is not None else 1
+        worker_id, num_workers = _worker_info()
         resolved = _resolve_video_paths(
             self.video_paths,
             data_dir=self.data_dir,
@@ -287,13 +291,10 @@ class GameImageDataset(IterableDataset):
     def __iter__(self):
         import logging
 
-        import torch.utils.data as data_utils
         from torchvision.io import read_image
 
         logger = logging.getLogger(__name__)
-        info = data_utils.get_worker_info()
-        worker_id = info.id if info is not None else 0
-        num_workers = info.num_workers if info is not None else 1
+        worker_id, num_workers = _worker_info()
         resolved = _resolve_image_paths(
             self.image_paths,
             data_dir=self.data_dir,
@@ -411,23 +412,16 @@ class HFVideoDataset(IterableDataset):
         frames = vr.get_batch(indices).as_tensor()
         frames = einops.rearrange(frames, "t h w c -> t c h w")
         frames = frames.float() / 255.0
-        if frames.shape[-2:] != (self.height, self.width):
-            import torchvision.transforms.functional as TF
-
-            frames = torch.stack([TF.resize(f, [self.height, self.width]) for f in frames])
+        frames = _resize_video_frames(frames, self.height, self.width)
         return frames
 
     def __iter__(self):
         import logging
 
-        import torch.utils.data as data_utils
         from datasets import load_dataset
 
         logger = logging.getLogger(__name__)
-        info = data_utils.get_worker_info()
-        worker_id = info.id if info is not None else 0
-        num_workers = info.num_workers if info is not None else 1
-
+        worker_id, num_workers = _worker_info()
         ds = load_dataset(self.repo_id, split=self.split, streaming=True)
         if num_workers > 1:
             ds = ds.shard(num_shards=num_workers, index=worker_id)

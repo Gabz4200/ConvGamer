@@ -25,6 +25,10 @@ from convgamer.data.dataset import (
 )
 
 
+def _make_loader(ds, batch_size: int, num_workers: int) -> DataLoader:
+    return DataLoader(ds, batch_size=batch_size, num_workers=num_workers, drop_last=True)
+
+
 class VJEPAGamingDataModule(pl.LightningDataModule):
     """DataModule for V-JEPA 2.1 pretraining on gaming data.
 
@@ -143,34 +147,14 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
                 raise RuntimeError("video_ds not initialized; call setup() first")
             if self.image_ds is None:
                 raise RuntimeError("image_ds not initialized; call setup() first")
-            video_dl = DataLoader(
-                self.video_ds,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                drop_last=True,
-            )
-            image_dl = DataLoader(
-                self.image_ds,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers,
-                drop_last=True,
-            )
+            video_dl = _make_loader(self.video_ds, self.batch_size, self.num_workers)
+            image_dl = _make_loader(self.image_ds, self.batch_size, self.num_workers)
             loaders = [video_dl, image_dl]
             if self.reg_ds is not None:
-                reg_dl = DataLoader(
-                    self.reg_ds,
-                    batch_size=self.batch_size,
-                    num_workers=self.num_workers,
-                    drop_last=True,
-                )
+                reg_dl = _make_loader(self.reg_ds, self.batch_size, self.num_workers)
                 loaders.append(reg_dl)
             return loaders
-        return DataLoader(
-            self.train_ds,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            drop_last=True,
-        )
+        return _make_loader(self.train_ds, self.batch_size, self.num_workers)
 
     def val_dataloader(self) -> DataLoader | None:
         # For self-supervised pretraining, validation uses synthetic data
