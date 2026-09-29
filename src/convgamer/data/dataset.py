@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 import einops
 import torch
 from decord import VideoReader as _DecordVideoReader
 from decord import cpu as _decord_cpu
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from convgamer.data.oklab import srgb_to_oklab
 from convgamer.data.sources import _resolve_image_paths, _resolve_video_paths
@@ -19,12 +21,25 @@ def _resize_video_frames(frames: torch.Tensor, height: int, width: int) -> torch
 
 
 def _worker_info() -> tuple[int, int]:
-    import torch.utils.data as data_utils
-
-    info = data_utils.get_worker_info()
+    info = get_worker_info()
     worker_id = info.id if info is not None else 0
     num_workers = info.num_workers if info is not None else 1
     return worker_id, num_workers
+
+
+def _mask_video_clip(
+    y: torch.Tensor, mask: torch.Tensor, to_oklab: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask ``y`` (T, C, H, W), optionally convert to oklab, return (x, y) as (C, T, H, W)."""
+    x = y.clone()
+    c = y.shape[1]
+    x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
+    if to_oklab:
+        y = srgb_to_oklab(y, dim=1)
+        x = srgb_to_oklab(x, dim=1)
+    y = einops.rearrange(y, "t c h w -> c t h w")
+    x = einops.rearrange(x, "t c h w -> c t h w")
+    return x, y
 
 
 class RandomSyntheticDataset(Dataset):
@@ -144,17 +159,7 @@ class JEPADataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         y = self._data[index]  # (T, C, H, W)
         mask = self._masks[index]  # (T, H, W)
-
-        x = y.clone()
-        x[mask.unsqueeze(1).expand(-1, self.channels, -1, -1)] = 0.0
-
-        if self.to_oklab:
-            y = srgb_to_oklab(y, dim=1)
-            x = srgb_to_oklab(x, dim=1)
-
-        # Rearrange to (C, T, H, W)
-        y = einops.rearrange(y, "t c h w -> c t h w")
-        x = einops.rearrange(x, "t c h w -> c t h w")
+        x, y = _mask_video_clip(y, mask, self.to_oklab)
         return x, y, mask
 
 
@@ -202,9 +207,7 @@ class GameVideoDataset(IterableDataset):
 
         Returns: ``(T, C, H, W)`` float tensor in [0, 1].
         """
-        from decord import VideoReader, cpu
-
-        vr = VideoReader(path, ctx=cpu(0))
+        vr = _DecordVideoReader(path, ctx=_decord_cpu(0))
         total = len(vr)
         total = min(total, self.max_frames)
 
@@ -235,8 +238,6 @@ class GameVideoDataset(IterableDataset):
         return frames
 
     def __iter__(self):
-        import logging
-
         logger = logging.getLogger(__name__)
         worker_id, num_workers = _worker_info()
         resolved = _resolve_video_paths(
@@ -253,17 +254,9 @@ class GameVideoDataset(IterableDataset):
                 continue
 
             mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
-            x = y.clone()
-            c = y.shape[1]
-            x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
-
-            if self.to_oklab:
-                y = srgb_to_oklab(y, dim=1)
-                x = srgb_to_oklab(x, dim=1)
+            x, y = _mask_video_clip(y, mask, self.to_oklab)
 
             # (C, T, H, W)
-            y = einops.rearrange(y, "t c h w -> c t h w")
-            x = einops.rearrange(x, "t c h w -> c t h w")
             yield x, y, mask
 
 
@@ -289,8 +282,6 @@ class GameImageDataset(IterableDataset):
         self.data_dir = data_dir
 
     def __iter__(self):
-        import logging
-
         from torchvision.io import read_image
 
         logger = logging.getLogger(__name__)
@@ -390,18 +381,12 @@ class HFVideoDataset(IterableDataset):
 
     def _load_frames(self, source) -> torch.Tensor:
         """Decode ``source`` (path or bytes) into a ``(T, C, H, W)`` tensor."""
-        reader = _DecordVideoReader
-        cpu = _decord_cpu
-        if reader is None or cpu is None:
-            raise ImportError(
-                "decord is required for HFVideoDataset; install with `pip install decord`"
-            )
         if isinstance(source, (bytes, bytearray)):
             import io
 
-            vr = reader(io.BytesIO(bytes(source)), ctx=cpu(0))
+            vr = _DecordVideoReader(io.BytesIO(bytes(source)), ctx=_decord_cpu(0))
         else:
-            vr = reader(str(source), ctx=cpu(0))
+            vr = _DecordVideoReader(str(source), ctx=_decord_cpu(0))
         total = len(vr)
         total = min(total, 10_000)
         if total < self.num_frames:
@@ -416,8 +401,6 @@ class HFVideoDataset(IterableDataset):
         return frames
 
     def __iter__(self):
-        import logging
-
         from datasets import load_dataset
 
         logger = logging.getLogger(__name__)
@@ -439,15 +422,6 @@ class HFVideoDataset(IterableDataset):
                 continue
 
             mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
-            x = y.clone()
-            c = y.shape[1]
-            x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
-
-            if self.to_oklab:
-                y = srgb_to_oklab(y, dim=1)
-                x = srgb_to_oklab(x, dim=1)
-
-            y = einops.rearrange(y, "t c h w -> c t h w")
-            x = einops.rearrange(x, "t c h w -> c t h w")
+            x, y = _mask_video_clip(y, mask, self.to_oklab)
             count += 1
             yield x, y, mask
