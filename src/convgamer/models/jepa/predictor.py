@@ -61,7 +61,8 @@ class _MultiHeadAttentionBlock(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, layer_scale_init: float = 1e-6):
         super().__init__()
-        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
+        if dim % num_heads != 0:
+            raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
@@ -228,7 +229,6 @@ class VJEPAPredictor(nn.Module):
 
         h = self.input_proj(x)  # (B*L, predictor_dim, T, H, W)
         _, _, ft, fh, fw = h.shape
-        h = h.reshape(b * (self.num_levels if multi else 1), self.predictor_dim, ft, fh, fw)
 
         # Nearest resize: mask marks discrete tokens, not a smooth field.
         mask_resized = (
