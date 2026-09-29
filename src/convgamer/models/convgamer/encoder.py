@@ -233,7 +233,7 @@ class ConvGamerEncoder(nn.Module):
         if self.num_heads > 1:
             video = video.unsqueeze(1).expand(-1, self.num_heads, -1, -1, -1, -1)
             mh_mixer = cast(MultiHeadCausalTemporalMixer, self.temporal_mix)
-            mixed, mixer_state = mh_mixer.step(video, cast(tuple, state.mixer))
+            mixed, mixer_state = mh_mixer.step(video, cast("tuple[MixerState, ...]", state.mixer))
         else:
             st_mixer = cast(CausalTemporalMixer, self.temporal_mix)
             mixed, mixer_state = st_mixer.step(video, cast(MixerState, state.mixer))

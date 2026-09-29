@@ -49,7 +49,8 @@ def _backbone_kwargs_for_checkpoint(target: str, params: dict[str, Any]) -> dict
     if isinstance(kwargs.get("mlp_ratios"), list):
         kwargs["mlp_ratios"] = tuple(kwargs["mlp_ratios"])
     if kwargs.get("target_size") is not None and not isinstance(kwargs["target_size"], tuple):
-        kwargs["target_size"] = tuple(kwargs["target_size"])
+        v = kwargs["target_size"]
+        kwargs["target_size"] = (v, v) if isinstance(v, int) else tuple(v)
     return kwargs
 
 
