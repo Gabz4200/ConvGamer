@@ -34,6 +34,21 @@ class ClassificationLightningModule(pl.LightningModule):
     lr: float
     weight_decay: float
 
+    def __init__(
+        self,
+        model: Any,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        model_kwargs: dict[str, Any] | None = None,
+    ):
+        super().__init__()
+        self.model = model
+        self.lr: float = lr
+        self.weight_decay: float = weight_decay
+        self.save_hyperparameters(
+            {"lr": lr, "weight_decay": weight_decay, "model": dict(model_kwargs or {})}
+        )
+
     def _step(self, batch, stage: str) -> torch.Tensor:
         x, y = batch
         loss, acc = _cls_metrics(self(x), y)
@@ -157,13 +172,7 @@ class InceptionNeXtModule(ClassificationLightningModule):
         weight_decay: float = 0.0,
         model_kwargs: dict[str, Any] | None = None,
     ):
-        super().__init__()
-        self.model = model
-        self.lr: float = lr
-        self.weight_decay: float = weight_decay
-        self.save_hyperparameters(
-            {"lr": lr, "weight_decay": weight_decay, "model": dict(model_kwargs or {})}
-        )
+        super().__init__(model, lr=lr, weight_decay=weight_decay, model_kwargs=model_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -186,13 +195,7 @@ class ConvGamerModel(ClassificationLightningModule):
         weight_decay: float = 0.0,
         model_kwargs: dict[str, Any] | None = None,
     ):
-        super().__init__()
-        self.model = model
-        self.lr: float = lr
-        self.weight_decay: float = weight_decay
-        self.save_hyperparameters(
-            {"lr": lr, "weight_decay": weight_decay, "model": dict(model_kwargs or {})}
-        )
+        super().__init__(model, lr=lr, weight_decay=weight_decay, model_kwargs=model_kwargs)
 
     def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         return self.model(x, return_sequence=return_sequence)
