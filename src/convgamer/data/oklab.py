@@ -1,14 +1,10 @@
 # ruff: noqa: E501, E741, N802, N803, SIM300
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import Tensor
 
 __all__ = ["srgb_to_oklab"]
-
-pi = math.pi
 
 
 def _cbrt(x: Tensor) -> Tensor:

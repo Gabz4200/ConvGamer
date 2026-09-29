@@ -33,8 +33,6 @@ def create_trainer(cfg: DictConfig) -> pl.Trainer:
     callbacks = [_build_callback(name) for name in callback_names]
     ckpt_cfg = getattr(cfg.trainer, "checkpoint_callback", None)
     if ckpt_cfg:
-        from pytorch_lightning.callbacks import ModelCheckpoint
-
         container = OmegaConf.to_container(ckpt_cfg, resolve=True)
         if not isinstance(container, dict):
             raise TypeError(f"checkpoint config must be a dict, got {type(container).__name__}")

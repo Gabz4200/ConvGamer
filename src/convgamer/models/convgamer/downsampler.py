@@ -239,14 +239,6 @@ def spatial_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     if x.ndim not in (4, 5):
         raise ValueError(f"Expected 4D (B,C,H,W) or 5D (B,C,T,H,W), got {x.ndim}D")
-
-    # Flatten only the last two spatial dimensions (H, W) -> (..., H*W)
-    # For 4D: (B, C, H, W) -> (B, C, H*W)
-    # For 5D: (B, T, C, H, W) -> (B, T, C, H*W)
     flattened = x.flatten(start_dim=-2)
-
-    # Apply softmax over the flattened spatial dimension
     probs = F.softmax(flattened.float(), dim=-1).to(dtype=flattened.dtype)
-
-    # Restore original shape
     return probs.view_as(x)
