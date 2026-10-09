@@ -1,15 +1,48 @@
+"""Video/image datasets for JEPA training and offline smoke runs.
+
+Real data only — no noise-synthetic datasets. Offline smoke runs use the
+checked-in real game clip (``tests/fixtures/terraria16_u8.pt``), never random
+tensors. Masking is multi-block at token resolution (see
+:mod:`convgamer.data.masking`); it is strictly a train-time augmentation.
+"""
+
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import einops
+import numpy as np
 import torch
 from decord import VideoReader as _DecordVideoReader
 from decord import cpu as _decord_cpu
+from PIL import Image
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
-from convgamer.data.oklab import srgb_to_oklab
+from convgamer.data.masking import multiblock_mask_3d
 from convgamer.data.sources import _resolve_image_paths, _resolve_video_paths
+
+__all__ = [
+    "FixtureClipDataset",
+    "FixtureFrameDataset",
+    "GameImageDataset",
+    "GameVideoDataset",
+    "fixture_path",
+]
+
+
+def fixture_path() -> Path:
+    """Locate the checked-in smoke clip, from CWD or the repo tree."""
+    candidates = [
+        Path("tests/fixtures/terraria16_u8.pt"),
+        Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "terraria16_u8.pt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "smoke fixture not found; searched " + ", ".join(str(c) for c in candidates)
+    )
 
 
 def _resize_video_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -27,155 +60,119 @@ def _worker_info() -> tuple[int, int]:
     return worker_id, num_workers
 
 
-def _mask_video_clip(
-    y: torch.Tensor, mask: torch.Tensor, to_oklab: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask ``y`` (T, C, H, W), optionally convert to oklab, return (x, y) as (C, T, H, W)."""
+# ImageNet standardization for sRGB inputs in [0, 1].
+_RGB_MEAN = (0.485, 0.456, 0.406)
+_RGB_STD = (0.229, 0.224, 0.225)
+
+
+def _normalize_rgb(y: torch.Tensor, dim: int) -> torch.Tensor:
+    mean = torch.tensor(_RGB_MEAN, device=y.device, dtype=y.dtype)
+    std = torch.tensor(_RGB_STD, device=y.device, dtype=y.dtype)
+    shape = [1] * y.ndim
+    shape[dim] = 3
+    return (y - mean.view(shape)) / std.view(shape)
+
+
+def _mask_video_clip(y: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask ``y`` (T, C, H, W), standardize RGB, return (x, y) as (C, T, H, W)."""
     x = y.clone()
     c = y.shape[1]
     x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
-    if to_oklab:
-        y = srgb_to_oklab(y, dim=1)
-        x = srgb_to_oklab(x, dim=1)
+    y = _normalize_rgb(y, dim=1)
+    x = _normalize_rgb(x, dim=1)
     y = einops.rearrange(y, "t c h w -> c t h w")
     x = einops.rearrange(x, "t c h w -> c t h w")
     return x, y
 
 
-class RandomSyntheticDataset(Dataset):
-    """Synthetic smoke dataset for images and video.
+def _load_fixture_clip(path: Path | None = None) -> torch.Tensor:
+    """Load the smoke clip as float ``(C, Tf, Hf, Wf)`` in [0, 1]."""
+    clip = torch.load(str(path or fixture_path()), weights_only=True)
+    return clip.float() / 255.0
 
-    With ``num_frames=None`` the sample shape is ``(C, H, W)``; otherwise
-    ``(C, T, H, W)``.
+
+class FixtureClipDataset(IterableDataset):
+    """Offline smoke dataset over the checked-in real game clip.
+
+    Cycles the fixture clip ``repeats`` times, yielding ``(x, y, mask)``
+    triplets with a fresh multi-block mask per sample. Finite length
+    (``len == repeats``) so smoke runs terminate.
     """
 
     def __init__(
         self,
-        num_samples: int = 64,
-        channels: int = 3,
-        size: int = 32,
-        num_classes: int = 10,
-        num_frames: int | None = None,
+        num_frames: int = 16,
+        height: int = 144,
+        width: int = 256,
+        mask_ratio: float = 0.25,
+        repeats: int = 8,
+        fixture: Path | None = None,
     ):
-        self.num_samples = num_samples
-        self.channels = channels
-        self.size = size
-        self.num_classes = num_classes
         self.num_frames = num_frames
-        shape = (
-            (num_samples, channels, size, size)
-            if num_frames is None
-            else (num_samples, channels, num_frames, size, size)
-        )
-        self._data = torch.randn(*shape)
-        self._labels = torch.randint(0, num_classes, (num_samples,))
+        self.height = height
+        self.width = width
+        self.mask_ratio = mask_ratio
+        self.repeats = repeats
+        self.fixture = fixture
 
     def __len__(self) -> int:
-        return self.num_samples
+        return self.repeats
+
+    def __iter__(self):
+        clip = _load_fixture_clip(self.fixture)  # (C, Tf, Hf, Wf)
+        tf = clip.shape[1]
+        if self.num_frames > tf:
+            raise ValueError(f"num_frames={self.num_frames} exceeds fixture length {tf}")
+        step = max(1, tf // self.num_frames)
+        idx = torch.arange(0, tf, step)[: self.num_frames]
+        frames = clip[:, idx]  # (C, T, Hf, Wf)
+        frames = einops.rearrange(frames, "c t h w -> t c h w")
+        frames = _resize_video_frames(frames, self.height, self.width)
+        for n in range(self.repeats):
+            mask = multiblock_mask_3d(
+                self.num_frames, self.height, self.width, self.mask_ratio, seed=n
+            )
+            x, y = _mask_video_clip(frames, mask)
+            yield x, y, mask
+
+
+class FixtureFrameDataset(Dataset):
+    """Real game frames as ``(image, label)`` pairs for classification smoke runs.
+
+    Labels cycle deterministically over ``num_classes`` — they validate wiring,
+    not quality.
+    """
+
+    def __init__(
+        self,
+        size: int = 32,
+        num_classes: int = 10,
+        fixture: Path | None = None,
+    ):
+        clip = _load_fixture_clip(fixture)  # (C, Tf, Hf, Wf)
+        frames = einops.rearrange(clip, "c t h w -> t c h w")
+        self.frames = _resize_video_frames(frames, size, size)
+        self.num_classes = num_classes
+
+    def __len__(self) -> int:
+        return self.frames.shape[0]
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._data[index], self._labels[index]
-
-
-class RandomImageDataset(RandomSyntheticDataset):
-    """Synthetic image dataset — lets the smoke test run without downloading data."""
-
-    def __init__(
-        self,
-        num_samples: int = 64,
-        channels: int = 3,
-        size: int = 32,
-        num_classes: int = 10,
-    ):
-        super().__init__(
-            num_samples=num_samples,
-            channels=channels,
-            size=size,
-            num_classes=num_classes,
-            num_frames=None,
-        )
-
-
-class RandomVideoDataset(RandomSyntheticDataset):
-    """Synthetic video dataset — (B, C, T, H, W) smoke input."""
-
-    def __init__(
-        self,
-        num_samples: int = 64,
-        channels: int = 3,
-        num_frames: int = 8,
-        size: int = 32,
-        num_classes: int = 10,
-    ):
-        super().__init__(
-            num_samples=num_samples,
-            channels=channels,
-            size=size,
-            num_classes=num_classes,
-            num_frames=num_frames,
-        )
-
-
-class JEPADataset(Dataset):
-    """Synthetic JEPA dataset for smoke testing.
-
-    Yields ``(x_view, y_view, mask)`` where:
-    - ``x_view``: masked input in oklab space, shape ``(C, T, H, W)``.
-    - ``y_view``: clean target in oklab space, shape ``(C, T, H, W)``.
-    - ``mask``: boolean mask ``(T, H, W)`` — True at masked positions.
-
-    With ``num_frames=1`` (static image mode), a dummy temporal axis
-    is injected so the same pipeline handles T=1 and T>1.
-    """
-
-    def __init__(
-        self,
-        num_samples: int = 64,
-        channels: int = 3,
-        num_frames: int = 16,
-        size: int = 224,
-        mask_ratio: float = 0.25,
-        to_oklab: bool = True,
-        seed: int = 42,
-    ):
-        self.num_samples = num_samples
-        self.channels = channels
-        self.num_frames = num_frames
-        self.size = size
-        self.mask_ratio = mask_ratio
-        self.to_oklab = to_oklab
-        g = torch.Generator().manual_seed(seed)
-        shape = (num_samples, num_frames, channels, size, size)
-        self._data = torch.rand(*shape, generator=g)
-        self._masks = [self._generate_mask(g) for _ in range(num_samples)]
-
-    def _generate_mask(self, g: torch.Generator) -> torch.Tensor:
-        mask = torch.rand(self.num_frames, self.size, self.size, generator=g) < self.mask_ratio
-        return mask
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        y = self._data[index]  # (T, C, H, W)
-        mask = self._masks[index]  # (T, H, W)
-        x, y = _mask_video_clip(y, mask, self.to_oklab)
-        return x, y, mask
+        return self.frames[index], torch.tensor(index % self.num_classes, dtype=torch.long)
 
 
 class GameVideoDataset(IterableDataset):
     """IterableDataset over gaming MP4 files using decord.
 
-    Yields ``(x_masked, y_clean, mask)`` in oklab space.
+    Yields standardized-RGB ``(x_masked, y_clean, mask)``.
     Supports Tier 1 (direct mp4), Tier 2 (extracted mp4s), and
     Tier 7 (cuphead chunks).
 
     Args:
         video_paths: List of path templates; each can be a glob string.
-        num_frames: Temporal chunk size T (8-12 for T4 VRAM).
+        num_frames: Temporal chunk size T (16 for V-JEPA 2.1 App A).
         height, width: Target resize resolution.
         mask_ratio: Fraction of spatio-temporal tokens to mask.
-        to_oklab: Convert sRGB -> Oklab.
         sample_stride: Frames to skip between sampled frames.
         max_frames: Cap on frames to read per clip (prevents OOM on massive files).
     """
@@ -183,11 +180,10 @@ class GameVideoDataset(IterableDataset):
     def __init__(
         self,
         video_paths: list[str],
-        num_frames: int = 12,
-        height: int = 224,
-        width: int = 224,
+        num_frames: int = 16,
+        height: int = 144,
+        width: int = 256,
         mask_ratio: float = 0.25,
-        to_oklab: bool = True,
         sample_stride: int = 1,
         max_frames: int = 10_000,
         data_dir: str = "./data/jepa",
@@ -197,7 +193,6 @@ class GameVideoDataset(IterableDataset):
         self.height = height
         self.width = width
         self.mask_ratio = mask_ratio
-        self.to_oklab = to_oklab
         self.sample_stride = sample_stride
         self.max_frames = max_frames
         self.data_dir = data_dir
@@ -213,14 +208,11 @@ class GameVideoDataset(IterableDataset):
 
         if total < self.num_frames * self.sample_stride:
             # Pad by repeating last frame if clip too short
-            start = 0
-            stride = 1
+            start, stride = 0, 1
         else:
-            if total == self.num_frames * self.sample_stride:
-                start = 0
-            else:
-                start = torch.randint(0, total - self.num_frames * self.sample_stride, (1,)).item()
             stride = self.sample_stride
+            span = total - self.num_frames * stride
+            start = torch.randint(0, span, (1,)).item() if span > 0 else 0
 
         indices = list(
             range(int(start), min(int(start) + self.num_frames * stride, total), int(stride))
@@ -230,7 +222,8 @@ class GameVideoDataset(IterableDataset):
             indices += [indices[-1]] * (self.num_frames - len(indices))
         indices = indices[: self.num_frames]
 
-        frames = vr.get_batch(indices).as_tensor()  # (T, H, W, C) from decord
+        frames = vr.get_batch(indices).asnumpy()  # (T, H, W, C) uint8 from decord
+        frames = torch.from_numpy(frames)
         frames = einops.rearrange(frames, "t h w c -> t c h w")
 
         frames = frames.float() / 255.0
@@ -253,8 +246,8 @@ class GameVideoDataset(IterableDataset):
                 logger.warning("Skipping unreadable video %s (%s)", path, error)
                 continue
 
-            mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
-            x, y = _mask_video_clip(y, mask, self.to_oklab)
+            mask = multiblock_mask_3d(self.num_frames, self.height, self.width, self.mask_ratio)
+            x, y = _mask_video_clip(y, mask)
 
             # (C, T, H, W)
             yield x, y, mask
@@ -263,8 +256,9 @@ class GameVideoDataset(IterableDataset):
 class GameImageDataset(IterableDataset):
     """IterableDataset over static game images (T=1 spatial regularizer).
 
-    Loads JPEG/PNG via torchvision.io, injects a dummy temporal axis,
-    converts to oklab, and yields ``(x_masked, y_clean, mask)``.
+    Loads images via PIL (torchvision.io PNG decode conflicts with decord's
+    FFmpeg symbols in-process), injects a dummy temporal axis, standardizes
+    RGB, and yields ``(x_masked, y_clean, mask)``.
     """
 
     def __init__(
@@ -272,18 +266,14 @@ class GameImageDataset(IterableDataset):
         image_paths: list[str],
         size: int = 224,
         mask_ratio: float = 0.1,
-        to_oklab: bool = True,
         data_dir: str = "./data/jepa",
     ):
         self.image_paths = image_paths
         self.size = size
         self.mask_ratio = mask_ratio
-        self.to_oklab = to_oklab
         self.data_dir = data_dir
 
     def __iter__(self):
-        from torchvision.io import read_image
-
         logger = logging.getLogger(__name__)
         worker_id, num_workers = _worker_info()
         resolved = _resolve_image_paths(
@@ -295,17 +285,13 @@ class GameImageDataset(IterableDataset):
 
         for path in resolved:
             try:
-                img = read_image(path)  # (C, H, W) uint8
+                # PIL, not torchvision.io: torchvision's bundled libpng
+                # segfaults once decord's FFmpeg is loaded in-process
+                # (symbol interposition), while PIL decodes fine.
+                with Image.open(path) as im:
+                    img = torch.from_numpy(np.array(im.convert("RGB"))).permute(2, 0, 1)
             except Exception as error:
                 logger.warning("Skipping unreadable image %s (%s)", path, error)
-                continue
-
-            if img.shape[0] == 1:
-                img = img.repeat(3, 1, 1)
-            elif img.shape[0] == 4:
-                img = img[:3]
-            if img.shape[0] != 3:
-                logger.warning("Skipping non-RGB image %s (C=%d)", path, img.shape[0])
                 continue
 
             img = img.float() / 255.0
@@ -323,105 +309,13 @@ class GameImageDataset(IterableDataset):
             # Inject dummy temporal axis: (C, 1, H, W)
             y = img.unsqueeze(1)  # (C, 1, H, W)
 
-            mask = torch.rand(1, self.size, self.size) < self.mask_ratio
+            mask = multiblock_mask_3d(1, self.size, self.size, self.mask_ratio)
             x = y.clone()
             # y is (C, 1, H, W); mask is (T=1, H, W) -> align on (C, T) dims.
             x[mask.unsqueeze(0).expand_as(y)] = 0.0
 
-            if self.to_oklab:
-                # Single sample (C, T, H, W): channel lives at dim 0.
-                y = srgb_to_oklab(y, dim=0)
-                x = srgb_to_oklab(x, dim=0)
+            # Single sample (C, T, H, W): channel lives at dim 0.
+            y = _normalize_rgb(y, dim=0)
+            x = _normalize_rgb(x, dim=0)
 
-            yield x, y, mask
-
-
-class HFVideoDataset(IterableDataset):
-    """IterableDataset over Hugging Face video datasets (Kinetics, UCF101).
-
-    Streams rows from ``datasets`` (parquet/zip-backed repos) and decodes
-    the video column with ``decord`` — no snapshot download of raw MP4s.
-    Useful as a regularization source (the "ImageNet of videos") alongside
-    the gaming MP4 pipeline.
-
-    Args:
-        repo_id: HF dataset id, e.g. ``"kiyoonkim/kinetics-400-splits"``.
-        video_column: name of the column holding the video (path or bytes).
-        split: HF split to stream.
-        num_frames: temporal chunk size T.
-        height, width: target resize resolution.
-        mask_ratio: fraction of spatio-temporal tokens to mask.
-        to_oklab: convert sRGB -> Oklab.
-        max_rows: cap rows per worker (prevents unbounded iteration).
-    """
-
-    def __init__(
-        self,
-        repo_id: str,
-        video_column: str = "0",
-        split: str = "train",
-        num_frames: int = 16,
-        height: int = 224,
-        width: int = 224,
-        mask_ratio: float = 0.25,
-        to_oklab: bool = True,
-        max_rows: int | None = None,
-        data_dir: str = "./data/jepa",
-    ):
-        self.repo_id = repo_id
-        self.video_column = video_column
-        self.split = split
-        self.num_frames = num_frames
-        self.height = height
-        self.width = width
-        self.mask_ratio = mask_ratio
-        self.to_oklab = to_oklab
-        self.max_rows = max_rows
-        self.data_dir = data_dir
-
-    def _load_frames(self, source) -> torch.Tensor:
-        """Decode ``source`` (path or bytes) into a ``(T, C, H, W)`` tensor."""
-        if isinstance(source, (bytes, bytearray)):
-            import io
-
-            vr = _DecordVideoReader(io.BytesIO(bytes(source)), ctx=_decord_cpu(0))
-        else:
-            vr = _DecordVideoReader(str(source), ctx=_decord_cpu(0))
-        total = len(vr)
-        total = min(total, 10_000)
-        if total < self.num_frames:
-            indices = list(range(total)) + [total - 1] * (self.num_frames - total)
-        else:
-            start = int(torch.randint(0, total - self.num_frames, (1,)).item())
-            indices = list(range(start, start + self.num_frames))
-        frames = vr.get_batch(indices).as_tensor()
-        frames = einops.rearrange(frames, "t h w c -> t c h w")
-        frames = frames.float() / 255.0
-        frames = _resize_video_frames(frames, self.height, self.width)
-        return frames
-
-    def __iter__(self):
-        from datasets import load_dataset
-
-        logger = logging.getLogger(__name__)
-        worker_id, num_workers = _worker_info()
-        ds = load_dataset(self.repo_id, split=self.split, streaming=True)
-        if num_workers > 1:
-            ds = ds.shard(num_shards=num_workers, index=worker_id)
-        count = 0
-        for row in ds:
-            if self.max_rows is not None and count >= self.max_rows:
-                break
-            source = row.get(self.video_column, row.get("video"))
-            if source is None:
-                continue
-            try:
-                y = self._load_frames(source)
-            except Exception as error:
-                logger.warning("Skipping unreadable row %s (%s)", source, error)
-                continue
-
-            mask = torch.rand(self.num_frames, self.height, self.width) < self.mask_ratio
-            x, y = _mask_video_clip(y, mask, self.to_oklab)
-            count += 1
             yield x, y, mask

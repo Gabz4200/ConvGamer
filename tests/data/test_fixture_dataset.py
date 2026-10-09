@@ -1,10 +1,9 @@
-"""Behavior tests for JEPA datasets and oklab conversion.
+"""Behavior tests for real-data JEPA datasets and RGB normalization.
 
 Seams tested:
-- ``srgb_to_oklab``: RGB tensor (B,C,H,W) -> Oklab (B,3,H,W).
-- ``GameVideoDataset``: returns (B,C,T,H,W) video tensor from mp4 paths.
-- ``GameImageDataset``: returns (B,C,H,W) from image paths -> oklab.
-- ``JEPADataset``: yields (x_view, y_view, mask) where x is masked.
+- ``FixtureClipDataset``: yields (x_view, y_view, mask) from the checked-in
+  real clip, where x is masked.
+- ``_normalize_rgb``: ImageNet standardization of [0, 1] sRGB.
 """
 
 from __future__ import annotations
@@ -12,38 +11,37 @@ from __future__ import annotations
 import torch
 
 from convgamer.data.dataset import (
-    JEPADataset,
+    FixtureClipDataset,
+    _normalize_rgb,
     _resolve_image_paths,
     _resolve_video_paths,
 )
-from convgamer.data.oklab import srgb_to_oklab
 
 
-def test_srgb_to_oklab_matches_linear_path() -> None:
-    """srgb_to_oklab produces the same result as linear_srgb-to-oklab + transfer."""
-    rgb = torch.rand(2, 3, 8, 8)
-    converted = srgb_to_oklab(rgb, dim=1)
-    expected = srgb_to_oklab(rgb.clone(), dim=1)
-    torch.testing.assert_close(converted, expected, atol=1e-5, rtol=1e-4)
+def test_normalize_rgb_standardizes_channels() -> None:
+    """ImageNet mean/std normalization on [0, 1] sRGB."""
+    rgb = torch.ones(2, 3, 4, 4) * 0.485
+    out = _normalize_rgb(rgb, dim=1)
+    torch.testing.assert_close(out[:, 0], torch.zeros(2, 4, 4), atol=1e-6, rtol=1e-4)
+    assert torch.isfinite(out).all()
 
 
-def test_srgb_to_oklab_preserves_video_shape() -> None:
+def test_normalize_rgb_preserves_video_shape() -> None:
     """Video tensor (B,C,T,H,W) converts with shape preserved."""
     video = torch.rand(2, 3, 8, 16, 16)
-    assert srgb_to_oklab(video, dim=1).shape == video.shape
+    assert _normalize_rgb(video, dim=1).shape == video.shape
 
 
-def test_jepa_dataset_yields_masked_x_and_clean_y() -> None:
-    """JEPADataset returns x (has mask), y (clean), and mask tensor."""
-    dataset = JEPADataset(
-        num_samples=4,
-        channels=3,
+def test_fixture_dataset_yields_masked_x_and_clean_y() -> None:
+    """FixtureClipDataset returns x (has mask), y (clean), and mask tensor."""
+    dataset = FixtureClipDataset(
         num_frames=8,
-        size=32,
+        height=32,
+        width=32,
         mask_ratio=0.25,
-        to_oklab=True,
+        repeats=2,
     )
-    x, y, mask = dataset[0]
+    x, y, mask = next(iter(dataset))
     assert x.shape == (3, 8, 32, 32)
     assert y.shape == (3, 8, 32, 32)
     assert mask.shape == (8, 32, 32)
@@ -52,37 +50,39 @@ def test_jepa_dataset_yields_masked_x_and_clean_y() -> None:
     assert not torch.equal(x, y)  # masked view differs from clean target
 
 
-def test_jepa_dataset_oklab_output() -> None:
-    """When to_oklab=True, x and y are in oklab space (L channel in [0,1])."""
-    dataset = JEPADataset(
-        num_samples=2,
-        channels=3,
+def test_fixture_dataset_normalized_output() -> None:
+    """x and y are standardized (zero-center-ish, finite)."""
+    dataset = FixtureClipDataset(
         num_frames=4,
-        size=16,
+        height=16,
+        width=16,
         mask_ratio=0.3,
-        to_oklab=True,
+        repeats=1,
     )
-    x, y, mask = dataset[0]
-    # Oklab L channel should be in ~[0, 1] for sRGB inputs
-    assert x.shape[0] == 3  # still 3 channels in oklab
+    x, y, mask = next(iter(dataset))
+    assert x.shape[0] == 3
     assert torch.isfinite(x).all()
-    assert x[0].min() >= -0.05 and x[0].max() <= 1.05
+    assert abs(y.float().mean().item()) < 2.0
 
 
-def test_jepa_dataset_image_mode_temporal_axis() -> None:
-    """T=1 image path: dummy temporal axis injected."""
-    dataset = JEPADataset(
-        num_samples=4,
-        channels=3,
-        num_frames=1,
-        size=32,
-        mask_ratio=0.1,
-        to_oklab=True,
-    )
-    x, y, mask = dataset[0]
-    assert x.shape == (3, 1, 32, 32)
-    assert y.shape == (3, 1, 32, 32)
-    assert mask.shape == (1, 32, 32)
+def test_fixture_dataset_is_finite_and_real_pixels() -> None:
+    """Smoke data comes from real pixels: y has nonzero variance."""
+    dataset = FixtureClipDataset(num_frames=4, height=16, width=16, repeats=1)
+    _, y, _ = next(iter(dataset))
+    assert y.shape == (3, 4, 16, 16)
+    assert y.std() > 1e-3  # not noise-flat, not constant
+
+
+def test_fixture_video_clips_are_unit_scale() -> None:
+    """Video smoke clips live in [0, 1] with real image content."""
+    from convgamer.data.datamemodule import FixtureVideoDataset
+
+    ds = FixtureVideoDataset(num_frames=8, size=16, num_classes=4)
+    x, y = ds[0]
+    assert x.shape == (3, 8, 16, 16)
+    assert x.min() >= 0.0 and x.max() <= 1.0
+    assert x.float().mean() > 0.01  # not divided twice, not blank
+    assert y.item() == 0  # labels cycle from 0
 
 
 def _touch(tmp_path, name: str) -> str:
@@ -126,3 +126,20 @@ def test_resolve_video_paths_extracts_tier2_archives(tmp_path, monkeypatch) -> N
     assert len(resolved) == 3
     assert all(path.endswith("clip.mp4") for path in resolved)
     assert len({path.rsplit(".extracted", 1)[0] for path in resolved}) == 3
+
+
+def test_game_image_dataset_converts_any_mode_to_rgb(tmp_path) -> None:
+    """Grayscale/RGBA PNGs all yield (3, 1, H, W) triplets via convert('RGB')."""
+    from PIL import Image
+
+    from convgamer.data.dataset import GameImageDataset
+
+    Image.new("L", (16, 16), color=128).save(tmp_path / "gray.png")
+    Image.new("RGBA", (16, 16), color=(255, 0, 0, 128)).save(tmp_path / "alpha.png")
+    ds = GameImageDataset(image_paths=[str(tmp_path / "*.png")], size=16, mask_ratio=0.0)
+    batches = list(ds)
+    assert len(batches) == 2
+    for x, y, mask in batches:
+        assert x.shape == y.shape == (3, 1, 16, 16)
+        assert mask.shape == (1, 16, 16)
+        assert torch.isfinite(x).all() and torch.isfinite(y).all()
