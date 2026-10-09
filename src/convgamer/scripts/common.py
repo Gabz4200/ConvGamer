@@ -9,7 +9,7 @@ model class and picking it in a model YAML — nothing here needs to change.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -19,11 +19,7 @@ from convgamer.data.jepa_datamodule import VJEPAGamingDataModule
 from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
 from convgamer.modules.jepa_module import ConvGamerVJEPAModel
-from convgamer.modules.lightning_module import (
-    ClassificationLightningModule,
-    ConvGamerModel,
-    InceptionNeXtModule,
-)
+from convgamer.modules.lightning_module import BackboneClassifier
 
 # Absolute config path so Hydra finds configs regardless of CWD or __main__.
 CONFIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "configs"
@@ -37,9 +33,8 @@ def _backbone_kwargs_for_checkpoint(target: str, params: dict[str, Any]) -> dict
     """Metadata the system records under its ``model`` hyperparameters.
 
     Saved checkpoints carry the backbone's construction parameters (resolved,
-    config-type free) so ``export-hf`` can rebuild the HF config from any
-    checkpoint — including ones written before the shell refactor.  The config
-    value of ``num_layers`` is normalized because Hydra hands us a plain list.
+    config-type free) so ``export-hf`` can rebuild the HF config. Plain lists
+    from Hydra are normalized to tuples.
     """
     kwargs = {"target": target, **params}
     if isinstance(kwargs.get("num_layers"), list):
@@ -48,9 +43,6 @@ def _backbone_kwargs_for_checkpoint(target: str, params: dict[str, Any]) -> dict
         kwargs["temporal_dilations"] = tuple(kwargs["temporal_dilations"])
     if isinstance(kwargs.get("mlp_ratios"), list):
         kwargs["mlp_ratios"] = tuple(kwargs["mlp_ratios"])
-    if kwargs.get("target_size") is not None and not isinstance(kwargs["target_size"], tuple):
-        v = kwargs["target_size"]
-        kwargs["target_size"] = (v, v) if isinstance(v, int) else tuple(v)
     return kwargs
 
 
@@ -89,20 +81,6 @@ def backbone_kwargs(cfg: DictConfig) -> tuple[str, dict[str, Any]]:
     return target, params
 
 
-def system_for_backbone(
-    backbone: object,
-) -> type[InceptionNeXtModule] | type[ConvGamerModel]:
-    """Pick the classification system by what the backbone *is*, not by strings."""
-    if isinstance(backbone, InceptionNeXtEncoder):
-        return InceptionNeXtModule
-    if isinstance(backbone, ConvGamerEncoder):
-        return ConvGamerModel
-    raise ValueError(
-        f"No classification system for backbone type {type(backbone).__name__}; "
-        "register it in system_for_backbone."
-    )
-
-
 def build_backbone(cfg: DictConfig) -> InceptionNeXtEncoder | ConvGamerEncoder:
     """Instantiate the pure backbone from ``cfg.model`` (JEPA targets excluded)."""
     target, params = backbone_kwargs(cfg)
@@ -122,7 +100,7 @@ def build_backbone(cfg: DictConfig) -> InceptionNeXtEncoder | ConvGamerEncoder:
 
 def build_model(
     cfg: DictConfig,
-) -> ClassificationLightningModule:
+) -> BackboneClassifier | ConvGamerVJEPAModel:
     """Instantiate the training system selected by ``cfg.model.target``.
 
     Classification backbones are built with ``instantiate`` and injected into
@@ -131,11 +109,10 @@ def build_model(
     """
     target, params = backbone_kwargs(cfg)
     if target == _JEPA_TARGET:
-        return cast(ClassificationLightningModule, _build_jepa_model(cfg))
-    backbone = cast(Any, build_backbone(cfg))
-    system_cls = system_for_backbone(backbone)
+        return _build_jepa_model(cfg)
+    backbone = build_backbone(cfg)
     optimizer = cfg.get("optimizer", {})
-    system: ClassificationLightningModule = system_cls(  # type: ignore[call-overload]
+    system = BackboneClassifier(
         backbone,
         lr=float(optimizer.get("lr", 1e-3)),
         weight_decay=float(optimizer.get("weight_decay", 0.0)),
@@ -147,10 +124,35 @@ def build_model(
 def build_datamodule(
     cfg: DictConfig, *, num_workers: int | None = None
 ) -> ConvGamerDataModule | VJEPAGamingDataModule:
-    """Single JEPA-vs-classic datamodule selector shared by train and eval."""
-    if str(cfg.model.get("target", "")) != _JEPA_TARGET:
-        return ConvGamerDataModule(**cfg.data)
-    mode = cfg.data.get("mode", "synthetic")
+    """Single JEPA-vs-classic datamodule selector shared by train and eval.
+
+    The model target and the datamodule must agree: the JEPA stack consumes
+    ``(context, target, mask)`` triplets while the classification shell
+    consumes ``(x, y)`` pairs. Mismatches fail here with a clear message
+    instead of a cryptic collate crash mid-training. Trainer/optimizer
+    groups stay freely composable.
+    """
+    is_jepa = str(cfg.model.get("target", "")) == _JEPA_TARGET
+    if is_jepa:
+        if "mode" not in cfg.data:
+            raise ValueError(
+                "model target is the JEPA stack but data config has no 'mode'; "
+                "use data=jepa with model=jepa, or model=<backbone> with data=default."
+            )
+        return _build_jepa_datamodule(cfg, num_workers=num_workers)
+    if "mode" in cfg.data:
+        raise ValueError(
+            "model target is a classification backbone but data config is a JEPA "
+            "triplet config (has 'mode'); use data=default with classification "
+            "models, or model=jepa with data=jepa."
+        )
+    return ConvGamerDataModule(**cfg.data)
+
+
+def _build_jepa_datamodule(
+    cfg: DictConfig, *, num_workers: int | None = None
+) -> VJEPAGamingDataModule:
+    mode = cfg.data.get("mode", "fixture")
     workers = cfg.data.num_workers if num_workers is None else num_workers
     shared = {
         "batch_size": cfg.data.batch_size,
@@ -159,21 +161,15 @@ def build_datamodule(
         "height": cfg.data.height,
         "width": cfg.data.width,
         "mask_ratio": cfg.data.mask_ratio,
-        "to_oklab": cfg.data.to_oklab,
     }
-    if mode == "synthetic":
-        return VJEPAGamingDataModule(
-            **shared,
-            mode=mode,
-            num_synthetic_samples=cfg.data.get("num_synthetic_samples", 64),
-        )
+    if mode == "fixture":
+        return VJEPAGamingDataModule(**shared, mode=mode)
     return VJEPAGamingDataModule(
         **shared,
         mode=mode,
         image_mask_ratio=cfg.data.get("image_mask_ratio", 0.1),
         video_dataset_ids=cfg.data.get("video_dataset_ids", []),
         image_dataset_ids=cfg.data.get("image_dataset_ids", []),
-        regularization_dataset_ids=cfg.data.get("regularization_dataset_ids", []),
         data_dir=cfg.data.get("data_dir", "./data/jepa"),
         sample_stride=cfg.data.get("sample_stride", 1),
         max_frames=cfg.data.get("max_frames", 10_000),

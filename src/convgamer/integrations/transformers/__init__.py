@@ -1,4 +1,4 @@
-from .configuration_convgamer import ConvGamerConfig
-from .modeling_convgamer import ConvGamerModel
+from .configuration_convgamer import ConvGamerImageConfig
+from .modeling_convgamer import ConvGamerImageModel
 
-__all__ = ["ConvGamerConfig", "ConvGamerModel"]
+__all__ = ["ConvGamerImageConfig", "ConvGamerImageModel"]

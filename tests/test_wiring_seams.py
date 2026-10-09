@@ -12,15 +12,13 @@ from omegaconf import OmegaConf
 from convgamer.callbacks.ema_update import EMAUpdateCallback
 from convgamer.data.datamemodule import ConvGamerDataModule
 from convgamer.data.jepa_datamodule import VJEPAGamingDataModule
-from convgamer.integrations.transformers import ConvGamerConfig, ConvGamerModel
+from convgamer.integrations.transformers import ConvGamerImageConfig, ConvGamerImageModel
 from convgamer.modules.jepa_module import ConvGamerVJEPAModel
-from convgamer.modules.lightning_module import ConvGamerModel as PLVideoModel
-from convgamer.modules.lightning_module import InceptionNeXtModule
+from convgamer.modules.lightning_module import BackboneClassifier
 from convgamer.scripts.common import (
     backbone_kwargs,
     build_backbone,
     build_model,
-    system_for_backbone,
 )
 from convgamer.training.engine import create_trainer
 
@@ -57,7 +55,7 @@ def test_when_inception_module_cfg_then_image_backbone_constructs() -> None:
     target, params = backbone_kwargs(cfg)
     assert target == "convgamer.models.inception_next.encoder.InceptionNeXtEncoder"
     backbone = instantiate({"_target_": target, **params})
-    assert system_for_backbone(backbone) is InceptionNeXtModule
+    assert isinstance(BackboneClassifier(backbone).model, type(backbone))
 
 
 def test_when_video_module_cfg_then_video_backbone_constructs() -> None:
@@ -68,13 +66,7 @@ def test_when_video_module_cfg_then_video_backbone_constructs() -> None:
     target, params = backbone_kwargs(cfg)
     assert target == "convgamer.models.convgamer.encoder.ConvGamerEncoder"
     backbone = instantiate({"_target_": target, **params})
-    assert system_for_backbone(backbone) is PLVideoModel
-
-
-def test_when_unknown_backbone_then_system_selection_fails() -> None:
-    """A backbone without a registered system fails with the type named."""
-    with pytest.raises(ValueError, match="object"):
-        system_for_backbone(object())
+    assert isinstance(BackboneClassifier(backbone).model, type(backbone))
 
 
 def test_when_jepa_config_then_build_model_runs() -> None:
@@ -124,16 +116,15 @@ def test_when_default_trainer_cfg_then_trainer_builds() -> None:
     assert trainer.max_epochs == 1
 
 
-def test_when_synthetic_datamodule_then_loaders_yield_batches() -> None:
-    """Synthetic JEPA datamodule yields (x, y, mask) batches after setup."""
+def test_when_fixture_datamodule_then_loaders_yield_batches() -> None:
+    """Fixture JEPA datamodule yields (x, y, mask) batches after setup."""
     dm = VJEPAGamingDataModule(
         batch_size=2,
         num_workers=0,
         num_frames=4,
         height=16,
         width=16,
-        num_synthetic_samples=4,
-        mode="synthetic",
+        mode="fixture",
     )
     dm.setup()
     x, y, mask = next(iter(dm.train_dataloader()))
@@ -163,7 +154,7 @@ def test_when_classification_datamodule_setup_then_test_aliases_val() -> None:
 
 def test_when_jepa_datamodule_not_setup_then_train_loader_fails() -> None:
     """JEPA training loader fails loudly before dataset setup."""
-    dm = VJEPAGamingDataModule(mode="synthetic")
+    dm = VJEPAGamingDataModule(mode="fixture")
     with pytest.raises(RuntimeError, match="train_ds"):
         dm.train_dataloader()
 
@@ -211,25 +202,52 @@ def test_when_invalid_modality_then_raises() -> None:
 
 def test_when_video_modality_then_loader_shapes_match() -> None:
     """Video classification datamodule yields (B, C, T, H, W) batches."""
-    dm = ConvGamerDataModule(
-        batch_size=2, num_samples=8, modality="video", num_frames=4, image_size=16
-    )
+    dm = ConvGamerDataModule(batch_size=2, modality="video", num_frames=4, image_size=16)
     dm.setup()
     x, y = next(iter(dm.train_dataloader()))
     assert x.shape == (2, 3, 4, 16, 16)
     assert y.shape == (2,)
 
 
+def test_when_jepa_model_with_classification_data_then_fails_fast() -> None:
+    """model=jepa + data=default fails in build_datamodule, not mid-training."""
+    from omegaconf import OmegaConf
+
+    from convgamer.scripts.common import build_datamodule
+
+    cfg = OmegaConf.create(
+        {"model": {"target": "convgamer.models.jepa"}, "data": {"batch_size": 4}}
+    )
+    with pytest.raises(ValueError, match="data=jepa"):
+        build_datamodule(cfg)
+
+
+def test_when_classification_model_with_jepa_data_then_fails_fast() -> None:
+    """model=convgamer + data=jepa fails in build_datamodule, not mid-training."""
+    from omegaconf import OmegaConf
+
+    from convgamer.scripts.common import build_datamodule
+
+    cfg = OmegaConf.create(
+        {
+            "model": {"target": "convgamer.models.convgamer.encoder.ConvGamerEncoder"},
+            "data": {"mode": "fixture"},
+        }
+    )
+    with pytest.raises(ValueError, match="data=default"):
+        build_datamodule(cfg)
+
+
 def test_when_hf_wrapper_missing_inputs_then_raises() -> None:
     """HF wrapper requires one of input_ids/pixel_values/inputs_embeds."""
-    wrapper = ConvGamerModel(ConvGamerConfig(hidden_dim=16, num_layers=1, num_classes=4))
+    wrapper = ConvGamerImageModel(ConvGamerImageConfig(hidden_dim=16, num_layers=1, num_classes=4))
     with pytest.raises(ValueError, match="Specify input_ids"):
         wrapper.forward()
 
 
 def test_when_hf_wrapper_pixel_values_then_returns_dict() -> None:
     """HF wrapper maps pixel_values through the native backbone to a dict."""
-    wrapper = ConvGamerModel(ConvGamerConfig(hidden_dim=16, num_layers=1, num_classes=4))
+    wrapper = ConvGamerImageModel(ConvGamerImageConfig(hidden_dim=16, num_layers=1, num_classes=4))
     wrapper.eval()
     with torch.no_grad():
         out = wrapper(pixel_values=torch.randn(1, 3, 32, 32))

@@ -17,25 +17,24 @@ def main() -> None:
         type=str,
         choices=("video", "image"),
         default="video",
-        help="video loads ConvGamerModel.frame_encoder; image loads InceptionNeXtModule.",
+        help="video loads the video checkpoint's frame_encoder; image loads an image checkpoint.",
     )
     args = parser.parse_args()
 
     from convgamer import __version__
     from convgamer.integrations.transformers import (
-        ConvGamerConfig,
-        ConvGamerModel,
+        ConvGamerImageConfig,
+        ConvGamerImageModel,
     )
     from convgamer.models.inception_next.encoder import InceptionNeXtEncoder
-    from convgamer.modules.lightning_module import ConvGamerModel as PLModel
-    from convgamer.modules.lightning_module import InceptionNeXtModule
+    from convgamer.modules.lightning_module import BackboneClassifier
 
     if args.ckpt_kind == "image":
-        image_ckpt = InceptionNeXtModule.load_from_checkpoint(args.checkpoint, strict=False)
+        image_ckpt = BackboneClassifier.load_from_checkpoint(args.checkpoint, strict=False)
         native_state = image_ckpt.model.state_dict()  # type: ignore[attr-defined]  # nn.Module
         model_cfg = image_ckpt.hparams["model"]
     else:
-        video_ckpt: PLModel = PLModel.load_from_checkpoint(args.checkpoint, strict=False)
+        video_ckpt = BackboneClassifier.load_from_checkpoint(args.checkpoint, strict=False)
         frame_encoder: InceptionNeXtEncoder = video_ckpt.model.frame_encoder  # type: ignore[attr-defined]
         native_state = frame_encoder.state_dict()
         model_cfg = video_ckpt.hparams["model"]
@@ -43,7 +42,7 @@ def main() -> None:
         model_cfg["num_layers"] = tuple(model_cfg["num_layers"])
     if isinstance(model_cfg.get("mlp_ratios"), list):
         model_cfg["mlp_ratios"] = tuple(model_cfg.get("mlp_ratios", (4, 4, 4, 3)))
-    config = ConvGamerConfig(
+    config = ConvGamerImageConfig(
         hidden_dim=model_cfg["hidden_dim"],
         num_layers=model_cfg["num_layers"],
         num_classes=model_cfg["num_classes"],
@@ -51,7 +50,7 @@ def main() -> None:
         layer_scale_init=model_cfg["layer_scale_init"],
         mlp_ratios=tuple(model_cfg.get("mlp_ratios", (4, 4, 4, 3))),
     )
-    wrapper = ConvGamerModel(config)
+    wrapper = ConvGamerImageModel(config)
     wrapper.native.load_state_dict(native_state)
     wrapper.save_pretrained(args.output_dir)
     config.save_pretrained(args.output_dir)

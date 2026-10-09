@@ -1,20 +1,26 @@
 # V-JEPA 2.1 ConvGamer pretraining data config
-# Tier 1: Direct MP4 datasets (no extraction needed)
-# Tier 2: Extracted archives (download + extract first)
-# Tier 3: Static images (T=1 spatial regularizer)
-# Tier 4: Regularization video (Kinetics/UCF101 — the "ImageNet of videos")
+# Tier 1: Direct MP4 datasets (verified: repos below contain direct .mp4 files)
+# Tier 3: Static images (T=1 spatial regularizer — needs verified IDs)
+#
+# Verification notes (2026-10-09, see docs/ablations/data_audit.md):
+# - KEPT (direct .mp4): terraria 256x144, hollow_knight_dataset (73),
+#   hollow-knight-boss-deaths (853), gaming-500-hours (776), cuphead (71).
+# - DROPPED hollow-knight-diverse-dataset (CSV pointers only, no videos).
+# - DROPPED smb-worldmodel-data (smb_frames.zip holds frames, not mp4s).
+# - DROPPED VideoGameBunny image sets (split-zip parts, not directly loadable).
+# - DROPPED kiyoonkim/kinetics-400-splits (CSV rows point at relative mp4
+#   paths with no videos in-repo; HFVideoDataset removed with it).
+# Regularization = extra entries in video_dataset_ids (no separate plumbing).
 
-mode: synthetic          # synthetic | video | mixed
+mode: fixture            # fixture (offline smoke) | video | mixed
 batch_size: 8            # per-GPU; effective = 8 × 2 (T4) = 16
 num_workers: 4
-num_frames: 12           # T — within T4 16GB VRAM budget
-height: 224
-width: 224
-mask_ratio: 0.25         # V-JEPA 2.1 spatial mask scale [0.15, 0.7]
+num_frames: 16           # T — V-JEPA 2.1 App A clip length
+height: 144
+width: 256               # 16:9 native game aspect (terraria workhorse is 256x144)
+mask_ratio: 0.25         # multi-block coverage target
 image_mask_ratio: 0.10   # lower mask for spatial regularizer
-to_oklab: true           # RGB -> Oklab conversion in dataset loading
 data_dir: ./data/jepa
-num_synthetic_samples: 64
 sample_stride: 1         # frames to skip when slicing long MP4s
 max_frames: 10000        # cap decoded frames per clip (prevents OOM)
 
@@ -27,18 +33,8 @@ video_dataset_ids:
   - teawhite/hollow-knight-boss-deaths
   # Diversity injection — non-rigid animations
   - markov-ai/gaming-500-hours
-  # Environmental diversity — map zones
-  - datasetter458/hollow-knight-diverse-dataset
-  # Grid-based physics
-  - DylanRiden/smb-worldmodel-data
   # Hand-drawn 2D kinematics
   - ch1415926/cuphead
 
 # Tier 3: Static images (T=1 spatial regularizer)
-image_dataset_ids:
-  - asgaardlab/VideoGameBunny-Dataset
-  - VideoGameBunny/Dataset
-
-# Tier 4: Regularization video (Kinetics-400 — the "ImageNet of videos")
-regularization_dataset_ids:
-  - kiyoonkim/kinetics-400-splits
+image_dataset_ids: []

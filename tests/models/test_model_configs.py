@@ -81,7 +81,6 @@ def test_convgamer_small_config_builds() -> None:
         layer_scale_init=cfg["layer_scale_init"],
         mlp_ratios=tuple(cfg["mlp_ratios"]),
         out_factor=cfg["out_factor"],
-        use_softmax=cfg["use_softmax"],
         temporal_dilations=tuple(cfg["temporal_dilations"]),
         widths=tuple(cfg["widths"]),
     )
@@ -105,22 +104,16 @@ def test_jepa_config_composition() -> None:
     assert cfg["model"]["encoder"]["num_classes"] is None
     assert cfg["model"]["encoder"]["hidden_dim"] == 96
     assert cfg["model"]["encoder"]["num_layers"] == [3, 3, 9, 3]
-    assert cfg["model"]["encoder"]["num_heads"] == 1
-    assert cfg["model"]["predictor"]["feature_dim"] == 768
-    assert cfg["model"]["predictor"]["num_levels"] == 1
-    assert cfg["model"]["predictor"]["num_heads"] == 4
-    assert cfg["model"]["loss"]["feature_dim"] == 768
-    assert cfg["model"]["loss"]["num_levels"] == 1
+    assert cfg["model"]["predictor"]["feature_dim"] == 256
+    assert cfg["model"]["predictor"]["num_outputs"] == 4
     assert cfg["model"]["loss"]["lambda_base"] == 0.5
     assert cfg["model"]["loss"]["lambda_image"] == 0.7
     assert cfg["model"]["ema_decay"] == 0.99925
     assert cfg["model"]["lr"] == 5.25e-4
     assert cfg["optimizer"]["lr"] == 5.25e-4
     assert cfg["optimizer"]["weight_decay"] == 0.04
-    assert cfg["data"]["num_frames"] == 12
-    assert cfg["data"]["to_oklab"] is True
-    assert len(cfg["data"]["video_dataset_ids"]) == 7
-    assert len(cfg["data"]["image_dataset_ids"]) == 2
-    assert len(cfg["data"]["regularization_dataset_ids"]) == 1
+    assert cfg["data"]["num_frames"] == 16
+    assert len(cfg["data"]["video_dataset_ids"]) == 5
+    assert len(cfg["data"]["image_dataset_ids"]) == 0
     assert cfg["trainer"]["max_steps"] == 135000
     assert cfg["trainer"]["precision"] == "16-mixed"

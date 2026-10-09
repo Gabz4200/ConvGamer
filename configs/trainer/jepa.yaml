@@ -9,7 +9,9 @@ log_every_n_steps: 20
 max_steps: 135000              # Primary phase (Appendix A)
 val_check_interval: 500
 limit_val_batches: 100          # 100 val batches for fast eval
-accumulate_grad_batches: 2     # Effective batch: 8 * 2 * 2 = 32
+accumulate_grad_batches: 2     # Effective batch: 8 * 2 * 2 = 32; also aggregates
+                              # one video + one image batch per step in mixed mode
+                              # (mirrors V-JEPA 2.1 App A per-modality aggregation)
 gradient_clip_val: 1.0
 
 # Callbacks (built by convgamer.training.engine._build_callback)

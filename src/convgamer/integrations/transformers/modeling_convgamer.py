@@ -1,20 +1,26 @@
+"""HuggingFace wrapper around the ConvGamer *image* backbone.
+
+This wraps :class:`InceptionNeXtEncoder` (single images), not the video
+foundation encoder — the export scripts always transfer frame-encoder
+weights, hence the image-explicit name.
+"""
+
 from __future__ import annotations
 
 import torch
-from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.modeling_utils import PreTrainedModel
 
 from convgamer.models.registry import get_model
 
-from .configuration_convgamer import ConvGamerConfig
+from .configuration_convgamer import ConvGamerImageConfig
 
 
-class ConvGamerModel(PreTrainedModel):
-    config_class = ConvGamerConfig
+class ConvGamerImageModel(PreTrainedModel):
+    config_class = ConvGamerImageConfig
     base_model_prefix = "convgamer"
 
-    def __init__(self, config: ConvGamerConfig):
+    def __init__(self, config: ConvGamerImageConfig):
         super().__init__(config)
         self.native = get_model(
             "InceptionNeXtEncoder",
@@ -35,6 +41,7 @@ class ConvGamerModel(PreTrainedModel):
         return_dict: bool | None = None,
         **kwargs,
     ) -> BaseModelOutput | tuple:
+        """Encode images; returns logits with a head, pooled features headless."""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         hidden = (
             inputs_embeds
@@ -47,7 +54,3 @@ class ConvGamerModel(PreTrainedModel):
         if return_dict:
             return BaseModelOutput(last_hidden_state=out)
         return (out,)
-
-    def get_input_embeddings(self) -> nn.Module:  # type: ignore[override]
-        # Placeholder — ConvGamer is vision backbone with no token embeddings
-        return nn.Identity()

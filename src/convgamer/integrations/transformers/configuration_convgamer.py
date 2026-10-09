@@ -1,4 +1,4 @@
-"""HuggingFace ``PretrainedConfig`` for ConvGamer (InceptionNeXt).
+"""HuggingFace ``PretrainedConfig`` for the ConvGamer image backbone.
 
 ``model_type`` is ``convgamer`` — verified non-colliding with existing
 HF model types.
@@ -7,9 +7,9 @@ HF model types.
 from transformers import PretrainedConfig
 
 
-class ConvGamerConfig(PretrainedConfig):
+class ConvGamerImageConfig(PretrainedConfig):
     model_type = "convgamer"
-    config_class = "ConvGamerConfig"
+    config_class = "ConvGamerImageConfig"
 
     def __init__(
         self,

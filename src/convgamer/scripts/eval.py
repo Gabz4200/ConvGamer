@@ -10,6 +10,7 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig
 
+from convgamer.modules.lightning_module import BackboneClassifier
 from convgamer.training.engine import create_trainer
 
 from .common import (
@@ -18,7 +19,6 @@ from .common import (
     build_backbone,
     build_datamodule,
     build_model,
-    system_for_backbone,
 )
 
 
@@ -32,10 +32,9 @@ def main(cfg: DictConfig) -> None:
         # straight into its system wrapper or hand it to load_from_checkpoint
         # (whose stored hyper-parameters fill lr/weight_decay/model_kwargs).
         backbone = build_backbone(cfg)
-        system_cls = system_for_backbone(backbone)
         ckpt = Path(cfg.eval.checkpoint) if hasattr(cfg, "eval") else None
         model = (
-            system_cls.load_from_checkpoint(str(ckpt), model=backbone)
+            BackboneClassifier.load_from_checkpoint(str(ckpt), model=backbone)
             if ckpt is not None and ckpt.exists()
             else build_model(cfg)
         )
