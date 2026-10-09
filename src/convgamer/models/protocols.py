@@ -25,7 +25,7 @@ class DenseFeatureEncoder(Protocol):
 
     Required by ``ConvGamerVJEPAModel`` and ``EMAEncoder``:
 
-    - ``forward_feature_maps`` produces the spatial feature maps that the
+    - ``forward_feature_maps`` produces the level pyramid that the
       predictor predicts and the target encoder supplies as ground truth.
     - The ``nn.Module`` bookkeeping surface below is what EMA tracking needs
       (enumerate parameters, snapshot/restore the shadow copy, move it to the
@@ -34,7 +34,11 @@ class DenseFeatureEncoder(Protocol):
     """
 
     def forward_feature_maps(self, x: torch.Tensor) -> torch.Tensor:
-        """Map ``(B, C, T, H, W)`` video to maps ``(B, F, T', H', W')``."""
+        """Map ``(B, C, T, H, W)`` video to the level pyramid ``(B, L, F, T', H', W')``."""
+        ...
+
+    def fuse_pyramid(self, pyramid: torch.Tensor) -> torch.Tensor:
+        """Fuse stacked levels ``(B, L, F, T, H, W)`` to ``(B, F, T, H, W)``."""
         ...
 
     def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]: ...
@@ -42,8 +46,9 @@ class DenseFeatureEncoder(Protocol):
     def state_dict(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def load_state_dict(
-        self, state_dict: Mapping[str, Any], strict: bool = True, **kwargs: Any
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ) -> Any: ...
+
     def eval(self) -> Any: ...
 
     def to(self, *args: Any, **kwargs: Any) -> Any: ...

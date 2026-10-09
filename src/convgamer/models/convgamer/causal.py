@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-from typing import cast
-
 import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from convgamer.models.io import MixerState
-
-from .minconv import MinConvExpLSTM
 
 
 class CausalConv3d(nn.Module):
@@ -19,9 +13,9 @@ class CausalConv3d(nn.Module):
     Spatial dims are padded symmetrically for odd kernels. Even spatial kernels
     use one extra pixel on the right/bottom to preserve the output shape.
 
-    ``forward`` maps a whole clip ``(B, C_in, T, H, W)``.  ``step`` streams one
-    frame, taking its past-frame window as an explicit ``state`` argument and
-    returning the updated window — the module keeps no history of its own.
+    Stateless: ``forward`` maps a whole clip ``(B, C_in, T, H, W)``.
+    Frame-by-frame streaming is handled one level up by the encoder, which
+    re-runs this stateless mapping over its fixed-size frame cache.
     """
 
     def __init__(
@@ -41,9 +35,7 @@ class CausalConv3d(nn.Module):
 
         kt, kh, kw = _triple(kernel_size)
         dt, dh, dw = _triple(dilation)
-        self._kernel_t = kt
-        self._stride = _triple(stride)
-        self._dilation = (dt, dh, dw)
+        stride = _triple(stride)
 
         pt = dt * (kt - 1)
         ph = dh * (kh - 1)
@@ -57,7 +49,7 @@ class CausalConv3d(nn.Module):
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=(kt, kh, kw),
-            stride=self._stride,
+            stride=stride,
             padding=0,
             dilation=(dt, dh, dw),
             groups=groups,
@@ -72,77 +64,15 @@ class CausalConv3d(nn.Module):
     def bias(self) -> torch.Tensor | None:
         return self.conv.bias
 
-    def init_state(
-        self,
-        batch_size: int,
-        spatial_h: int,
-        spatial_w: int,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
-        """Fresh streaming state: ``pt`` zero frames ``(B, C_in, pt, H, W)``.
-
-        ``spatial_h``/``spatial_w`` are the H/W of the **input** frame (before
-        any spatial padding).  The state stores raw frames; spatial padding is
-        applied per-frame in :meth:`step` so streaming matches :meth:`forward`
-        exactly.
-        """
-        ref = self.conv.weight
-        return torch.zeros(
-            batch_size,
-            self.conv.in_channels,
-            self._pt,
-            spatial_h,
-            spatial_w,
-            device=ref.device if device is None else device,
-            dtype=ref.dtype if dtype is None else dtype,
-        )
+    @property
+    def temporal_extent(self) -> int:
+        """Past frames needed alongside the current one (left pad depth)."""
+        return self._pt
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if any(p != 0 for p in self._pad):
             x = F.pad(x, self._pad)
         return self.conv(x)
-
-    def step(self, x_t: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process one frame ``(B, C_in, 1, H, W)``; returns ``(out_t, next_state)``.
-
-        ``state`` is the sliding window of ``pt`` past **raw** frames
-        (``init_state`` output).  The current frame is spatially padded, appended
-        to the window, and the convolution runs over the whole padded window —
-        mirroring :meth:`forward` exactly.  ``next_state`` drops the oldest
-        frame and appends the current one (detached: cache history is not a
-        gradient path).
-        """
-        if self._pt == 0:
-            # Temporal extent 1: the output at t depends on frame t alone, so
-            # the window is empty and travels through untouched.
-            return self.conv(x_t), state
-
-        b, c_in, _, h, w = x_t.shape
-
-        # Apply spatial padding to current frame only (symmetric on H, W).
-        # Temporal left padding is supplied by the state window.
-        sp_pad = (self._pad[0], self._pad[1], self._pad[2], self._pad[3])
-        x_t_padded = F.pad(x_t, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else x_t
-
-        if state.shape != (b, c_in, self._pt, h, w):
-            raise RuntimeError(
-                f"Cache mismatch: expected (B, {c_in}, {self._pt}, {h}, {w}), "
-                f"got {tuple(state.shape)}"
-            )
-
-        # Pad the window spatially too (so cached frames see the same border behavior)
-        state_padded = F.pad(state, sp_pad + (0, 0)) if any(p != 0 for p in sp_pad) else state
-
-        # Full window: [pt padded past frames, 1 padded current frame]
-        window = torch.cat([state_padded, x_t_padded], dim=2)  # (B, C, pt+1, hp, wp)
-        # Conv with padding=0 (no temporal pad — the window supplies history)
-        out = self.conv(window)
-        out_t = out[:, :, -1:]  # (B, C_out, 1, H_out, W_out)
-
-        # Slide the window: drop the oldest frame, store the raw (unpadded) frame.
-        next_state = torch.cat([state[:, :, 1:], x_t], dim=2).detach()
-        return out_t, next_state
 
 
 class CausalLayerNorm(nn.LayerNorm):
@@ -199,136 +129,8 @@ class CausalTemporalMixer(nn.Module):
         )
         self.norms = nn.ModuleList([CausalLayerNorm(channels) for _ in dilations])
         self.act = nn.GELU()
-        self.aggregator = MinConvExpLSTM(channels, channels, 3, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for conv, norm in zip(self.layers, self.norms, strict=True):
             x = x + self.act(conv(norm(x)))
-        return self.aggregator(x)
-
-    def init_state(
-        self,
-        batch_size: int,
-        spatial_h: int = 1,
-        spatial_w: int = 1,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> MixerState:
-        """Fresh streaming state: one window per dilated conv plus the LSTM hidden."""
-        return MixerState(
-            conv=tuple(
-                cast(CausalConv3d, conv).init_state(
-                    batch_size, spatial_h, spatial_w, device=device, dtype=dtype
-                )
-                for conv in self.layers
-            ),
-            aggregator=self.aggregator.init_state(
-                batch_size, spatial_h, spatial_w, device=device, dtype=dtype
-            ),
-        )
-
-    def step(self, x_t: torch.Tensor, state: MixerState) -> tuple[torch.Tensor, MixerState]:
-        """Stream one frame ``(B, F, 1, H, W)``; returns ``(output_t, next_state)``.
-
-        Both the dilated-conv windows and the aggregator hidden are carried in
-        ``state``; nothing is written back onto the module.
-        """
-        windows: list[torch.Tensor] = []
-        for conv, norm in zip(self.layers, self.norms, strict=True):
-            conv_c = cast(CausalConv3d, conv)
-            out, window = conv_c.step(norm(x_t), state.conv[len(windows)])
-            x_t = x_t + self.act(out)
-            windows.append(window)
-        out_t, hidden = self.aggregator.step(x_t.squeeze(2), state.aggregator)
-        return out_t.unsqueeze(2), MixerState(conv=tuple(windows), aggregator=hidden)
-
-
-class MultiHeadCausalTemporalMixer(nn.Module):
-    """``CausalTemporalMixer`` applied independently per head.
-
-    V-JEPA 2.1 (§2.3.2) attaches one prediction head per encoder level. Each
-    level is a distinct feature modality, so the temporal mixer should be
-    allowed to model its own per-head dynamics rather than being forced to
-    share one. This wrapper instantiates ``num_heads`` independent
-    :class:`~convgamer.models.convgamer.causal.CausalTemporalMixer` instances
-    and applies each to its own ``(B, C, T, H, W)`` head slice.
-
-    Input ``x`` is ``(B, num_heads, C, T, H, W)``; output is the same shape.
-    Streaming mirrors the single-head seam: :meth:`init_state` returns a tuple
-    of :class:`~convgamer.models.io.MixerState` (one per head) and
-    :meth:`step` threads frame ``t`` through every head's pipeline
-    independently.
-    """
-
-    def __init__(
-        self,
-        channels: int,
-        num_heads: int,
-        kernel_size: int = 3,
-        dilations: tuple[int, ...] = (1, 2, 4),
-    ) -> None:
-        super().__init__()
-        if num_heads < 1:
-            raise ValueError(f"num_heads must be >= 1, got {num_heads}")
-        self.num_heads = num_heads
-        self.mixers = nn.ModuleList(
-            [
-                CausalTemporalMixer(channels, kernel_size=kernel_size, dilations=dilations)
-                for _ in range(num_heads)
-            ]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply each head's mixer independently.
-
-        Args:
-            x: ``(B, num_heads, C, T, H, W)``.
-
-        Returns:
-            ``(B, num_heads, C, T, H, W)`` — each head mixed independently.
-        """
-        if x.ndim != 6:
-            raise ValueError(f"Expected (B, num_heads, C, T, H, W) input (6D), got {x.ndim}D")
-        if x.shape[1] != self.num_heads:
-            raise ValueError(f"Head axis size {x.shape[1]} != num_heads={self.num_heads}")
-        return torch.stack([m(x[:, i]) for i, m in enumerate(self.mixers)], dim=1)
-
-    def init_state(
-        self,
-        batch_size: int,
-        spatial_h: int = 1,
-        spatial_w: int = 1,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> tuple[MixerState, ...]:
-        """One fresh :class:`MixerState` per head."""
-        return tuple(
-            cast(CausalTemporalMixer, mixer).init_state(
-                batch_size, spatial_h, spatial_w, device=device, dtype=dtype
-            )
-            for mixer in self.mixers
-        )
-
-    def step(
-        self, x_t: torch.Tensor, state: tuple[MixerState, ...]
-    ) -> tuple[torch.Tensor, tuple[MixerState, ...]]:
-        """Stream one frame through every head independently.
-
-        Args:
-            x_t: ``(B, num_heads, C, 1, H, W)``.
-            state: Tuple of per-head :class:`MixerState`, in head order.
-
-        Returns:
-            ``(output_t, next_state)`` where ``output_t`` is
-            ``(B, num_heads, C, 1, H, W)`` and ``next_state`` is a tuple of
-            updated per-head states.
-        """
-        if len(state) != self.num_heads:
-            raise ValueError(f"state must have {self.num_heads} per-head states, got {len(state)}")
-        heads: list[torch.Tensor] = []
-        next_states: list[MixerState] = []
-        for i, mixer in enumerate(self.mixers):
-            out_i, next_i = cast(CausalTemporalMixer, mixer).step(x_t[:, i], state[i])
-            heads.append(out_i)
-            next_states.append(next_i)
-        return torch.stack(heads, dim=1), tuple(next_states)
+        return x

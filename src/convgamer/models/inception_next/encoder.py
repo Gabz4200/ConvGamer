@@ -144,6 +144,20 @@ class InceptionNeXtEncoder(nn.Module):
         x = self._stem_forward(x)
         return self.stages(x)
 
+    def forward_stage_maps(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Per-stage spatial maps (one ``(B, C_i, H', W')`` per stage).
+
+        Exposes the intermediate encoder levels for deep self-supervision
+        (V-JEPA 2.1 §2.3.2): each level is a distinct feature modality, not a
+        copy of the final map.
+        """
+        x = self._stem_forward(x)
+        maps = []
+        for stage in self.stages:
+            x = stage(x)
+            maps.append(x)
+        return maps
+
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Spatially pooled frame features (B, F); resolution collapsed by mean."""
         return self.forward_feature_map(x).mean(dim=[2, 3])

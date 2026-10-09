@@ -1,22 +1,22 @@
-"""Behavior tests for ConvGamerEncoder/ConvGamerModel feature extraction.
+"""Behavior tests for ConvGamerEncoder/BackboneClassifier feature extraction.
 
 Seams:
 - ConvGamerEncoder.forward_features: returns (B, F, T) feature sequence with
   NO head, NO causal pooling. Pure backbone output.
 - ConvGamerEncoder.forward: forward_features -> causal cumulative-mean pool
   over past frames -> head -> logits/class sequence.
-- ConvGamerModel.forward_features: delegates to encoder.forward_features.
+- BackboneClassifier.forward_features: delegates to encoder.forward_features.
 """
 
-from typing import Any, cast
+import warnings
 
 import torch
 from omegaconf import DictConfig, OmegaConf
 
 from convgamer.models.convgamer.encoder import ConvGamerEncoder
-from convgamer.models.io import StepOutput, StreamingState
-from convgamer.modules.lightning_module import ConvGamerModel
-from convgamer.scripts.common import build_backbone, system_for_backbone
+from convgamer.models.io import StepOutput, StreamCache
+from convgamer.modules.lightning_module import BackboneClassifier
+from convgamer.scripts.common import build_backbone
 
 
 def _cfg(num_classes: int = 4) -> DictConfig:
@@ -31,7 +31,6 @@ def _cfg(num_classes: int = 4) -> DictConfig:
                 "layer_scale_init": 1e-6,
                 "mlp_ratios": [4, 4, 4, 3],
                 "out_factor": 2,
-                "use_softmax": False,
                 "temporal_dilations": [1, 2],
             },
             "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
@@ -41,19 +40,15 @@ def _cfg(num_classes: int = 4) -> DictConfig:
     return cfg
 
 
-def _mod(num_classes: int = 4) -> ConvGamerModel:
+def _mod(num_classes: int = 4) -> BackboneClassifier:
     """Compose the video system exactly like the train entrypoint does."""
     cfg = _cfg(num_classes)
-    backbone = cast(Any, build_backbone(cfg))
-    system_cls = system_for_backbone(backbone)
+    backbone = build_backbone(cfg)
     optimizer = cfg["optimizer"]
-    return cast(
-        ConvGamerModel,
-        system_cls(
-            backbone,
-            lr=float(optimizer["lr"]),
-            weight_decay=float(optimizer["weight_decay"]),
-        ),
+    return BackboneClassifier(
+        backbone,
+        lr=float(optimizer["lr"]),
+        weight_decay=float(optimizer["weight_decay"]),
     )
 
 
@@ -66,7 +61,6 @@ def _enc(num_classes: int | None = 4) -> ConvGamerEncoder:
         layer_scale_init=1e-6,
         mlp_ratios=(4, 4, 4, 3),
         out_factor=2,
-        use_softmax=False,
         temporal_dilations=(1, 2),
     )
 
@@ -77,7 +71,7 @@ def test_forward_features_returns_sequence_no_head() -> None:
     enc.eval()
     with torch.no_grad():
         feats = enc.forward_features(torch.randn(2, 3, 8, 32, 32))
-    assert feats.shape[:2] == (2, enc.frame_encoder.feature_dim)
+    assert feats.shape[:2] == (2, enc.level_dim)
     assert feats.shape[2] == 8  # temporal preserved, no subsampling
 
 
@@ -108,7 +102,7 @@ def test_forward_matches_head_on_pooled_features() -> None:
     pooled = torch.cumsum(feats, dim=2) / torch.arange(
         1, t + 1, device=feats.device, dtype=feats.dtype
     )
-    expected = enc.head(enc.norm(pooled[:, :, -1]))
+    expected = enc.head(pooled[:, :, -1])
     torch.testing.assert_close(logits.flatten(), expected.flatten())
 
 
@@ -139,7 +133,7 @@ def test_step_returns_features_and_logits() -> None:
         state = enc.init_state(1, 32, 32)
         out = enc.step(video[:, :, 0], state)
     assert isinstance(out, StepOutput)
-    assert out.features.shape == (1, enc.frame_encoder.feature_dim, 1)
+    assert out.features.shape == (1, enc.level_dim, 1)
     assert out.logits.shape[0] == 1
 
 
@@ -158,16 +152,12 @@ def test_step_logits_match_forward_causal_pooling() -> None:
 
 
 def test_streaming_state_continuity_across_chunks() -> None:
-    """State threaded through step() is complete: chunked streaming == one-shot.
-
-    This is the payoff of explicit state routing — the same property that
-    truncated backprop and per-stream evaluation depend on.
-    """
+    """Chunked streaming equals one-shot streaming."""
     enc: ConvGamerEncoder = _enc(num_classes=4)
     enc.eval()
     video = torch.randn(1, 3, 6, 32, 32)
 
-    def run(state: StreamingState, frames: range) -> tuple[list[torch.Tensor], StreamingState]:
+    def run(state: StreamCache, frames: range) -> tuple[list[torch.Tensor], StreamCache]:
         feats = []
         for t in frames:
             out = enc.step(video[:, :, t], state)
@@ -195,13 +185,11 @@ def test_forward_sequence_returns_per_frame_logits() -> None:
 
 def test_foundation_seam_headless_then_attachable() -> None:
     """Default encoder is headless; head attaches later for downstream tasks."""
-    import warnings
-
     enc: ConvGamerEncoder = _enc(num_classes=None)
     assert isinstance(enc.head, torch.nn.Identity)
     with torch.no_grad():
         pooled = enc(torch.randn(1, 3, 4, 32, 32))
-    assert pooled.shape[1] == enc.frame_encoder.feature_dim
+    assert pooled.shape[1] == enc.level_dim
     enc.add_classification_head(4)
     with torch.no_grad():
         logits = enc(torch.randn(1, 3, 4, 32, 32))
@@ -213,8 +201,8 @@ def test_foundation_seam_headless_then_attachable() -> None:
 
 
 def test_module_forward_features_delegates_to_encoder() -> None:
-    """ConvGamerModel.forward_features calls encoder.forward_features."""
-    mod: ConvGamerModel = _mod(num_classes=4)
+    """BackboneClassifier.forward_features calls encoder.forward_features."""
+    mod: BackboneClassifier = _mod(num_classes=4)
     mod.eval()
     with torch.no_grad():
         feats = mod.forward_features(torch.randn(1, 3, 8, 32, 32))

@@ -15,20 +15,11 @@ from convgamer.models.convgamer.stem import ConvGamerStem
 
 @pytest.mark.parametrize("in_channels", [3, 8, 16, 24, 32])
 def test_channel_expansion_is_fourfold(in_channels: int) -> None:
-    m = ConvGamerStem(in_channels=in_channels, use_softmax=False, use_norm=True)
+    m = ConvGamerStem(in_channels=in_channels, use_norm=True)
     x = torch.randn(1, in_channels, 4, 16, 16)
     y = m(x)
     assert y.shape[1] == in_channels * 4
     assert m.out_channels == in_channels * 4
-    assert m.norm.num_channels == m.out_channels
-
-
-def test_softmax_concatenation_doubles_channels() -> None:
-    m = ConvGamerStem(in_channels=8, use_softmax=True, use_norm=True)
-    x = torch.randn(1, 8, 4, 16, 16)
-    y = m(x)
-    assert y.shape[1] == 8 * 8
-    assert m.out_channels == 8 * 8
     assert m.norm.num_channels == m.out_channels
 
 
