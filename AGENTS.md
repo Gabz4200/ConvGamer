@@ -10,13 +10,13 @@ ConvGamer is a PyTorch research framework implementing **InceptionNeXt** (arXiv:
 - `src/convgamer/models/inception_next/` — InceptionNeXtEncoder (2D image backbone)
 - `src/convgamer/models/convgamer/` — ConvGamerEncoder (causal video encoder, builds on InceptionNeXt)
 - `src/convgamer/models/jepa/` — V-JEPA loss (`JEPALoss`), predictor (`VJEPAPredictor`), helpers
-- `src/convgamer/modules/` — LightningModule wrappers (`InceptionNeXtModule`, `ConvGamerModel`, `ConvGamerVJEPAModel`), EMA bookkeeping (`EMAEncoder`)
+- `src/convgamer/modules/` — `BackboneClassifier` (single supervised shell for both backbones), `ConvGamerVJEPAModel` (JEPA), EMA bookkeeping (`EMAEncoder`)
 - `src/convgamer/callbacks/` — EMA lifecycle hook (`EMAUpdateCallback`)
 - `src/convgamer/training/` — trainer factory (`create_trainer`, `_build_callback`)
-- `src/convgamer/data/` — DataModules: `ConvGamerDataModule` (smoke), `VJEPAGamingDataModule` (V-JEPA); datasets: `RandomImageDataset`, `RandomVideoDataset`, `JEPADataset`, `HFVideoDataset`, `GameVideoDataset`, `GameImageDataset`; `oklab.py` for color conversion
-- `src/convgamer/integrations/transformers/` — HF `ConvGamerConfig` / `ConvGamerModel` (`PretrainedConfig` / `PreTrainedModel`)
+- `src/convgamer/data/` — DataModules: `ConvGamerDataModule` (fixture-frame smoke), `VJEPAGamingDataModule` (V-JEPA, modes `fixture`/`video`/`mixed`); datasets: `GameVideoDataset`, `GameImageDataset`, `FixtureClipDataset`, `FixtureFrameDataset`, `FixtureVideoDataset`; `masking.py` for multi-block masking; RGB is ImageNet-standardized (no oklab — see `docs/ablations/color_space.md`)
+- `src/convgamer/integrations/transformers/` — HF `ConvGamerImageConfig` / `ConvGamerImageModel` (image backbone only, not video)
 - Model registry in `src/convgamer/models/registry.py` with `@register_model` decorator
-- Streaming I/O contracts in `src/convgamer/models/io.py` (`StreamingState`, `StepOutput`)
+- Streaming I/O contracts in `src/convgamer/models/io.py` (`StreamCache`, `StepOutput`)
 
 ## Setup Commands
 
@@ -116,7 +116,7 @@ uv build
 
 **Build system:** `uv_build` backend (pyproject.toml). Package installs as `convgamer` with entry points: `train`, `eval`, `export-hf`.
 
-**HF Transformers integration:** Import `ConvGamerConfig` and `ConvGamerModel` from `convgamer.integrations.transformers`. There is no `auto_mapping` module and no `register_auto_classes()` — do not use `AutoModel.from_pretrained` unless you register auto classes yourself. `export-hf` writes `config.json` + weights via `save_pretrained()`.
+**HF Transformers integration:** Import `ConvGamerImageConfig` and `ConvGamerImageModel` from `convgamer.integrations.transformers` (image backbone only). There is no `auto_mapping` module and no `register_auto_classes()` — do not use `AutoModel.from_pretrained` unless you register auto classes yourself. `export-hf` writes `config.json` + weights via `save_pretrained()`.
 
 ## Pull Request Guidelines
 
@@ -140,37 +140,34 @@ uv run pytest
 **Composition root:** `src/convgamer/scripts/common.py` — configs describe what to build; `build_model` / `build_datamodule` instantiate. Backbones never see config objects. JEPA is selected by the marker target `convgamer.models.jepa`, not by a backbone class.
 
 **Lightning modules:**
-- `InceptionNeXtModule` — 2D backbone on (B, C, H, W), inherits `ClassificationLightningModule`
-- `ConvGamerModel` (`modules/lightning_module.py`) — causal video encoder on (B, C, T, H, W) for classification, inherits `ClassificationLightningModule`
+- `BackboneClassifier` — single supervised shell for the 2D backbone on (B, C, H, W) and the causal video encoder on (B, C, T, H, W); inherits `ClassificationLightningModule`. Video-only delegates (`init_state`/`step`) fail loudly on image backbones.
 - `ConvGamerVJEPAModel` — V-JEPA self-supervised on `(context, target, mask)` triplets, extends `pl.LightningModule` directly
 
-Note: `convgamer.integrations.transformers.ConvGamerModel` is a different class (HF `PreTrainedModel`); alias it when importing both.
-
-**Causal video encoder:** Input (B, C, T, H, W). Fully causal — no future frame influences past output. Streaming contract:
-- `init_state(batch_size, height, width, ...)` → fresh `StreamingState` (module keeps no history)
-- `step(x_t, state)` → `StepOutput` dataclass with `.features` (B, F, 1), `.logits`, `.new_state`; reassign `state = out.new_state` (not tuple unpacking)
-- `forward(x, return_sequence=False)` — full clip; default returns latest causal cumulative-mean pooled output (foundation model: pooled feature (B, F)); `return_sequence=True` returns per-frame outputs. Streaming state is used only by `step()`.
+**Causal video encoder:** Input (B, C, T, H, W). Fully causal — no future frame influences past output. Temporal layers are stateless clip functions; streaming replays them over bounded per-stage windows. Streaming contract:
+- `init_state(batch_size, height, width, ...)` → fresh, empty `StreamCache` (module keeps no history; memory O(1) in T)
+- `step(x_t, state)` → `StepOutput` dataclass with `.features` (B, P, 1), `.logits`, `.new_state`; reassign `state = out.new_state` (not tuple unpacking). Matches `forward()` on the same prefix exactly (parity-tested).
+- `forward(x, return_sequence=False)` — full clip; default returns latest causal cumulative-mean pooled output (foundation model: pooled feature (B, P)); `return_sequence=True` returns per-frame outputs.
 
 **Foundation model contract:** `ConvGamerEncoder` has no classification head by default (`num_classes: null`). Passing `num_classes > 0` emits a deprecation warning; attach later via `add_classification_head(num_classes)`.
 
 **Feature extraction:**
 - `forward_feature_map()` — spatial feature map (B, F, H', W') for single images (InceptionNeXtEncoder)
-- `forward_feature_maps()` — spatial feature maps (B, F, T, H', W') for video (ConvGamerEncoder)
-- `forward_features()` — pooled frame features (B, F) or (B, F, T)
+- `forward_feature_maps()` — stacked level pyramid (B, 4, P, T, H', W') for video (ConvGamerEncoder); levels are tapped InceptionNeXt stages, never copies
+- `forward_features()` — fused per-frame features (B, P, T)
 - `forward()` — classification logits when a head is attached; pooled features when head is `nn.Identity`
 
-**Data pipeline:** `VJEPAGamingDataModule` yields (context, target, mask) triplets; modes `synthetic` (default, offline), `video`, `mixed`. `ConvGamerDataModule` for smoke tests. `HFVideoDataset` is an `IterableDataset` over HF video datasets. `oklab.py` provides `srgb_to_oklab()`.
+**Data pipeline:** `VJEPAGamingDataModule` yields (context, target, mask) triplets; modes `fixture` (default, offline checked-in clip), `video`, `mixed` (video+image loaders + `accumulate_grad_batches: 2`). `ConvGamerDataModule` for fixture-frame smoke tests. Default JEPA clips are 16-frame 16:9 (144×256).
 
 ## Common Gotchas
 
 - **PyTorch install:** Use `uv` extras (`cpu` or `cu124`) or `pip install -e '.[cpu]'`. Do not install torch separately when using these extras.
 - **Import errors:** Run `uv sync --extra cpu --extra dev` (or `cu124`) if pyrefly complains about missing test imports.
 - **Config overrides:** Dot notation: `model.hidden_dim=128 trainer.max_epochs=10`. Use `+eval.checkpoint=...` for eval (key not in defaults).
-- **V-JEPA training:** Select all four groups together: `model=jepa data=jepa trainer=jepa optimizer=jepa`. There is no `experiment` group. Mixing `model=convgamer` with `data=jepa` fails — classification modules expect (x, y) but `data=jepa` yields (context, target, mask) triplets. Dispatch is by marker target `convgamer.models.jepa`.
+- **V-JEPA training:** `model=jepa` needs `data=jepa` and vice versa (`build_datamodule` fails fast otherwise); trainer/optimizer groups stay freely composable. There is no `experiment` group. Dispatch is by marker target `convgamer.models.jepa`.
 - **Eval uses Hydra:** Pass checkpoint via `+eval.checkpoint=...` (not `checkpoint=...`).
 - **Export-hf uses argparse:** Pass `--checkpoint` and `--output-dir` explicitly, plus `--ckpt-kind video|image`.
 - **Model registry duplicate:** `@register_model` raises `ValueError` on duplicate name, not `KeyError`. Unknown `get_model` names raise `KeyError`.
-- **Streaming state:** `step()` requires a `StreamingState` argument and returns `StepOutput`; always take `.new_state` for the next frame.
+- **Streaming cache:** `step()` requires a `StreamCache` argument and returns `StepOutput`; always take `.new_state` for the next frame. Cache windows start empty and saturate at their bounds (bounded, O(1) in T).
 - **No notebooks extra:** `pyproject.toml` has only `cpu`, `cu124`, `dev` extras — do not document a `notebooks` extra.
-- **No auto classes:** There is no `auto_mapping` / `register_auto_classes()`; use `convgamer.integrations.transformers.ConvGamerConfig` / `ConvGamerModel` directly.
+- **No auto classes:** There is no `auto_mapping` / `register_auto_classes()`; use `convgamer.integrations.transformers.ConvGamerImageConfig` / `ConvGamerImageModel` directly.
 - **No CI workflows:** `.github/` does not exist; verification is local (ruff, pyrefly, pytest).
