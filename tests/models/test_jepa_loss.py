@@ -16,7 +16,7 @@ from convgamer.models.jepa import JEPALoss, compute_context_lambdas
 
 def test_lambda_image_is_higher_than_video() -> None:
     """Static-image (T=1) context weight must exceed video (T>1)."""
-    loss = JEPALoss(feature_dim=8, lambda_base=0.5, lambda_image=0.7)
+    loss = JEPALoss(lambda_base=0.5, lambda_image=0.7)
     video_mask = torch.zeros(1, 4, 4, 4, dtype=torch.bool)
     image_mask = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
     assert loss._effective_lambda(image_mask) == 0.7
@@ -26,7 +26,7 @@ def test_lambda_image_is_higher_than_video() -> None:
 
 def test_lambda_warmup_ramps_from_zero() -> None:
     """With warmup enabled, the context-loss component starts at 0 and ramps."""
-    loss = JEPALoss(feature_dim=8, lambda_base=0.5, lambda_image=0.7, lambda_warmup_steps=10)
+    loss = JEPALoss(lambda_base=0.5, lambda_image=0.7, lambda_warmup_steps=10)
     pred = torch.zeros(1, 8, 4, 4, 4)
     target = torch.ones(1, 8, 4, 4, 4)
     mask = torch.zeros(1, 4, 4, 4, dtype=torch.bool)

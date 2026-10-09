@@ -13,6 +13,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .masking import resize_token_mask
+
 __all__ = ["JEPALoss", "compute_context_lambdas"]
 
 
@@ -72,37 +74,25 @@ def compute_context_lambdas(
 
 
 class JEPALoss(nn.Module):
-    """Dense predictive loss for V-JEPA 2.1.
+    """Dense predictive loss for V-JEPA 2.1, averaged over encoder levels.
 
     Args:
-        feature_dim: Channel dimension of features (for any proj layers).
         lambda_base: Base context-loss weight (0.5 video, 0.7 image per Appendix A).
         lambda_image: Context weight for static-image (T=1) samples.
         lambda_warmup_steps: Linear warmup steps for ``lambda`` (epochs 50-100
             in the paper); 0 disables the schedule.
-        num_levels: Number of prediction levels (one per encoder level). When
-            ``> 1``, ``pred`` is ``(B, num_levels, F, T, H, W)`` and ``target``
-            is ``(B, F, T, H, W)``, with every level compared to the same
-            target level. ``num_levels=1`` preserves the legacy
-            ``(B, F, T, H, W)`` prediction layout.
     """
 
     def __init__(
         self,
-        feature_dim: int,
         lambda_base: float = 0.5,
         lambda_image: float = 0.7,
         lambda_warmup_steps: int = 0,
-        num_levels: int = 1,
     ):
         super().__init__()
-        if num_levels < 1:
-            raise ValueError(f"num_levels must be >= 1, got {num_levels}")
-        self.feature_dim = feature_dim
         self.lambda_base = lambda_base
         self.lambda_image = lambda_image
         self.lambda_warmup_steps = max(0, int(lambda_warmup_steps))
-        self.num_levels = num_levels
         # Warmup schedule (V-JEPA 2.1 ramps lambda epochs 50-100): the step
         # counter must survive resume, so the buffer stays persistent.
         self._step_counter: torch.Tensor
@@ -129,69 +119,52 @@ class JEPALoss(nn.Module):
         target: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute L_dense = L_predict + L_ctx.
+        """Compute L_dense = L_predict + L_ctx, averaged over levels.
 
         Args:
-            pred: Predicted features ``(B, F, T, H, W)`` (single head) or
-                ``(B, num_heads, F, T, H, W)`` (multi-head).
-            target: Target encoder features ``(B, F, T, H, W)`` (already
-                stop-grad'd). Multi-head predictions are each compared to the
-                same target level.
+            pred: Predicted features ``(B, F, T, H, W)`` or per-level
+                ``(B, L, F, T, H, W)``.
+            target: Target encoder features, same layout as ``pred`` (already
+                stop-grad'd).
             mask: Boolean mask ``(B, T, H, W)`` — True at masked positions.
 
         Returns:
-            Scalar loss (averaged across heads when ``num_heads > 1``).
+            Scalar loss (mean over levels when ``L > 1``).
         """
         # Stop-gradient on target (V-JEPA 2.1 §2.1)
         target = target.detach()
 
-        # Normalize multi-level predictions to the single-level layout
-        # (B, F, T, H, W) so the rest of the loss is shared.
-        if pred.ndim == 6:
-            if pred.shape[1] != self.num_levels:
-                raise ValueError(f"pred level axis {pred.shape[1]} != num_levels={self.num_levels}")
-            if target.ndim == 5:
-                target = target.unsqueeze(1).expand(-1, self.num_levels, -1, -1, -1, -1)
-            if target.ndim != 6:
-                raise ValueError(f"target must be 5D (B,F,T,H,W); got {target.ndim}D")
-            flat_pred = pred.reshape(-1, *pred.shape[2:])
-            flat_target = target.reshape(-1, *target.shape[2:])
-        else:
-            flat_pred, flat_target = pred, target
+        if pred.ndim == 5:
+            pred = pred.unsqueeze(1)
+            target = target.unsqueeze(1)
+        if pred.ndim != 6 or target.ndim != 6:
+            raise ValueError(f"pred/target must be 5D or 6D, got {pred.ndim}D/{target.ndim}D")
+        if pred.shape != target.shape:
+            raise ValueError(f"pred {tuple(pred.shape)} must match target {tuple(target.shape)}")
+        b, num_levels = pred.shape[0], pred.shape[1]
+        flat_pred = pred.reshape(b * num_levels, *pred.shape[2:])
+        flat_target = target.reshape(b * num_levels, *target.shape[2:])
 
-        # Resize mask to feature-map dims with nearest: mask is token-level
-        # (V-JEPA 2.1 masks patch tokens), so binary boundaries must survive.
         _, _, ft, fh, fw = flat_pred.shape
-        mask_resized = (
-            nn.functional.interpolate(
-                mask.float().unsqueeze(1),
-                size=(ft, fh, fw),
-                mode="nearest",
-            )
-            .bool()
-            .squeeze(1)
-        )
+        mask_resized = resize_token_mask(mask, (ft, fh, fw))
+        # The level fold shares one mask and one lambda map: tile across levels.
+        mask_folded = mask_resized.repeat_interleave(num_levels, dim=0)
+        lambdas = compute_context_lambdas(
+            mask_resized, lambda_base=self._effective_lambda(mask)
+        ).repeat_interleave(num_levels, dim=0)
 
         # Per-token L1 distance
-        l1 = (flat_pred - flat_target).abs()  # (N, F, T, H, W)
-        token_loss = l1.mean(dim=1)  # (N, T, H, W)
+        l1 = (flat_pred - flat_target).abs()
+        token_loss = l1.mean(dim=1)
 
         # L_predict: only on masked tokens
-        pred_loss = token_loss.masked_fill(~mask_resized, 0.0)
-        n_masked = mask_resized.sum().clamp(min=1)
+        pred_loss = token_loss.masked_fill(~mask_folded, 0.0)
+        n_masked = mask_folded.sum().clamp(min=1)
         l_predict = pred_loss.sum() / n_masked
 
         # L_ctx: distance-weighted, only on context (visible) tokens
-        lambdas = compute_context_lambdas(
-            mask_resized, lambda_base=self._effective_lambda(mask)
-        )  # (N, T, H, W)
         ctx_loss = token_loss * lambdas  # already 0 at masked
-        n_ctx = (~mask_resized).sum().clamp(min=1)
+        n_ctx = (~mask_folded).sum().clamp(min=1)
         l_ctx = ctx_loss.sum() / n_ctx
 
-        loss = l_predict + l_ctx
-        # Multi-level losses pool the level axis into the batch fold; divide by
-        # the level count so the result is the per-level average.
-        if pred.ndim == 6:
-            loss = loss / self.num_levels
-        return loss
+        return l_predict + l_ctx

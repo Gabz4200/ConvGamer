@@ -19,11 +19,8 @@ drives ``self.ema_encoder.update()`` after every optimizer step.
 
 from __future__ import annotations
 
-from typing import Any, cast
-
 import pytorch_lightning as pl
 import torch
-from torch import nn
 
 from convgamer.models.jepa import JEPALoss, VJEPAPredictor
 from convgamer.models.protocols import DenseFeatureEncoder
@@ -48,7 +45,7 @@ class ConvGamerVJEPAModel(pl.LightningModule):
 
     def __init__(
         self,
-        encoder: nn.Module,
+        encoder: DenseFeatureEncoder,
         predictor: VJEPAPredictor,
         loss: JEPALoss,
         ema_decay: float = 0.99925,
@@ -68,23 +65,21 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         self.total_steps = total_steps
 
         # EMA target encoder (shadow copy of encoder)
-        self.ema_encoder = EMAEncoder(cast(Any, encoder), decay=ema_decay)
+        self.ema_encoder = EMAEncoder(encoder, decay=ema_decay)
 
-        # Save hyperparameters (encoder is a module, not a config dict)
-        # We don't save encoder/predictor/loss as hparams since they are
-        # nn.Module instances, not config values.
+        # Modules aren't config values, so exclude them from hparams.
         self.save_hyperparameters(ignore=["encoder", "predictor", "loss", "ema_encoder"])
 
     def encode_x(self, x: torch.Tensor) -> torch.Tensor:
         """Encode the x-view (context encoder on masked input).
 
         Args:
-            x: ``(B, C, T, H, W)`` masked video in oklab space.
+            x: ``(B, C, T, H, W)`` masked standardized-RGB video.
 
         Returns:
-            Encoder features ``(B, F, T', H', W')``.
+            Encoder level pyramid ``(B, 4, P, T', H', W')``.
         """
-        return cast(DenseFeatureEncoder, self.encoder).forward_feature_maps(x)
+        return self.encoder.forward_feature_maps(x)
 
     @torch.no_grad()
     def encode_y(self, y: torch.Tensor) -> torch.Tensor:
@@ -94,41 +89,30 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         already knows it satisfies the dense-feature seam — no runtime probe.
 
         Args:
-            y: ``(B, C, T, H, W)`` clean video in oklab space.
+            y: ``(B, C, T, H, W)`` clean standardized-RGB video.
 
         Returns:
-            Target features ``(B, F, T', H', W')``.
+            Target level pyramid ``(B, 4, P, T', H', W')``.
         """
-        return cast(DenseFeatureEncoder, self.ema_encoder.shadow_module).forward_feature_maps(y)
+        return self.ema_encoder.shadow_module.forward_feature_maps(y)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Single V-JEPA 2.1 training step.
 
-        Returns scalar L_dense = L_predict + L_ctx.
+        Returns scalar L_dense = L_predict + L_ctx, averaged over levels.
         """
-        # x-encoder: context features on masked input
-        x_feat = self.encode_x(x)
+        # x-encoder: level pyramid on masked input, fused for the predictor
+        x_pyramid = self.encode_x(x)
+        x_fused = self.encoder.fuse_pyramid(x_pyramid)
 
-        # y-encoder: target features on clean input (stop-grad)
-        y_feat = self.encode_y(y)
+        # y-encoder: target level pyramid on clean input (stop-grad)
+        y_pyramid = self.encode_y(y)
 
-        # Predictor: predict target features from context + mask
-        pred = self.predictor(x_feat, mask)
+        # Predictor: per-level predictions from fused context + mask
+        pred = self.predictor(x_fused, mask)
 
-        # Align target to multi-head layout: each head is compared to the
-        # same encoder feature level, so broadcast the target across heads.
-        y_for_loss = y_feat
-        if pred.ndim == 6:
-            if y_feat.ndim == 5:
-                y_for_loss = y_feat.unsqueeze(1).expand(-1, pred.shape[1], -1, -1, -1, -1)
-            elif y_for_loss.shape[1] != pred.shape[1]:
-                raise ValueError(
-                    f"Predictor head axis {pred.shape[1]} must match target "
-                    f"head axis {y_for_loss.shape[1]}"
-                )
-
-        # Dense predictive loss (L_predict + L_ctx)
-        return self.loss_fn(pred, y_for_loss, mask)
+        # Dense predictive loss (L_predict + L_ctx), averaged over levels
+        return self.loss_fn(pred, y_pyramid, mask)
 
     def training_step(self, batch, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # noqa: ARG002
         x, y, mask = batch
@@ -184,9 +168,7 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         """Move the non-module EMA shadow onto the online encoder's device/dtype."""
         shadow = self.ema_encoder.shadow_module
         ref = next(self.encoder.parameters(), None)
-        if shadow is None or ref is None:
-            return
-        if next(shadow.parameters(), None) is None:
+        if shadow is None or ref is None or next(shadow.parameters(), None) is None:
             return
         shadow.to(device=ref.device, dtype=ref.dtype)
 

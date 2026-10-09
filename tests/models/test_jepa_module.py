@@ -29,11 +29,10 @@ def _tiny_jepa_model(
             input_dim=3,
             hidden_dim=32,
             num_layers=1,
-            target_size=(8, 8),
             temporal_dilations=(1,),
         ),
         predictor=VJEPAPredictor(feature_dim=256, predictor_dim=256, num_layers=1),
-        loss=JEPALoss(feature_dim=256, lambda_base=0.5),
+        loss=JEPALoss(lambda_base=0.5),
         ema_decay=ema_decay,
         lr=lr,
         warmup_steps=warmup_steps,
@@ -45,9 +44,9 @@ def test_jepa_model_training_step_runs() -> None:
     """One training step must return a scalar loss."""
     model = _tiny_jepa_model(ema_decay=0.99)
 
-    x = torch.randn(1, 3, 4, 16, 16)
-    y = torch.randn(1, 3, 4, 16, 16)
-    mask = torch.zeros(1, 4, 16, 16, dtype=torch.bool)
+    x = torch.randn(1, 3, 4, 32, 32)
+    y = torch.randn(1, 3, 4, 32, 32)
+    mask = torch.zeros(1, 4, 32, 32, dtype=torch.bool)
     mask[0, :, :8, :8] = True
 
     loss = model.training_step((x, y, mask), batch_idx=0)
@@ -131,9 +130,9 @@ def test_jepa_training_step_output_is_finite() -> None:
     """Full JEPA forward + backward: loss and gradients must be finite."""
     model = _tiny_jepa_model(ema_decay=0.99)
 
-    x = torch.randn(1, 3, 4, 16, 16)
-    y = torch.randn(1, 3, 4, 16, 16)
-    mask = torch.zeros(1, 4, 16, 16, dtype=torch.bool)
+    x = torch.randn(1, 3, 4, 32, 32)
+    y = torch.randn(1, 3, 4, 32, 32)
+    mask = torch.zeros(1, 4, 32, 32, dtype=torch.bool)
     mask[0, :, :8, :8] = True
 
     loss = model.training_step((x, y, mask), batch_idx=0)
@@ -153,9 +152,9 @@ def test_jepa_multi_step_training_stability() -> None:
     model = _tiny_jepa_model(ema_decay=0.99)
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
 
-    x = torch.randn(1, 3, 4, 16, 16)
-    y = torch.randn(1, 3, 4, 16, 16)
-    mask = torch.zeros(1, 4, 16, 16, dtype=torch.bool)
+    x = torch.randn(1, 3, 4, 32, 32)
+    y = torch.randn(1, 3, 4, 32, 32)
+    mask = torch.zeros(1, 4, 32, 32, dtype=torch.bool)
     mask[0, :, :8, :8] = True
 
     grad_norms: list[float] = []
@@ -183,45 +182,3 @@ def test_jepa_multi_step_training_stability() -> None:
     min_norm = min(grad_norms)
     assert min_norm > 1e-6, f"Gradient vanishing: min norm = {min_norm}"
     assert max_norm < 1e4, f"Gradient explosion: max norm = {max_norm}"
-
-
-def _tiny_multihead_jepa_model() -> ConvGamerVJEPAModel:
-    encoder = ConvGamerEncoder(
-        input_dim=3,
-        hidden_dim=32,
-        num_layers=1,
-        target_size=(8, 8),
-        temporal_dilations=(1,),
-        num_heads=2,
-    )
-    # Mirror the per-level feature dim for predictor/loss.
-    feat_dim = encoder.frame_encoder.feature_dim
-    return ConvGamerVJEPAModel(
-        encoder=encoder,
-        predictor=VJEPAPredictor(
-            feature_dim=feat_dim,
-            predictor_dim=feat_dim,
-            num_layers=1,
-            num_levels=2,
-            num_heads=4,
-        ),
-        loss=JEPALoss(feature_dim=feat_dim, num_levels=2),
-        ema_decay=0.99,
-    )
-
-
-def test_jepa_multi_head_model_training_step_runs() -> None:
-    """Multi-head JEPA step returns a scalar loss with finite gradients."""
-    model = _tiny_multihead_jepa_model()
-    x = torch.randn(1, 3, 4, 32, 32)
-    y = torch.randn(1, 3, 4, 32, 32)
-    mask = torch.zeros(1, 4, 8, 8, dtype=torch.bool)
-    mask[0, :, :4, :4] = True
-
-    loss = model.training_step((x, y, mask), batch_idx=0)
-    assert loss.dim() == 0
-    assert torch.isfinite(loss)
-    loss.backward()
-    assert any(
-        p.grad is not None and torch.isfinite(p.grad).all() for p in model.encoder.parameters()
-    )

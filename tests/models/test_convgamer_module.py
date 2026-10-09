@@ -1,11 +1,9 @@
-"""Behavior tests for ConvGamerModel video Lightning module."""
-
-from typing import Any, cast
+"""Behavior tests for the BackboneClassifier video path."""
 
 import torch
 
-from convgamer.modules.lightning_module import ConvGamerModel
-from convgamer.scripts.common import build_backbone, system_for_backbone
+from convgamer.modules.lightning_module import BackboneClassifier
+from convgamer.scripts.common import build_backbone
 
 
 def _video_cfg():
@@ -22,7 +20,6 @@ def _video_cfg():
                 "layer_scale_init": 1e-6,
                 "mlp_ratios": [4, 4, 4, 3],
                 "out_factor": 2,
-                "use_softmax": False,
                 "temporal_dilations": [1, 2],
             },
             "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
@@ -30,29 +27,29 @@ def _video_cfg():
     )
 
 
-def _module() -> ConvGamerModel:
+def _module() -> BackboneClassifier:
     cfg = _video_cfg()
-    backbone = cast(Any, build_backbone(cfg))
+    backbone = build_backbone(cfg)
     optimizer = cfg["optimizer"]
-    return cast(
-        ConvGamerModel,
-        system_for_backbone(backbone)(
-            backbone,
-            lr=float(optimizer["lr"]),
-            weight_decay=float(optimizer["weight_decay"]),
-        ),
+    return BackboneClassifier(
+        backbone,
+        lr=float(optimizer["lr"]),
+        weight_decay=float(optimizer["weight_decay"]),
     )
 
 
 def test_video_module_forward_produces_logits() -> None:
     """Feature maps keep H,W > 1 while logits collapse to a per-class vector."""
+    from convgamer.models.convgamer.encoder import ConvGamerEncoder
+
     m = _module()
+    assert isinstance(m.model, ConvGamerEncoder)
     m.eval()
     with torch.no_grad():
-        out = m(torch.randn(1, 3, 8, 32, 32))
-        maps = m.model.forward_feature_maps(torch.randn(1, 3, 8, 32, 32))
+        out = m(torch.randn(1, 3, 8, 64, 64))
+        maps = m.model.forward_feature_maps(torch.randn(1, 3, 8, 64, 64))
     assert out.shape == (1, 4)
-    assert maps.ndim == 5 and maps.shape[3] > 1 and maps.shape[4] > 1
+    assert maps.ndim == 6 and maps.shape[1] == 4 and maps.shape[4] > 1 and maps.shape[5] > 1
 
 
 def test_video_module_steps_run() -> None:

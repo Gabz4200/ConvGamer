@@ -7,10 +7,12 @@ Public seams:
 """
 
 from convgamer.models.jepa.loss import JEPALoss, compute_context_lambdas
+from convgamer.models.jepa.masking import resize_token_mask
 from convgamer.models.jepa.predictor import VJEPAPredictor
 
 __all__ = [
     "JEPALoss",
     "VJEPAPredictor",
     "compute_context_lambdas",
+    "resize_token_mask",
 ]

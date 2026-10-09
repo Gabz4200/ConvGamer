@@ -8,16 +8,14 @@ EMA *bookkeeping* (parameter state) lives in ``modules/ema.py``; the EMA
 from .ema import EMAEncoder, EncoderT
 from .jepa_module import ConvGamerVJEPAModel
 from .lightning_module import (
+    BackboneClassifier,
     ClassificationLightningModule,
-    ConvGamerModel,
-    InceptionNeXtModule,
 )
 
 __all__ = [
+    "BackboneClassifier",
     "ClassificationLightningModule",
-    "ConvGamerModel",
     "ConvGamerVJEPAModel",
     "EMAEncoder",
     "EncoderT",
-    "InceptionNeXtModule",
 ]
