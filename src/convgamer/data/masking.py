@@ -47,9 +47,12 @@ def multiblock_mask_3d(
     mask = torch.zeros(num_frames, height, width, dtype=torch.bool)
     if mask_ratio == 0.0:
         return mask
+    if mask_ratio == 1.0:
+        return torch.ones_like(mask)
     target = mask_ratio * mask.numel()
     guard = 0
-    while mask.sum().item() < target and guard < 64:
+    max_blocks = 256
+    while mask.sum().item() < target and guard < max_blocks:
         guard += 1
         bt = int(torch.randint(1, num_frames + 1, (1,), generator=g).item())
         bh = max(1, int(height * _uniform(g, min_scale, max_scale)))
@@ -59,7 +62,7 @@ def multiblock_mask_3d(
         w0 = int(torch.randint(0, width - bw + 1, (1,), generator=g).item())
         mask[t0 : t0 + bt, h0 : h0 + bh, w0 : w0 + bw] = True
     coverage = mask.sum().item() / mask.numel()
-    if guard >= 64 and coverage < mask_ratio:
+    if guard >= max_blocks and coverage < mask_ratio:
         logging.getLogger(__name__).warning(
             "multiblock_mask_3d guard exhausted at %.3f < target %.3f", coverage, mask_ratio
         )

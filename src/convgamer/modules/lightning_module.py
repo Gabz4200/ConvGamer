@@ -61,8 +61,8 @@ class ClassificationLightningModule(pl.LightningModule):
                 f"ConvGamerVJEPAModel): {e}"
             ) from e
         loss, acc = _cls_metrics(self(x), y)
-        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         return loss
 
     def training_step(self, batch, _):
@@ -134,12 +134,9 @@ def _load_model_metadata(checkpoint_path: Any) -> dict[str, Any]:
     """Return a mutable copy of the ``model`` hyper-parameter mapping.
 
     Trusted checkpoints only: Lightning stores non-tensor hparams that
-    require ``weights_only=False`` to read.
+    require ``weights_only=False`` to read, so load once that way.
     """
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    except Exception:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     hyper_parameters = checkpoint.get("hyper_parameters") or {}
     model_kwargs = hyper_parameters.get("model", {}) if isinstance(hyper_parameters, dict) else {}
     return dict(model_kwargs)
@@ -153,9 +150,15 @@ def _build_backbone(target: str, params: dict[str, Any]) -> nn.Module:
     """
     from importlib import import_module
 
-    module_name, _, cls_name = target.rpartition(".")
-    cls = getattr(import_module(module_name), cls_name)
-    return cls(**params)
+    try:
+        module_name, _, cls_name = target.rpartition(".")
+        cls = getattr(import_module(module_name), cls_name)
+    except (ImportError, AttributeError) as e:
+        raise ValueError(f"cannot resolve backbone target {target!r}: {e}") from e
+    try:
+        return cls(**params)
+    except TypeError as e:
+        raise ValueError(f"cannot build backbone {target!r} with {sorted(params)}: {e}") from e
 
 
 class BackboneClassifier(ClassificationLightningModule):

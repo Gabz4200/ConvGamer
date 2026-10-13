@@ -30,7 +30,7 @@ def _looks_like_hf_id(item: str) -> bool:
     return len(parts) == 2
 
 
-def _shard_for_distributed(paths: list[str]) -> list[str]:
+def _shard_for_distributed[T](paths: list[T]) -> list[T]:
     """Shard ``paths`` across DDP ranks (no-op outside distributed)."""
     try:
         import torch.distributed as dist
@@ -45,12 +45,63 @@ def _shard_for_distributed(paths: list[str]) -> list[str]:
 
 def disk_free_bytes(path: str = ".") -> int:
     """Free bytes on the filesystem holding ``path`` (for pre-download guards)."""
-    return shutil.disk_usage(path).free
+    anchor = path if os.path.exists(path) else os.path.abspath(os.path.join(path, os.pardir))
+    while not os.path.exists(anchor) and anchor != os.path.dirname(anchor):
+        anchor = os.path.dirname(anchor)
+    return shutil.disk_usage(anchor or ".").free
+
+
+def stride_cap(files: list[str], cap: int) -> list[str]:
+    """Strided subsample of ``files`` to at most ``cap`` entries.
+
+    Steps evenly through the sorted listing (``files[::step][:cap]``) so a
+    capped slice still covers the whole repo instead of clustering at the
+    top. ``cap >= len(files)`` returns the list unchanged.
+    """
+    if cap < 1:
+        raise ValueError(f"cap must be >= 1, got {cap}")
+    if len(files) <= cap:
+        return list(files)
+    step = max(1, len(files) // cap)
+    return list(files[::step][:cap])
+
+
+def describe_sampling(
+    video_ids: list[str],
+    caps: dict | None = None,
+    repeats: dict | None = None,
+    val_tail: int = 2,
+) -> list[tuple[str, int, int, int, int]]:
+    """Per-repo sampling table without downloading anything.
+
+    Returns ``(repo_id, total, train_pool, repeat, train_effective)`` rows:
+    ``train_pool`` excludes the ``val_tail`` held-out files and applies the
+    strided cap; ``train_effective = train_pool * repeat``. Local globs
+    report their pattern string with ``(n, n, 1, n)`` counts.
+    """
+    caps = caps or {}
+    repeats = repeats or {}
+    rows: list[tuple[str, int, int, int, int]] = []
+    for item in video_ids:
+        if _looks_like_hf_id(item) and not os.path.exists(item):
+            total = len(list_remote_video_files(item))
+            pool = total - min(val_tail, total)
+            selected = pool
+            if item in caps:
+                # stride_cap yields exactly min(pool, cap) entries.
+                selected = min(pool, int(caps[item]))
+            repeat = int(repeats.get(item, 1))
+            rows.append((item, total, selected, repeat, selected * max(1, repeat)))
+        else:
+            local = _expand_archive_globs(item, recursive=True)
+            rows.append((item, len(local), len(local), 1, len(local)))
+    return rows
 
 
 def list_remote_video_files(
     repo_id: str,
     repo_type: str = "dataset",
+    revision: str | None = None,
 ) -> list[str]:
     """List remote ``.mp4`` files in a Hub dataset without downloading anything.
 
@@ -60,7 +111,7 @@ def list_remote_video_files(
     """
     from huggingface_hub import HfApi
 
-    files = HfApi().list_repo_files(repo_id=repo_id, repo_type=repo_type)
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type=repo_type, revision=revision)
     return sorted(f for f in files if f.lower().endswith(_VIDEO_EXTS))
 
 
@@ -69,6 +120,7 @@ def download_remote_file(
     filename: str,
     data_dir: str = "./data/jepa",
     repo_type: str = "dataset",
+    revision: str | None = None,
 ) -> str:
     """Download one Hub file into an isolated per-repo dir; return its path.
 
@@ -79,12 +131,16 @@ def download_remote_file(
     """
     from huggingface_hub import hf_hub_download
 
+    if os.path.isabs(filename) or ".." in filename.split("/"):
+        raise ValueError(f"refusing unsafe Hub filename: {filename!r}")
     local_dir = os.path.join(data_dir, repo_id.replace("/", "__"))
     cache_dir = os.path.join(local_dir, ".hf_cache")
+    os.makedirs(local_dir, exist_ok=True)
     return hf_hub_download(
         repo_id=repo_id,
         filename=filename,
         repo_type=repo_type,
+        revision=revision,
         local_dir=local_dir,
         cache_dir=cache_dir,
     )
@@ -95,8 +151,9 @@ def download_video_chunk(
     filenames: list[str],
     data_dir: str = "./data/jepa",
     min_free_gb: float = 1.0,
+    revision: str | None = None,
 ) -> list[str]:
-    """Download exactly ``filenames`` from ``repo_id``; skip when disk is low.
+    """Download exactly ``filenames`` from ``repo_id``; refuse when disk is low.
 
     Files already on disk are reused. Raises ``OSError`` (errno 28) when
     free space drops below ``min_free_gb`` so the caller can train on what
@@ -115,7 +172,7 @@ def download_video_chunk(
                 f"need >={min_free_gb:.1f} GB to fetch {repo_id}/{name}; "
                 "train on the current chunk, delete it, then continue."
             )
-        paths.append(download_remote_file(repo_id, name, data_dir=data_dir))
+        paths.append(download_remote_file(repo_id, name, data_dir=data_dir, revision=revision))
     return paths
 
 
@@ -123,6 +180,7 @@ def iter_video_chunks(
     video_ids: list[str],
     data_dir: str = "./data/jepa",
     chunk_size: int = 30,
+    revision: str | None = None,
 ) -> Iterator[list[str]]:
     """Yield successive local-path chunks, downloading one chunk at a time.
 
@@ -134,9 +192,11 @@ def iter_video_chunks(
     """
     for item in video_ids:
         if _looks_like_hf_id(item) and not os.path.exists(item):
-            remote = list_remote_video_files(item)
+            remote = list_remote_video_files(item, revision=revision)
             for start in range(0, len(remote), chunk_size):
-                yield download_video_chunk(item, remote[start : start + chunk_size], data_dir)
+                yield download_video_chunk(
+                    item, remote[start : start + chunk_size], data_dir, revision=revision
+                )
         else:
             local = _expand_archive_globs(item, recursive=True)
             for start in range(0, len(local), chunk_size):
@@ -172,6 +232,7 @@ def _resolve_video_paths(
     worker_id: int = 0,
     num_workers: int = 1,
     max_files_per_repo: int | None = None,
+    revision: str | None = None,
 ) -> list[str]:
     """Expand HF dataset IDs or local globs into a flat MP4 list.
 
@@ -187,8 +248,8 @@ def _resolve_video_paths(
     for item in video_ids:
         if _looks_like_hf_id(item) and not os.path.exists(item):
             if max_files_per_repo is not None:
-                remote = list_remote_video_files(item)[:max_files_per_repo]
-                paths.extend(download_video_chunk(item, remote, data_dir))
+                remote = list_remote_video_files(item, revision=revision)[:max_files_per_repo]
+                paths.extend(download_video_chunk(item, remote, data_dir, revision=revision))
                 continue
             free_gb = disk_free_bytes(data_dir) / 1e9
             if free_gb < 1.0:
@@ -201,6 +262,7 @@ def _resolve_video_paths(
             local_dir = snapshot_download(
                 repo_id=item,
                 repo_type="dataset",
+                revision=revision,
                 local_dir=os.path.join(data_dir, item.replace("/", "__")),
                 allow_patterns=_ARCHIVE_PATTERNS,
             )
@@ -258,11 +320,9 @@ def _extract_archive(archive_path: str) -> list[str]:
                 dest = (root / member.name).resolve()
                 if not dest.is_relative_to(root):
                     raise ValueError(f"unsafe tar member: {member.name!r}")
-            try:
-                tf.extractall(extract_dir, filter="data")
-            except TypeError:
-                # Older Python without filter=: members already validated above.
-                tf.extractall(extract_dir)
+                if member.issym() or member.islnk():
+                    raise ValueError(f"refusing link member in archive: {member.name!r}")
+            tf.extractall(extract_dir, filter="data")
     return sorted(glob.glob(os.path.join(extract_dir, "**", "*.mp4"), recursive=True))
 
 
@@ -271,6 +331,7 @@ def _resolve_image_paths(
     data_dir: str = "./data/jepa",
     worker_id: int = 0,
     num_workers: int = 1,
+    revision: str | None = None,
 ) -> list[str]:
     """Expand HF image dataset IDs or local globs into a flat image list."""
     from huggingface_hub import snapshot_download
@@ -281,6 +342,7 @@ def _resolve_image_paths(
             local_dir = snapshot_download(
                 repo_id=item,
                 repo_type="dataset",
+                revision=revision,
                 local_dir=os.path.join(data_dir, item.replace("/", "__")),
                 allow_patterns=["**/*.jpg", "**/*.jpeg", "**/*.png", "*.jpg", "*.png"],
             )

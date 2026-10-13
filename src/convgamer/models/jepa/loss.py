@@ -1,11 +1,19 @@
-"""V-JEPA 2.1 dense predictive loss (§2.3.1).
+"""V-JEPA 2.1 dense predictive loss (§2.3.1), with LeJEPA isotropy pressure.
 
-L_dense = L_predict + L_ctx
+L_dense = L_predict + L_ctx [+ sigreg_lambda * SIGReg(pred)]
 
   L_predict = (1/|M|) * sum_{i in M} || P(E_theta(x), Delta_y)_i - sg(E_theta_bar(y)_i) ||_1
   L_ctx     = (1/|C|) * sum_{i in C} lambda_i * || P(...) - sg(E_theta_bar(y)_i) ||_1
 
   lambda_i = lambda / sqrt(d_min(i, M))     (Eq. 3, Appendix A: lambda=0.5 video, 0.7 image)
+
+  ``d_min`` is the Manhattan (L1) distance in token coordinates to the nearest
+  masked token — cheap on the (T, H, W) grid and monotone in true proximity.
+
+The optional SIGReg term (LeJEPA, arXiv:2511.08544, goto λ=0.02) pressures
+the predicted latents toward an isotropic Gaussian, which provably minimizes
+downstream prediction risk and resists representation collapse — complementing
+the EMA teacher rather than replacing it.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ import torch
 from torch import nn
 
 from .masking import resize_token_mask
+from .sigreg import SIGReg
 
 __all__ = ["JEPALoss", "compute_context_lambdas"]
 
@@ -24,11 +33,11 @@ def compute_context_lambdas(
     mask: torch.Tensor,
     lambda_base: float = 0.5,
 ) -> torch.Tensor:
-    """Distance-weighted context lambda (Eq. 3).
+    """Manhattan-distance-weighted context lambda (Eq. 3).
 
     ``mask`` is ``(B, T, H, W)`` boolean — True at masked positions.
     Returns ``(B, T, H, W)`` floats; 0 at masked positions, decreasing
-    with spatio-temporal distance to nearest mask token.
+    with spatio-temporal Manhattan distance to nearest mask token.
     """
     B, T, H, W = mask.shape
     device = mask.device
@@ -48,7 +57,7 @@ def compute_context_lambdas(
     h_flat = h_grid.reshape(B, -1)
     w_flat = w_grid.reshape(B, -1)
 
-    lambdas = torch.zeros_like(mask_flat, dtype=torch.float)
+    lambdas = torch.zeros_like(mask_flat, dtype=torch.float32)
     has_mask = mask_flat.any(dim=1)
 
     if not has_mask.any():
@@ -61,6 +70,7 @@ def compute_context_lambdas(
 
     # Chunked: for every token, distance to its nearest masked token.
     # Chunk the query dim so peak memory is O(chunk * M), not O(N * M).
+    all_idx = torch.arange(mask_flat.shape[1], device=device)
     for b in range(B):
         if not mask_flat[b].any():
             continue
@@ -68,8 +78,8 @@ def compute_context_lambdas(
         mt = t_flat[b][masked_idx]
         mh = h_flat[b][masked_idx]
         mw = w_flat[b][masked_idx]
-        d_min = torch.empty(mask_flat.shape[1], device=device, dtype=torch.float)
-        for chunk in torch.split(torch.arange(mask_flat.shape[1], device=device), 1024):
+        d_min = torch.empty(mask_flat.shape[1], device=device, dtype=torch.float32)
+        for chunk in torch.split(all_idx, 1024):
             dist = (
                 (t_flat[b][chunk].unsqueeze(1) - mt.unsqueeze(0)).abs()
                 + (h_flat[b][chunk].unsqueeze(1) - mh.unsqueeze(0)).abs()
@@ -94,6 +104,10 @@ class JEPALoss(nn.Module):
         lambda_image: Context weight for static-image (T=1) samples.
         lambda_warmup_steps: Linear warmup steps for ``lambda`` (epochs 50-100
             in the paper); 0 disables the schedule.
+        sigreg_lambda: LeJEPA isotropy weight on predicted latents (paper
+            goto 0.02); 0 disables the term (pure JEPA loss).
+        sigreg_slices: Random 1D slices per SIGReg call (256 in the paper).
+        sigreg_tokens: Token subsample cap per call (T4 cost control).
     """
 
     def __init__(
@@ -101,21 +115,31 @@ class JEPALoss(nn.Module):
         lambda_base: float = 0.5,
         lambda_image: float = 0.7,
         lambda_warmup_steps: int = 0,
+        sigreg_lambda: float = 0.0,
+        sigreg_slices: int = 256,
+        sigreg_tokens: int = 2048,
     ):
         super().__init__()
         self.lambda_base = lambda_base
         self.lambda_image = lambda_image
         self.lambda_warmup_steps = max(0, int(lambda_warmup_steps))
+        self.sigreg_lambda = float(sigreg_lambda)
+        self.sigreg_tokens = max(1, int(sigreg_tokens))
+        self._sigreg = SIGReg(num_slices=sigreg_slices)
+        # Last computed SIGReg component (detached float) for logging; None
+        # when the term is disabled. Read by the module after forward().
+        self.last_sigreg: float | None = None
         # Warmup schedule (V-JEPA 2.1 ramps lambda epochs 50-100): the step
-        # counter must survive resume, so the buffer stays persistent.
+        # counter is a persistent buffer so it survives checkpoint resume.
         self._step_counter: torch.Tensor
         self.register_buffer("_step_counter", torch.zeros((), dtype=torch.long))
-        self._step_int: int = 0
 
     def set_step(self, step: int) -> None:
         """Update the running step counter used by the lambda warmup."""
-        self._step_int = int(step)
         self._step_counter.fill_(int(step))
+
+    def _current_step(self) -> int:
+        return int(self._step_counter)
 
     def _effective_lambda(self, mask: torch.Tensor) -> float:
         """Pick per-modality lambda (video vs image) and apply warmup."""
@@ -125,7 +149,7 @@ class JEPALoss(nn.Module):
         if self.lambda_warmup_steps <= 0:
             return base
         # Linear ramp from 0 to base over the warmup window (paper: epochs 50-100).
-        ramp = min(1.0, float(self._step_int) / float(self.lambda_warmup_steps))
+        ramp = min(1.0, float(self._current_step()) / float(self.lambda_warmup_steps))
         return base * ramp
 
     def forward(
@@ -149,6 +173,10 @@ class JEPALoss(nn.Module):
         # Stop-gradient on target (V-JEPA 2.1 §2.1)
         target = target.detach()
 
+        if mask.ndim != 4 or mask.dtype is not torch.bool:
+            raise ValueError(
+                f"mask must be boolean (B, T, H, W), got {mask.dtype} {tuple(mask.shape)}"
+            )
         if pred.ndim == 5:
             pred = pred.unsqueeze(1)
             target = target.unsqueeze(1)
@@ -157,10 +185,25 @@ class JEPALoss(nn.Module):
         if pred.shape != target.shape:
             raise ValueError(f"pred {tuple(pred.shape)} must match target {tuple(target.shape)}")
         b, num_levels = pred.shape[0], pred.shape[1]
+        if mask.shape[0] != b:
+            raise ValueError(f"mask batch {mask.shape[0]} must match pred batch {b}")
+        if mask.device != pred.device or target.device != pred.device:
+            raise ValueError(
+                f"pred/target/mask must share a device, got "
+                f"{pred.device}/{target.device}/{mask.device}"
+            )
         flat_pred = pred.reshape(b * num_levels, *pred.shape[2:])
         flat_target = target.reshape(b * num_levels, *target.shape[2:])
 
         _, _, ft, fh, fw = flat_pred.shape
+        _, mt, mh, mw = mask.shape
+        if (ft, fh, fw) != (mt, mh, mw) and (mt % ft, mh % fh, mw % fw) != (0, 0, 0):
+            warnings.warn(
+                f"mask {tuple(mask.shape)} resized to {(ft, fh, fw)} at a non-integer ratio; "
+                "check the data pipeline.",
+                UserWarning,
+                stacklevel=2,
+            )
         mask_resized = resize_token_mask(mask, (ft, fh, fw))
         eff_lambda = self._effective_lambda(mask)
         if not mask_resized.any():
@@ -185,8 +228,20 @@ class JEPALoss(nn.Module):
         l_predict = pred_loss.sum() / n_masked
 
         # L_ctx: distance-weighted, only on context (visible) tokens
-        ctx_loss = token_loss * lambdas  # already 0 at masked
+        ctx_loss = token_loss * lambdas.to(token_loss.dtype)  # already 0 at masked
         n_ctx = (~mask_folded).sum().clamp(min=1)
         l_ctx = ctx_loss.sum() / n_ctx
 
-        return l_predict + l_ctx
+        base = l_predict + l_ctx
+        if self.sigreg_lambda <= 0 or not self.training:
+            self.last_sigreg = None
+            return base
+        # Isotropy pressure on the online path's predicted latents: fold
+        # levels/space-time into tokens, subsample for cost, keep grads.
+        tokens = flat_pred.permute(0, 2, 3, 4, 1).reshape(-1, flat_pred.shape[1])
+        if tokens.shape[0] > self.sigreg_tokens:
+            keep = torch.randperm(tokens.shape[0], device=tokens.device)[: self.sigreg_tokens]
+            tokens = tokens[keep]
+        sig = self._sigreg(tokens)
+        self.last_sigreg = sig.detach().item()
+        return base + self.sigreg_lambda * sig

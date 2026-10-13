@@ -8,7 +8,10 @@ import pytest
 import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
+from pytorch_lightning.callbacks import EarlyStopping
+from torch.utils.data import DataLoader
 
+from convgamer.callbacks.collapse_guard import CollapseGuardCallback
 from convgamer.callbacks.ema_update import EMAUpdateCallback
 from convgamer.data.datamemodule import ConvGamerDataModule
 from convgamer.data.jepa_datamodule import VJEPAGamingDataModule
@@ -114,6 +117,139 @@ def test_when_default_trainer_cfg_then_trainer_builds() -> None:
     )
     trainer = create_trainer(cfg)
     assert trainer.max_epochs == 1
+
+
+def test_when_early_stopping_enabled_then_callback_attaches() -> None:
+    """Early stopping builds from the trainer section and honors max_time."""
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "accelerator": "cpu",
+                "devices": 1,
+                "precision": "32-true",
+                "log_every_n_steps": 10,
+                "max_steps": 50,
+                "min_steps": 10,
+                "max_time": "00:00:30:00",
+                "callbacks": [],
+                "early_stopping": {
+                    "enabled": True,
+                    "monitor": "val/loss",
+                    "patience": 3,
+                    "min_delta": 1.0e-4,
+                    "mode": "min",
+                },
+            }
+        }
+    )
+    trainer = create_trainer(cfg)
+    stops = [c for c in trainer.callbacks if isinstance(c, EarlyStopping)]  # type: ignore[attr-defined]
+    assert len(stops) == 1
+    assert stops[0].monitor == "val/loss"
+    assert stops[0].patience == 3
+    assert trainer.min_steps == 10
+
+
+def test_when_early_stopping_absent_then_trainer_builds_without_it() -> None:
+    """Configs without the section (smoke, classification) get no callback."""
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "accelerator": "cpu",
+                "devices": 1,
+                "precision": "32-true",
+                "log_every_n_steps": 10,
+                "max_epochs": 1,
+                "callbacks": [],
+            }
+        }
+    )
+    trainer = create_trainer(cfg)
+    assert not any(isinstance(c, EarlyStopping) for c in trainer.callbacks)  # type: ignore[attr-defined]
+
+
+def test_when_collapse_guard_enabled_then_callback_attaches() -> None:
+    """Collapse guard builds from its section with the configured threshold."""
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "accelerator": "cpu",
+                "devices": 1,
+                "precision": "32-true",
+                "log_every_n_steps": 10,
+                "max_epochs": 1,
+                "callbacks": [],
+                "collapse_guard": {
+                    "enabled": True,
+                    "monitor": "val/pred_std",
+                    "min_std": 1.0e-4,
+                    "patience": 3,
+                },
+            }
+        }
+    )
+    trainer = create_trainer(cfg)
+    guards = [c for c in trainer.callbacks if isinstance(c, CollapseGuardCallback)]  # type: ignore[attr-defined]
+    assert len(guards) == 1
+    assert guards[0].monitor == "val/pred_std"
+    assert guards[0].min_std == 1.0e-4
+
+
+def test_when_val_free_then_no_val_monitored_callbacks() -> None:
+    """limit_val_batches=0 strips val/loss monitors (no MissingMetric crash)."""
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "accelerator": "cpu",
+                "devices": 1,
+                "precision": "32-true",
+                "log_every_n_steps": 10,
+                "max_steps": 10,
+                "limit_val_batches": 0,
+                "callbacks": [],
+                "early_stopping": {
+                    "enabled": True,
+                    "monitor": "val/loss",
+                    "patience": 3,
+                    "min_delta": 1.0e-4,
+                    "mode": "min",
+                },
+                "checkpoint_callback": {
+                    "dirpath": "checkpoints/test",
+                    "monitor": "val/loss",
+                    "mode": "min",
+                },
+            }
+        }
+    )
+    trainer = create_trainer(cfg)
+    assert not any(isinstance(c, EarlyStopping) for c in trainer.callbacks)  # type: ignore[attr-defined]
+    for c in trainer.callbacks:  # type: ignore[attr-defined]
+        if isinstance(c, ModelCheckpoint):
+            assert c.monitor is None
+
+
+def test_when_train_loader_then_pinned_and_persistent() -> None:
+    """Train loader pins memory and persists workers; val loader stays light."""
+    dm = VJEPAGamingDataModule(
+        batch_size=2,
+        num_workers=2,
+        num_frames=4,
+        height=16,
+        width=16,
+        mode="fixture",
+    )
+    dm.setup()
+    train_dl = dm.train_dataloader()
+    assert isinstance(train_dl, DataLoader)
+    assert train_dl.pin_memory is True
+    assert train_dl.persistent_workers is True
+    assert train_dl.prefetch_factor == 4
+    val_dl = dm.val_dataloader()
+    assert val_dl is not None
+    assert val_dl.persistent_workers is False
 
 
 def test_when_fixture_datamodule_then_loaders_yield_batches() -> None:

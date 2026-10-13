@@ -104,7 +104,15 @@ class VJEPAPredictor(nn.Module):
         """
         if x.ndim != 5:
             raise ValueError(f"Expected 5D input (B, F, T, H, W), got {x.ndim}D")
+        if mask.ndim != 4 or mask.dtype is not torch.bool:
+            raise ValueError(
+                f"mask must be boolean (B, T, H, W), got {mask.dtype} {tuple(mask.shape)}"
+            )
         b = x.shape[0]
+        if mask.shape[0] != b:
+            raise ValueError(f"mask batch {mask.shape[0]} must match input batch {b}")
+        if mask.device != x.device:
+            raise ValueError(f"mask device {mask.device} must match input device {x.device}")
 
         h = self.input_proj(x)  # (B, predictor_dim, T, H, W)
         _, _, ft, fh, fw = h.shape
@@ -114,7 +122,7 @@ class VJEPAPredictor(nn.Module):
         # Inject the (shared) mask token at masked positions. The singleton
         # dim broadcasts — never materialize a full B×D×T×H×W mask.
         mask_key = mask_resized.unsqueeze(1)  # (B, 1, T, H, W)
-        h = torch.where(mask_key, self.mask_token.view(1, -1, 1, 1, 1), h)
+        h = torch.where(mask_key, self.mask_token.view(1, -1, 1, 1, 1).to(h.dtype), h)
 
         for blk in self.blocks:
             h = blk(h)

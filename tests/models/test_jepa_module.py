@@ -59,6 +59,30 @@ def test_jepa_model_training_step_runs() -> None:
     )
 
 
+def test_jepa_forward_return_pred_matches_plain_loss() -> None:
+    """return_pred=True returns (same loss, finite predictor output) for val stats."""
+    model = _tiny_jepa_model(ema_decay=0.99)
+    model.eval()
+
+    x = torch.randn(1, 3, 4, 32, 32)
+    y = torch.randn(1, 3, 4, 32, 32)
+    mask = torch.zeros(1, 4, 32, 32, dtype=torch.bool)
+    mask[0, :, :8, :8] = True
+
+    with torch.no_grad():
+        plain = model(x, y, mask)
+        loss, pred = model(x, y, mask, return_pred=True)
+    assert plain.dim() == 0
+    torch.testing.assert_close(loss, plain)
+    assert torch.isfinite(pred).all()
+    # Sentinel is logged and finite (random-noise input may read ~zero;
+    # real-data scale is asserted by the guard's healthy-run test).
+    assert torch.isfinite(pred.detach().float().std())
+
+    val_loss, _ = model._val_test_forward((x, y, mask))
+    assert torch.isfinite(val_loss)
+
+
 def test_jepa_model_ema_encoder_exists() -> None:
     """Model must have an EMA target encoder."""
     model = _tiny_jepa_model(ema_decay=0.999)

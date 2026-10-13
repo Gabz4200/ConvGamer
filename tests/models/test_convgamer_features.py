@@ -10,6 +10,7 @@ Seams:
 
 import warnings
 
+import pytest
 import torch
 from omegaconf import DictConfig, OmegaConf
 
@@ -208,3 +209,25 @@ def test_module_forward_features_delegates_to_encoder() -> None:
         feats = mod.forward_features(torch.randn(1, 3, 8, 32, 32))
     assert feats.shape[0] == 1
     assert feats.shape[2] == 8  # temporal preserved
+
+
+def test_init_state_rejects_non_divisible_spatial() -> None:
+    """Non-divisible H/W fails loudly instead of silently mis-shaping caches."""
+    enc = _enc()
+    with pytest.raises(ValueError, match="divisible"):
+        enc.init_state(1, 30, 30)
+    with pytest.raises(ValueError, match="positive"):
+        enc.init_state(1, -8, 32)
+
+
+def test_step_warns_when_grad_enabled() -> None:
+    """step() is inference-only; grad mode warns instead of silently detaching."""
+    enc = _enc()
+    enc.eval()
+    state = enc.init_state(1, 32, 32)
+    frame = torch.randn(1, 3, 32, 32)
+    with torch.no_grad():
+        out = enc.step(frame, state)
+    assert out.features.shape == (1, enc.level_dim, 1)
+    with pytest.warns(UserWarning, match="detached"):
+        enc.step(frame, state)

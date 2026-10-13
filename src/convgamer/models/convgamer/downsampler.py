@@ -80,9 +80,18 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
         self.norm = CausalLayerNorm(self.out_channels)
 
     def resolve_spatial_size(self, h: int, w: int) -> tuple[int, int]:
-        """Output spatial dims of the strided patch embed for an ``h, w`` input."""
+        """Output spatial dims of the strided patch embed for an ``h, w`` input.
+
+        The patch embed is an unpadded strided conv, so ``h``/``w`` must be
+        divisible by ``patch_size`` — anything else fails loudly instead of
+        silently rounding.
+        """
         p = self.patch_size
-        return (max(1, (h + p - 1) // p), max(1, (w + p - 1) // p))
+        if h <= 0 or w <= 0:
+            raise ValueError(f"h, w must be positive, got {(h, w)}")
+        if h % p or w % p:
+            raise ValueError(f"h, w must be divisible by patch_size={p}, got {(h, w)}")
+        return (h // p, w // p)
 
     @property
     def history_frames(self) -> int:

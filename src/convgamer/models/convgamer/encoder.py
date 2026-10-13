@@ -199,11 +199,8 @@ class ConvGamerEncoder(nn.Module):
         return torch.stack(mixed, dim=1)
 
     def forward_pyramid(self, x: torch.Tensor) -> torch.Tensor:
-        """Four temporally-mixed encoder levels, stacked.
-
-        Returns ``(B, 4, P, T, H', W')``.
-        """
-        return self._mix_levels(self._encode_projected(x))
+        """Alias of :meth:`forward_feature_maps` (kept for backward compat)."""
+        return self.forward_feature_maps(x)
 
     def fuse_pyramid(self, pyramid: torch.Tensor) -> torch.Tensor:
         """Fuse stacked levels ``(B, 4, P, T, H, W)`` to ``(B, P, T, H, W)``."""
@@ -227,7 +224,7 @@ class ConvGamerEncoder(nn.Module):
 
     def forward_feature_maps(self, x: torch.Tensor) -> torch.Tensor:
         """Level pyramid for dense JEPA prediction: ``(B, 4, P, T, H', W')``."""
-        return self.forward_pyramid(x)
+        return self._mix_levels(self._encode_projected(x))
 
     def init_state(
         self,
@@ -239,19 +236,31 @@ class ConvGamerEncoder(nn.Module):
     ) -> StreamCache:
         """Fresh empty streaming cache (one window per temporal stage).
 
-        ``height``/``width`` are the **input** spatial dims. Windows start
-        empty and grow to their bound, holding real frames only — each stage
-        then supplies missing history through its own left padding, exactly
-        like ``forward()`` on the same prefix.
+        ``height``/``width`` are the **input** spatial dims and must be
+        divisible by the total stride (``patch_size * 4``): the patch embed
+        and the frame-encoder stem are unpadded strided convs, so anything
+        else cannot round-trip through ``step()``/``forward()`` parity.
+        Windows start empty and grow to their bound, holding real frames
+        only — each stage then supplies missing history through its own
+        left padding, exactly like ``forward()`` on the same prefix.
         """
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if height <= 0 or width <= 0:
+            raise ValueError(f"height/width must be positive, got {(height, width)}")
+        total_stride = self.downsampler.patch_size * 4
+        if height % total_stride or width % total_stride:
+            raise ValueError(
+                f"height/width must be divisible by {total_stride} "
+                f"(patch_size * stem stride), got {(height, width)}"
+            )
         ref = self.frame_encoder.stem.weight
         dev = ref.device if device is None else device
         dt = ref.dtype if dtype is None else dtype
         h_out, w_out = self.downsampler.resolve_spatial_size(height, width)
         stride = self.frame_encoder.stem.stride
         s_h, s_w = (stride[0], stride[1]) if isinstance(stride, tuple) else (stride, stride)
-        fe_h = max(1, (h_out + s_h - 1) // s_h)
-        fe_w = max(1, (w_out + s_w - 1) // s_w)
+        fe_h, fe_w = h_out // s_h, w_out // s_w
         base_ch = self.downsampler.out_channels
         return StreamCache(
             base=torch.zeros(batch_size, base_ch, 0, h_out, w_out, device=dev, dtype=dt),
@@ -284,6 +293,16 @@ class ConvGamerEncoder(nn.Module):
         """
         if x_t.ndim != 4:
             raise ValueError(f"Expected 4D frame (B, C, H, W), got shape {x_t.shape}")
+        if x_t.shape[1] != self.downsampler.in_channels:
+            raise ValueError(
+                f"Expected {self.downsampler.in_channels} channels, got {x_t.shape[1]}"
+            )
+        if torch.is_grad_enabled():
+            warnings.warn(
+                "step() cache is detached; use forward() for training.",
+                UserWarning,
+                stacklevel=2,
+            )
         ds = self.downsampler
         kb, ks, km = self._correction_history, self._stem_history, self.history_frames
 

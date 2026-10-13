@@ -9,9 +9,9 @@ ConvGamer is a PyTorch research framework implementing **InceptionNeXt** (arXiv:
 **Key components:**
 - `src/convgamer/models/inception_next/` — InceptionNeXtEncoder (2D image backbone)
 - `src/convgamer/models/convgamer/` — ConvGamerEncoder (causal video encoder, builds on InceptionNeXt)
-- `src/convgamer/models/jepa/` — V-JEPA loss (`JEPALoss`), predictor (`VJEPAPredictor`), helpers
+- `src/convgamer/models/jepa/` — V-JEPA loss (`JEPALoss` + LeJEPA `SIGReg` isotropy pressure), predictor (`VJEPAPredictor`), helpers
 - `src/convgamer/modules/` — `BackboneClassifier` (single supervised shell for both backbones), `ConvGamerVJEPAModel` (JEPA), EMA bookkeeping (`EMAEncoder`)
-- `src/convgamer/callbacks/` — EMA lifecycle hook (`EMAUpdateCallback`)
+- `src/convgamer/callbacks/` — EMA lifecycle hook (`EMAUpdateCallback`), collapse guard (`CollapseGuardCallback` on `val/pred_std`)
 - `src/convgamer/training/` — trainer factory (`create_trainer`, `_build_callback`)
 - `src/convgamer/data/` — DataModules: `ConvGamerDataModule` (fixture-frame smoke), `VJEPAGamingDataModule` (V-JEPA, modes `fixture`/`video`/`mixed`); datasets: `GameVideoDataset`, `GameImageDataset`, `FixtureClipDataset`, `FixtureFrameDataset`, `FixtureVideoDataset`; `masking.py` for multi-block masking; RGB is ImageNet-standardized (no oklab — see `docs/ablations/color_space.md`)
 - `src/convgamer/integrations/transformers/` — HF `ConvGamerImageConfig` / `ConvGamerImageModel` (image backbone only, not video)

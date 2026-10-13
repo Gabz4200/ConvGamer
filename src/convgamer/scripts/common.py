@@ -176,4 +176,8 @@ def _build_jepa_datamodule(
         streaming=bool(cfg.data.get("streaming", False)),
         max_files_per_repo=cfg.data.get("max_files_per_repo", None),
         cleanup_downloads=bool(cfg.data.get("cleanup_downloads", False)),
+        val_max_files=int(cfg.data.get("val_max_files", 8)),
+        subset_caps=dict(cfg.data.get("subset_caps", {})),
+        oversample=dict(cfg.data.get("oversample", {})),
+        val_tail=int(cfg.data.get("val_tail", 2)),
     )

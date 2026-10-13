@@ -79,7 +79,9 @@ class ConvGamerDataModule(pl.LightningDataModule):
     def setup(self, stage: str | None = None):
         if stage in (None, "fit"):
             self.train_ds = self._dataset()
-            self.val_ds = self._dataset()
+            # Train and val share the same fixture frames; masks are sampled
+            # per batch, so one build serves both (avoids 2× load/resize).
+            self.val_ds = self.train_ds
         if stage in (None, "test", "validate"):
             if self.val_ds is None:
                 self.val_ds = self._dataset()

@@ -30,12 +30,16 @@ def _normalize_layer_count(num_layers: int | Sequence[int], stages: int = 4) -> 
     if isinstance(num_layers, bool):
         raise ValueError(f"num_layers must be int or sequence, got {type(num_layers).__name__}")
     if isinstance(num_layers, int):
+        if num_layers < 0:
+            raise ValueError(f"num_layers must be >= 0, got {num_layers}")
         return [num_layers] * stages
     if isinstance(num_layers, str) or not isinstance(num_layers, Sequence):
         raise ValueError(f"num_layers must be int or sequence, got {type(num_layers).__name__}")
     layers = list(num_layers)
     if len(layers) != stages:
         raise ValueError(f"num_layers tuple must have length {stages}, got {len(layers)}")
+    if any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in layers):
+        raise ValueError(f"num_layers entries must be ints >= 0, got {layers}")
     return layers
 
 
@@ -80,10 +84,14 @@ class InceptionNeXtEncoder(nn.Module):
 
         if len(mlp_ratios) != 4:
             raise ValueError(f"mlp_ratios must have length 4, got {len(mlp_ratios)}")
+        if any(r <= 0 for r in mlp_ratios):
+            raise ValueError(f"mlp_ratios must be positive, got {tuple(mlp_ratios)}")
         if widths is None:
             widths = (hidden_dim, hidden_dim * 2, hidden_dim * 4, hidden_dim * 8)
         if len(widths) != 4:
             raise ValueError(f"widths must have length 4, got {len(widths)}")
+        if any(w <= 0 for w in widths):
+            raise ValueError(f"widths must be positive, got {tuple(widths)}")
         self.stem = nn.Conv2d(input_dim, widths[0], kernel_size=4, stride=4)
         self.stem_norm = nn.LayerNorm(widths[0])
 
@@ -156,6 +164,8 @@ class InceptionNeXtEncoder(nn.Module):
         (V-JEPA 2.1 §2.3.2): each level is a distinct feature modality, not a
         copy of the final map.
         """
+        if x.ndim != 4:
+            raise ValueError(f"Expected 4D input (B, C, H, W), got shape {x.shape}")
         x = self._stem_forward(x)
         maps = []
         for stage in self.stages:

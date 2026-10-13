@@ -1,9 +1,10 @@
 """LR range test for the JEPA stack (Phase F procedure).
 
-Runs Lightning's `lr_find` on a tiny JEPA model over the fixture clip and
-prints the suggested LR. This validates the finder wiring on CPU; the
-production LR for a full run must be re-found on GPU with real data and
-recorded in docs/ablations/temporal_and_norm.md (or the training log).
+Runs the shared :func:`convgamer.training.engine.maybe_run_lr_finder` on a
+tiny JEPA model over the fixture clip and prints the suggested LR. This
+validates the finder wiring on CPU; the production LR for a full run must be
+re-found on GPU with real data and recorded in docs/ablations/temporal_and_norm.md
+(or the training log).
 
 Usage:
     .venv/bin/python scripts/lr_find_jepa.py [--min-lr 1e-6] [--max-lr 1e-2]
@@ -14,13 +15,13 @@ from __future__ import annotations
 import argparse
 
 import pytorch_lightning as pl
-import torch
-from pytorch_lightning.tuner import Tuner
+from omegaconf import OmegaConf
 
-from convgamer.data.dataset import FixtureClipDataset
+from convgamer.data.jepa_datamodule import VJEPAGamingDataModule
 from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.jepa import JEPALoss, VJEPAPredictor
 from convgamer.modules.jepa_module import ConvGamerVJEPAModel
+from convgamer.training.engine import create_trainer, maybe_run_lr_finder
 
 
 def main() -> None:
@@ -45,26 +46,34 @@ def main() -> None:
         loss=JEPALoss(lambda_base=0.5),
         lr=5.25e-4,
     )
-    loader = torch.utils.data.DataLoader(
-        FixtureClipDataset(num_frames=8, height=64, width=64, repeats=8),
+    datamodule = VJEPAGamingDataModule(
         batch_size=2,
+        num_workers=0,
+        num_frames=8,
+        height=64,
+        width=64,
+        mode="fixture",
     )
-    trainer = pl.Trainer(
-        accelerator="cpu",
-        devices=1,
-        max_epochs=1,
-        enable_checkpointing=False,
-        logger=False,
-        enable_progress_bar=False,
+    datamodule.setup("fit")
+
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "accelerator": "cpu",
+                "devices": 1,
+                "max_epochs": 1,
+                "lr_finder": {
+                    "enabled": True,
+                    "min_lr": args.min_lr,
+                    "max_lr": args.max_lr,
+                    "num_training": 50,
+                },
+            }
+        }
     )
-    result = Tuner(trainer).lr_find(
-        model, train_dataloaders=loader, min_lr=args.min_lr, max_lr=args.max_lr
-    )
-    if result is None:
-        raise RuntimeError("lr_find returned no result")
-    print(f"suggested_lr: {result.suggestion()}")
-    print(f"tested_lrs: {[float(v) for v in result.results['lr']]}")
-    print(f"losses: {[float(v) for v in result.results['loss']]}")
+    trainer = create_trainer(cfg)
+    suggestion = maybe_run_lr_finder(trainer, model, datamodule, cfg)
+    print(f"suggested_lr: {suggestion}")
 
 
 if __name__ == "__main__":

@@ -50,11 +50,14 @@ def test_lr_finder_sets_lr_and_restores_weights() -> None:
         {"enabled": True, "min_lr": 1e-6, "max_lr": 1e-3, "num_training": 8}
     )
     before = {k: v.clone() for k, v in model.state_dict().items()}
+    ema_before = {k: v.clone() for k, v in model.ema_encoder.state_dict().items()}
     suggestion = maybe_run_lr_finder(trainer, model, datamodule, cfg)
     assert suggestion is not None and torch.isfinite(torch.tensor(suggestion))
     assert model.lr == pytest.approx(suggestion)
     for k, v in model.state_dict().items():
         torch.testing.assert_close(v, before[k])
+    for k, v in model.ema_encoder.state_dict().items():
+        torch.testing.assert_close(v, ema_before[k])
 
 
 def test_lr_finder_requires_lr_attribute() -> None:

@@ -17,7 +17,21 @@ from convgamer.data.dataset import (
 )
 
 
-def _make_loader(ds, batch_size: int, num_workers: int) -> DataLoader:
+def _make_loader(ds, batch_size: int, num_workers: int, *, train: bool = False) -> DataLoader:
+    # pin_memory: async host->device copies. persistent_workers: loader
+    # workers survive across epochs within one fit() — required so the
+    # per-worker sample counter keeps yielding fresh masks on every pass
+    # instead of replaying pass 1. prefetch_factor smooths JIT-download stalls.
+    if train and num_workers > 0:
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            drop_last=True,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
+        )
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers, drop_last=True)
 
 
@@ -57,6 +71,10 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         streaming: bool = False,
         max_files_per_repo: int | None = None,
         cleanup_downloads: bool = False,
+        val_max_files: int = 8,
+        subset_caps: dict | None = None,
+        oversample: dict | None = None,
+        val_tail: int = 2,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -75,11 +93,17 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         self.streaming = streaming
         self.max_files_per_repo = max_files_per_repo
         self.cleanup_downloads = cleanup_downloads
+        self.val_max_files = val_max_files
+        self.subset_caps = dict(subset_caps or {})
+        self.oversample = dict(oversample or {})
+        self.val_tail = val_tail
         self.train_ds: FixtureClipDataset | GameVideoDataset | None = None
         self.video_ds: GameVideoDataset | None = None
         self.image_ds: GameImageDataset | None = None
 
-    def _build_video_dataset(self, video_ids: list[str] | None = None) -> GameVideoDataset:
+    def _build_video_dataset(
+        self, video_ids: list[str] | None = None, file_slice: str = "train"
+    ) -> GameVideoDataset:
         return GameVideoDataset(
             video_paths=list(video_ids) if video_ids is not None else list(self.video_dataset_ids),
             num_frames=self.num_frames,
@@ -91,7 +115,11 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
             data_dir=self.data_dir,
             streaming=self.streaming,
             max_files_per_repo=self.max_files_per_repo,
-            cleanup_downloads=self.cleanup_downloads,
+            cleanup_downloads=self.cleanup_downloads and file_slice == "train",
+            subset_caps=self.subset_caps,
+            oversample=self.oversample,
+            file_slice=file_slice,
+            val_tail=self.val_tail,
         )
 
     def _build_image_dataset(self) -> GameImageDataset:
@@ -115,17 +143,26 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         elif self.mode == "video":
             if not self.video_dataset_ids:
                 raise ValueError("mode='video' requires non-empty video_dataset_ids")
-            # Hold out the last file for validation.
-            train_ids = self.video_dataset_ids[:-1] or self.video_dataset_ids
-            self.train_ds = self._build_video_dataset(train_ids)
+            # Streaming slices val tails inside the dataset, so train can
+            # exhaust every repo. Non-streaming holds out the last id as a
+            # whole-repo val set, so train must exclude it (no leakage).
+            train_ids = (
+                list(self.video_dataset_ids)
+                if self.streaming
+                else list(self.video_dataset_ids[:-1] or self.video_dataset_ids)
+            )
+            self.train_ds = self._build_video_dataset(train_ids, file_slice="train")
         elif self.mode == "mixed":
             if not self.video_dataset_ids or not self.image_dataset_ids:
                 raise ValueError(
                     "mode='mixed' requires non-empty video_dataset_ids and image_dataset_ids"
                 )
-            self.video_ds = self._build_video_dataset(
-                self.video_dataset_ids[:-1] or self.video_dataset_ids
+            train_ids = (
+                list(self.video_dataset_ids)
+                if self.streaming
+                else list(self.video_dataset_ids[:-1] or self.video_dataset_ids)
             )
+            self.video_ds = self._build_video_dataset(train_ids, file_slice="train")
             self.image_ds = self._build_image_dataset()
             self.train_ds = self.video_ds
         else:
@@ -139,15 +176,16 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
                 raise RuntimeError("video_ds not initialized; call setup() first")
             if self.image_ds is None:
                 raise RuntimeError("image_ds not initialized; call setup() first")
-            video_dl = _make_loader(self.video_ds, self.batch_size, self.num_workers)
-            image_dl = _make_loader(self.image_ds, self.batch_size, self.num_workers)
+            video_dl = _make_loader(self.video_ds, self.batch_size, self.num_workers, train=True)
+            image_dl = _make_loader(self.image_ds, self.batch_size, self.num_workers, train=True)
             return [video_dl, image_dl]
-        return _make_loader(self.train_ds, self.batch_size, self.num_workers)
+        return _make_loader(self.train_ds, self.batch_size, self.num_workers, train=True)
 
     def val_dataloader(self) -> DataLoader | None:
         # Validation holds out data: fixture uses fewer repeats with an
-        # offset seed (disjoint masks); video holds out the last file.
-        if self.mode == "fixture" or self.train_ds is None:
+        # offset seed (disjoint masks); video takes each repo's val_tail
+        # (stable order, cached, never cleaned) for a multi-domain signal.
+        if self.mode == "fixture":
             val_ds = FixtureClipDataset(
                 num_frames=self.num_frames,
                 height=self.height,
@@ -156,26 +194,33 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
                 repeats=2,
                 base_seed=10_000,
             )
+        elif self.mode in ("video", "mixed"):
+            if self.train_ds is None:
+                raise RuntimeError("train_ds not initialized; call setup('fit') first")
+            if not self.streaming:
+                ids = list(self.video_dataset_ids)
+                val_ids = ids[-1:] if ids else []
+                if not val_ids:
+                    raise ValueError("no video ids to hold out for validation")
+                val_ds = GameVideoDataset(
+                    video_paths=val_ids,
+                    num_frames=self.num_frames,
+                    height=self.height,
+                    width=self.width,
+                    mask_ratio=self.mask_ratio,
+                    sample_stride=self.sample_stride,
+                    max_frames=self.max_frames,
+                    data_dir=self.data_dir,
+                    streaming=False,
+                    max_files_per_repo=self.val_max_files,
+                    cleanup_downloads=False,
+                )
+            else:
+                if not self.video_dataset_ids:
+                    raise ValueError("no video ids to hold out for validation")
+                val_ds = self._build_video_dataset(list(self.video_dataset_ids), file_slice="val")
         else:
-            ids = list(self.video_dataset_ids)
-            val_ids = ids[-1:] if ids else []
-            if not val_ids:
-                raise ValueError("no video ids to hold out for validation")
-            # Streaming val stays tiny: 2 files max, no cleanup (reused across
-            # val checks), so validation never snapshot-downloads a repo.
-            val_ds = GameVideoDataset(
-                video_paths=val_ids,
-                num_frames=self.num_frames,
-                height=self.height,
-                width=self.width,
-                mask_ratio=self.mask_ratio,
-                sample_stride=self.sample_stride,
-                max_frames=self.max_frames,
-                data_dir=self.data_dir,
-                streaming=self.streaming,
-                max_files_per_repo=2 if self.streaming else self.max_files_per_repo,
-                cleanup_downloads=False,
-            )
+            raise ValueError(f"mode must be 'fixture', 'video', or 'mixed', got {self.mode!r}")
         # num_workers=0: val resolves paths in the main process, avoiding
         # the per-worker download race noted in dataset.GameVideoDataset.
         return DataLoader(val_ds, batch_size=self.batch_size, num_workers=0)

@@ -8,13 +8,18 @@ tensors. Masking is multi-block at token resolution (see
 
 from __future__ import annotations
 
+import hashlib
+import itertools
 import logging
+import os
+import shutil
+from itertools import zip_longest
 from pathlib import Path
 
 import einops
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
+import torch.nn.functional as F
 from decord import VideoReader as _DecordVideoReader
 from decord import cpu as _decord_cpu
 from PIL import Image
@@ -22,11 +27,14 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from convgamer.data.masking import multiblock_mask_3d
 from convgamer.data.sources import (
+    _expand_archive_globs,
+    _looks_like_hf_id,
     _resolve_image_paths,
     _resolve_video_paths,
     _shard_for_distributed,
     download_remote_file,
     list_remote_video_files,
+    stride_cap,
 )
 
 __all__ = [
@@ -54,7 +62,7 @@ def fixture_path() -> Path:
 
 def _resize_video_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if frames.shape[-2:] != (height, width):
-        frames = torch.stack([TF.resize(f, [height, width]) for f in frames])
+        frames = F.interpolate(frames, size=(height, width), mode="bilinear", align_corners=False)
     return frames
 
 
@@ -78,6 +86,11 @@ def _normalize_rgb(y: torch.Tensor, dim: int) -> torch.Tensor:
     return (y - mean.view(shape)) / std.view(shape)
 
 
+def _stable_seed(path: str) -> int:
+    """Deterministic per-path salt, stable across ``PYTHONHASHSEED`` runs."""
+    return int(hashlib.md5(path.encode()).hexdigest(), 16) % (2**16)
+
+
 def _mask_video_clip(y: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask ``y`` (T, C, H, W), standardize RGB, return (x, y) as (C, T, H, W).
 
@@ -99,6 +112,14 @@ def _load_fixture_clip(path: Path | None = None) -> torch.Tensor:
     return clip.float() / 255.0
 
 
+# Per-process sample counter. DataLoader workers are forked processes that
+# persist across epochs within one fit(), so this salts every yielded sample
+# uniquely per worker lifetime: repeated passes over the same file get fresh
+# masks (and fresh RNG clip starts) instead of replaying pass 1 identically.
+# Not reproducible across runs by design — variation is the point.
+_SAMPLE_COUNTER = itertools.count()
+
+
 class FixtureClipDataset(IterableDataset):
     """Offline smoke dataset over the checked-in real game clip.
 
@@ -117,6 +138,8 @@ class FixtureClipDataset(IterableDataset):
         fixture: Path | None = None,
         base_seed: int = 0,
     ):
+        if repeats < 1:
+            raise ValueError(f"repeats must be >= 1, got {repeats}")
         self.num_frames = num_frames
         self.height = height
         self.width = width
@@ -126,9 +149,11 @@ class FixtureClipDataset(IterableDataset):
         self.base_seed = base_seed
 
     def __len__(self) -> int:
-        return self.repeats
+        worker_id, num_workers = _worker_info()
+        return len(range(self.repeats)[worker_id::num_workers])
 
     def __iter__(self):
+        worker_id, num_workers = _worker_info()
         clip = _load_fixture_clip(self.fixture)  # (C, Tf, Hf, Wf)
         tf = clip.shape[1]
         if self.num_frames > tf:
@@ -138,7 +163,7 @@ class FixtureClipDataset(IterableDataset):
         frames = clip[:, idx]  # (C, T, Hf, Wf)
         frames = einops.rearrange(frames, "c t h w -> t c h w")
         frames = _resize_video_frames(frames, self.height, self.width)
-        for n in range(self.repeats):
+        for n in range(self.repeats)[worker_id::num_workers]:
             # Per-sample seed varies per epoch via base_seed so masks
             # don't freeze across epochs when the loader is re-iterated
             # with a new base_seed.
@@ -201,6 +226,14 @@ class GameVideoDataset(IterableDataset):
         cleanup_downloads: In streaming mode, delete each downloaded file
             after yielding its sample and evict the scoped Hub cache every
             few files, so training loop is download-train-delete.
+        subset_caps: Optional ``{repo_id: max_files}`` strided caps applied
+            in streaming mode (regularize with a small slice of huge repos).
+        oversample: Optional ``{repo_id: repeats}`` multipliers for small
+            but important repos (repeats yield fresh clips/masks via the
+            per-sample counter salt, never byte-identical replays).
+        file_slice: ``"train"`` (default; drops each repo's ``val_tail``)
+            or ``"val"`` (yields only the held-out tails, stable order).
+        val_tail: Held-out files per repo for the ``"val"`` slice.
     """
 
     def __init__(
@@ -216,7 +249,17 @@ class GameVideoDataset(IterableDataset):
         streaming: bool = False,
         max_files_per_repo: int | None = None,
         cleanup_downloads: bool = False,
+        subset_caps: dict | None = None,
+        oversample: dict | None = None,
+        file_slice: str = "train",
+        val_tail: int = 2,
     ):
+        if file_slice not in ("train", "val"):
+            raise ValueError(f"file_slice must be 'train' or 'val', got {file_slice!r}")
+        if sample_stride < 1:
+            raise ValueError(f"sample_stride must be >= 1, got {sample_stride}")
+        if num_frames < 1:
+            raise ValueError(f"num_frames must be >= 1, got {num_frames}")
         self.video_paths = video_paths
         self.num_frames = num_frames
         self.height = height
@@ -228,6 +271,11 @@ class GameVideoDataset(IterableDataset):
         self.streaming = streaming
         self.max_files_per_repo = max_files_per_repo
         self.cleanup_downloads = cleanup_downloads
+        self.subset_caps = dict(subset_caps or {})
+        self.oversample = dict(oversample or {})
+        self.file_slice = file_slice
+        self.val_tail = val_tail
+        self._skipped = 0
 
     def _load_video(self, path: str) -> torch.Tensor:
         """Load frames from a single mp4 using decord.
@@ -236,6 +284,8 @@ class GameVideoDataset(IterableDataset):
         """
         vr = _DecordVideoReader(path, ctx=_decord_cpu(0))
         total = len(vr)
+        if total == 0:
+            raise ValueError(f"video has no frames: {path}")
         total = min(total, self.max_frames)
 
         if total < self.num_frames * self.sample_stride:
@@ -265,16 +315,20 @@ class GameVideoDataset(IterableDataset):
 
     def _sample_from_path(self, path: str):
         """Load ``path`` and yield its ``(x, y, mask)`` triplet (or skip)."""
-        import logging
-
         logger = logging.getLogger(__name__)
         try:
             y = self._load_video(path)  # (T, C, H, W)
         except Exception as error:
             logger.warning("Skipping unreadable video %s (%s)", path, error)
+            self._skipped += 1
+            if self._skipped % 10 == 1:
+                logger.warning("skipped %d unreadable videos so far", self._skipped)
             return
-        # Deterministic per-worker stream under seed_everything(workers=True).
-        seed = int(torch.initial_seed() % (2**31)) + hash(path) % (2**16)
+        # Deterministic per-worker stream under seed_everything(workers=True),
+        # salted by a per-sample counter so repeated passes over one file
+        # (multi-epoch streaming) never replay identical masks.
+        seed = int(torch.initial_seed() % (2**31)) + _stable_seed(path)
+        seed += next(_SAMPLE_COUNTER) % (2**16)
         mask = multiblock_mask_3d(
             self.num_frames, self.height, self.width, self.mask_ratio, seed=seed
         )
@@ -288,42 +342,69 @@ class GameVideoDataset(IterableDataset):
         Remote repos are listed without downloading; each ``.mp4`` is pulled
         via single-file download, yielded to the caller, then optionally
         deleted so disk stays flat across thousand-file repos.
+
+        Sampling per pass: each repo contributes its listing minus the
+        ``val_tail`` holdout (``"val"`` slice yields only those tails, in
+        stable order), reduced by the strided ``subset_caps`` slice and
+        multiplied by ``oversample`` repeats. Train groups round-robin
+        across repos so every batch mixes domains instead of running
+        repo-homogeneous stretches.
         """
-        import os
-        import shutil
-
-        from convgamer.data.sources import _expand_archive_globs, _looks_like_hf_id
-
         worker_id, num_workers = _worker_info()
+        groups: list[list[tuple[str | None, str]]] = []
         for item in self.video_paths:
+            group: list[tuple[str | None, str]]
             if _looks_like_hf_id(item) and not os.path.exists(item):
                 remote = list_remote_video_files(item)
-                if self.max_files_per_repo is not None:
-                    remote = remote[: self.max_files_per_repo]
-                remote = _shard_for_distributed(remote)
-                if num_workers > 1:
-                    remote = remote[worker_id::num_workers]
-                repo_root = os.path.join(self.data_dir, item.replace("/", "__"))
-                for n, name in enumerate(remote):
-                    local_path = download_remote_file(item, name, data_dir=self.data_dir)
-                    yield local_path
-                    if self.cleanup_downloads:
-                        try:
-                            if os.path.isfile(local_path):
-                                os.remove(local_path)
-                        except OSError:
-                            pass
-                        # Evict the scoped Hub cache every few files so the
-                        # cache blob half of each download does not accumulate.
-                        if (n + 1) % 5 == 0:
-                            shutil.rmtree(os.path.join(repo_root, ".hf_cache"), ignore_errors=True)
-                if self.cleanup_downloads:
-                    shutil.rmtree(os.path.join(repo_root, ".hf_cache"), ignore_errors=True)
+                if not remote:
+                    raise ValueError(f"remote repo {item!r} lists no .mp4 files")
+                if self.file_slice == "val":
+                    tail = remote[-self.val_tail :] if self.val_tail > 0 else list(remote)
+                    group = [(item, name) for name in tail]
+                else:
+                    if self.val_tail > 0 and len(remote) > self.val_tail:
+                        pool = remote[: -self.val_tail]
+                    else:
+                        pool = list(remote)
+                    if item in self.subset_caps:
+                        pool = stride_cap(pool, int(self.subset_caps[item]))
+                    repeat = max(1, int(self.oversample.get(item, 1)))
+                    group = [(item, name) for name in pool] * repeat
             else:
-                local = _shard_for_distributed(_expand_archive_globs(item, recursive=True))
-                if num_workers > 1:
-                    local = local[worker_id::num_workers]
-                yield from local
+                local = _expand_archive_globs(item, recursive=True)
+                group = [(None, path) for path in local]
+            if group:
+                groups.append(group)
+        if self.file_slice == "val":
+            # Stable concatenated tails: same val batches every check.
+            planned = [ref for group in groups for ref in group]
+        else:
+            planned = [ref for tup in zip_longest(*groups) for ref in tup if ref is not None]
+        planned = _shard_for_distributed(planned)
+        if num_workers > 1:
+            planned = planned[worker_id::num_workers]
+        seen_roots: set[str] = set()
+        for n, (repo_id, name) in enumerate(planned):
+            if repo_id is None:
+                yield name
+                continue
+            local_path = download_remote_file(repo_id, name, data_dir=self.data_dir)
+            yield local_path
+            if self.cleanup_downloads:
+                try:
+                    if os.path.isfile(local_path):
+                        os.remove(local_path)
+                except OSError:
+                    pass
+                # Evict the scoped Hub cache across touched repos every few
+                # files so the cache-blob half of downloads never accumulates.
+                seen_roots.add(os.path.join(self.data_dir, repo_id.replace("/", "__")))
+                if (n + 1) % 5 == 0:
+                    for root in seen_roots:
+                        shutil.rmtree(os.path.join(root, ".hf_cache"), ignore_errors=True)
+        if self.cleanup_downloads:
+            for root in seen_roots:
+                shutil.rmtree(os.path.join(root, ".hf_cache"), ignore_errors=True)
 
     def __iter__(self):
         if self.streaming:
@@ -402,7 +483,8 @@ class GameImageDataset(IterableDataset):
             # Inject dummy temporal axis: (C, 1, H, W)
             y = img.unsqueeze(1)  # (C, 1, H, W)
 
-            seed = int(torch.initial_seed() % (2**31)) + hash(path) % (2**16)
+            seed = int(torch.initial_seed() % (2**31)) + _stable_seed(path)
+            seed += next(_SAMPLE_COUNTER) % (2**16)
             mask = multiblock_mask_3d(1, self.size, self.size, self.mask_ratio, seed=seed)
             # Mask after normalization with the mean (0.0 post-norm).
             y = _normalize_rgb(y, dim=0)

@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class StreamCache:
     """Fixed-size streaming cache of ``ConvGamerEncoder``.
 
@@ -61,7 +61,7 @@ class StreamCache:
     cumsum: torch.Tensor | None = None
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class StepOutput:
     """Output of streaming one frame through ``ConvGamerEncoder``.
 

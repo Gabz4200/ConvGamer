@@ -5,7 +5,8 @@
 # This notebook installs [ConvGamer](https://github.com/Gabz4200/ConvGamer) from GitHub,
 # wires the JEPA stack through the repo composition root
 # (`convgamer.scripts.common` + `convgamer.training.engine`), and trains the full
-# backbone (`ConvGamerEncoder` + `VJEPAPredictor` + `JEPALoss` in
+# backbone (`ConvGamerEncoder` in `models/convgamer`, `VJEPAPredictor`/`JEPALoss`
+# in `models/jepa`, wired by `ConvGamerVJEPAModel` in
 # `src/convgamer/modules/jepa_module.py`) on real gameplay MP4s.
 # The result is a self-supervised foundation encoder with no classification head.
 # A later notebook/script attaches an action-prediction head via
@@ -13,10 +14,17 @@
 #
 # Prerequisites: on Kaggle, enable **Internet: ON** (right panel, for the clone
 # and the Hugging Face downloads) and pick a **GPU accelerator**
-# (P100 or T4 x2; CPU works for the smoke cells only). The full 135k-step run
-# exceeds Kaggle's 9h session limit — train in chunks with Save Version outputs,
-# or lower MAX_STEPS. All configured video datasets are public, so no HF token
+# (P100 or T4 x2; CPU works for the smoke cells only). The run is time-boxed
+# to ~8.5h (`trainer.max_time`) with early stopping on the held-out loss, so
+# a single session covers it — checkpoints persist only via Save Version →
+# save outputs. All configured video datasets are public, so no HF token
 # is needed unless you add a gated one (then store it under Add-ons → Secrets).
+#
+# Importance-weighted subsets: Terraria (~35 GB, 310 files) regularizes
+# generalization, so training takes a small strided slice (60 files); small
+# important repos repeat for balanced exposure (Cuphead ×5, Hollow Knight ×2).
+# Validation holds out 2 files per repo across all domains for the
+# early-stop signal — no repo is wasted on a whole-repo holdout.
 #
 # Disk strategy (Kaggle /kaggle/working is ~20 GB): the dataset streams —
 # remote `.mp4` are listed (metadata only, zero bytes), fetched **one file at
@@ -29,12 +37,23 @@
 # %%
 # Clone the repo (skip if already present) and add it to the path.
 import os
+import subprocess
 import sys
 
 if not os.path.isdir("ConvGamer"):
-    os.system("git clone --depth 1 https://github.com/Gabz4200/ConvGamer.git")
-sys.path.insert(0, os.path.abspath("ConvGamer/src"))
-print("repo:", os.path.abspath("ConvGamer"))
+    if os.path.isdir(os.path.join(".", "src", "convgamer")):
+        sys.path.insert(0, os.path.abspath("src"))
+        print("repo: . (local checkout)")
+    else:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/Gabz4200/ConvGamer.git"],
+            check=True,
+        )
+        sys.path.insert(0, os.path.abspath("ConvGamer/src"))
+        print("repo:", os.path.abspath("ConvGamer"))
+else:
+    sys.path.insert(0, os.path.abspath("ConvGamer/src"))
+    print("repo:", os.path.abspath("ConvGamer"))
 
 # %%
 # Install runtime deps (torch/torchvision ship with the Kaggle image, so they
@@ -52,14 +71,19 @@ if torch.cuda.is_available():
 # %% [markdown]
 # ## 1. Compose the JEPA training config
 #
-# `model=jepa data=jepa trainer=jepa optimizer=jepa` must be selected together.
+# `model=jepa` requires `data=jepa` and vice versa (`build_datamodule` fails
+# fast otherwise); trainer/optimizer groups stay freely composable.
 # `data.mode=video` trains on `video_dataset_ids` below (`mode=fixture` is the
 # offline smoke clip only). Kaggle-sized for 2x T4: the full 5-repo gameplay
-# list from `configs/data/jepa.yaml` (~2k clips), batch 4 per GPU
-# (effective 4 x 2 GPUs x 2 accum = 16; raise to 8 per GPU for effective 32
-# if VRAM allows), `accelerator/devices/strategy` all `auto`
+# list from `configs/data/jepa.yaml` (~2k clips), batch 8 per GPU
+# (effective 8 x 2 GPUs x 2 accum = 32; drop to 4 per GPU for effective 16
+# if VRAM OOMs), `accelerator/devices/strategy` all `auto`
 # (→ cuda/2/DDP on the T4 host, cpu/1/single elsewhere).
 # For the full run, raise `MAX_STEPS` (paper Appendix A uses 135000).
+# Default 20000 ≈ 290 passes over the ~2170-sample weighted pool; early
+# stopping (`trainer.early_stopping`, patience 15 val checks) and the 8.5h
+# `trainer.max_time` backstop end the run sooner on convergence or timeout.
+# LR warmup rescales with the budget (paper 12k/135k ≈ 9% → 1500/20000).
 #
 # Streaming flags below are the disk fix: `data.streaming=true` lists remote
 # files without downloading and fetches one `.mp4` at a time inside the
@@ -74,9 +98,10 @@ from omegaconf import OmegaConf
 from convgamer.scripts.common import CONFIG_DIR
 
 USE_CUDA = torch.cuda.is_available()
-MAX_STEPS = 1000  # demo budget; raise toward 135000 for the real run
-# Full gameplay list from configs/data/jepa.yaml (~2k clips across 5 repos).
-VIDEO_IDS = list(OmegaConf.load(CONFIG_DIR / "data" / "jepa.yaml")["video_dataset_ids"])
+MAX_STEPS = 20000  # ~290 passes over the weighted pool; early stop ends sooner
+BATCH_SIZE = 8  # per-GPU (effective 8 x 2 GPUs x 2 accum = 32); drop to 4 on OOM
+WARMUP_STEPS = 1500  # ~9% of MAX_STEPS, matching the paper's 12k/135k ratio
+LAMBDA_WARMUP = round(MAX_STEPS * 30000 / 135000)  # same 22% ratio as paper epochs 50-100
 # Keep every downloaded byte inside the writable working disk (Kaggle or CWD).
 DATA_DIR = "/kaggle/working/data/jepa" if os.path.isdir("/kaggle/working") else "./data/jepa"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -88,20 +113,16 @@ overrides = [
     "trainer=jepa",
     "optimizer=jepa",
     "data.mode=video",
-    "trainer.accelerator=auto",
-    "trainer.devices=auto",
-    "trainer.strategy=auto",
     f"trainer.precision={'16-mixed' if USE_CUDA else '32-true'}",
     f"trainer.max_steps={MAX_STEPS}",
-    "trainer.limit_val_batches=10",
-    "trainer.val_check_interval=100",
-    "data.batch_size=4",
+    f"model.warmup_steps={WARMUP_STEPS}",
+    f"model.loss.lambda_warmup_steps={LAMBDA_WARMUP}",
+    f"data.batch_size={BATCH_SIZE}",
     "data.num_workers=2",
     f"data.data_dir={DATA_DIR}",
     # Streaming disk fix (see header): O(1-file) disk instead of O(dataset).
     "data.streaming=true",
     "data.cleanup_downloads=true",
-    f"data.video_dataset_ids=[{','.join(VIDEO_IDS)}]",
 ]
 
 with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
@@ -111,33 +132,52 @@ print(OmegaConf.to_yaml(cfg.data))
 print("video ids:", len(cfg.data.video_dataset_ids))
 
 # %% [markdown]
-# ## 2. Count remote files (no bytes), then smoke-test one streaming batch
+# ## 2. Sampling table (no bytes), then smoke-test one streaming batch
 #
-# No upfront snapshot download: `list_remote_video_files` hits the Hub API
-# only (filenames, not blobs), and the first training batch pulls just enough
-# `.mp4` just-in-time (~4 files for batch 4) through the streaming
+# No upfront snapshot download: `describe_sampling` lists remote files
+# (filenames, not blobs) and reports each repo's total → train pool → repeat
+# → effective samples, so the importance weighting is visible before any
+# byte moves. The first training batch then pulls just enough `.mp4`
+# just-in-time (~8 files for batch 8) through the streaming
 # `GameVideoDataset`. `build_model` dispatches on the `convgamer.models.jepa`
 # marker to `ConvGamerVJEPAModel` (encoder/predictor/loss from
 # `configs/model/jepa.yaml`). Batches are `(context, target, mask)` triplets
 # of standardized RGB.
 
 # %%
-from convgamer.data.sources import disk_free_bytes, list_remote_video_files
+from convgamer.data.sources import describe_sampling, disk_free_bytes
 from convgamer.scripts.common import build_datamodule, build_model
 
 print(f"free disk in {DATA_DIR}: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
-for vid in list(cfg.data.video_dataset_ids):
-    try:
-        print(f"  {vid}: {len(list_remote_video_files(vid))} remote .mp4")
-    except Exception as error:
-        print(f"  {vid}: list failed ({error})")
+try:
+    rows = describe_sampling(
+        list(cfg.data.video_dataset_ids),
+        caps=dict(cfg.data.get("subset_caps", {})),
+        repeats=dict(cfg.data.get("oversample", {})),
+        val_tail=int(cfg.data.get("val_tail", 2)),
+    )
+except Exception as error:
+    print(f"remote listing failed ({error}); continuing without the table")
+    rows = []
+if rows:
+    print(f"{'repo':50s} {'total':>6s} {'train':>6s} {'xN':>3s} {'effective':>9s}")
+    for repo, total, pool, rep, eff in rows:
+        print(f"{repo:50s} {total:6d} {pool:6d} {rep:3d} {eff:9d}")
+    print(
+        f"{'TOTAL':50s} {sum(r[1] for r in rows):6d} {sum(r[2] for r in rows):6d} {'':>3s} "
+        f"{sum(r[4] for r in rows):9d} samples/pass"
+    )
 
 model = build_model(cfg)
 datamodule = build_datamodule(cfg)
 datamodule.setup("fit")
 
-batch = next(iter(datamodule.train_dataloader()))
+train_loader = datamodule.train_dataloader()
+batch = next(iter(train_loader))
 x, y, mask = batch
+# Release the probe iterator so the streaming worker's just-in-time file can
+# be cleaned before fit() spawns its own loader set (avoids double-fetch).
+del train_loader
 print(
     "x:", tuple(x.shape), x.dtype, "| y:", tuple(y.shape), "| mask:", tuple(mask.shape), mask.dtype
 )
@@ -155,9 +195,20 @@ import pytorch_lightning as pl
 
 from convgamer.training.engine import create_trainer
 
-pl.seed_everything(42, workers=True)
-smoke_cfg = OmegaConf.merge(cfg, {"trainer": {"max_steps": 5, "limit_val_batches": 0}})
-smoke_trainer = create_trainer(smoke_cfg)
+pl.seed_everything(int(cfg.get("seed", 42)), workers=True)
+smoke_cfg = OmegaConf.merge(
+    cfg,
+    {
+        "trainer": {
+            "max_steps": 5,
+            "limit_val_batches": 0,
+            "min_steps": 0,
+            "early_stopping": {"enabled": False},
+            "collapse_guard": {"enabled": False},
+        }
+    },
+)
+smoke_trainer = create_trainer(smoke_cfg)  # type: ignore[arg-type]
 smoke_trainer.fit(model, datamodule=datamodule)
 print("smoke fit ok; ema shadow device:", next(model.ema_encoder.shadow_module.parameters()).device)
 
@@ -166,10 +217,27 @@ print("smoke fit ok; ema shadow device:", next(model.ema_encoder.shadow_module.p
 #
 # Lightning sweeps the LR exponentially, restores the pre-sweep weights, and
 # writes the suggestion back to `model.lr` (read by `configure_optimizers`).
+# The run ends whichever comes first: `MAX_STEPS`, early stopping on
+# `val/loss` (15 checks ≈ 1500 steps without improvement, after a 2000-step
+# floor so the weighted pool is seen ~30× first), the collapse guard
+# (`CollapseGuardCallback` stops on 3 consecutive ~zero `val/pred_std`
+# checks — JEPA loss alone cannot detect representation collapse), or the
+# 8.5h `max_time` backstop. Best weights survive via top-3 `val/loss`
+# checkpointing. The loss adds LeJEPA SIGReg isotropy pressure
+# (`loss.sigreg_lambda=0.02`, the paper's goto value; logged as
+# `train/sigreg`): predicted latents are regularized toward an isotropic
+# Gaussian, which provably minimizes downstream risk and resists collapse
+# without any teacher swap — EMA stays. A linear probe would be the ideal
+# stop signal, but no dataset carries per-clip action labels (Terraria has
+# provenance metadata only; others are bare MP4s), so the frozen-schedule
+# `val/loss` + feature std sentinel is the label-free substitute.
 # Training streams file-by-file (download → train → delete, with scoped-cache
-# eviction), so the working disk stays flat for the whole run.
-# Checkpoints land in `checkpoints/jepa/` (see `configs/trainer/jepa.yaml`).
-# On Kaggle, /kaggle/working persists only via Save Version → save outputs.
+# eviction), so the working disk stays flat for the whole run. The train
+# loader pins memory, persists workers across epochs (keeps the per-sample
+# mask salt unique on every pass), and prefetches to cover JIT-download
+# stalls. Checkpoints land in `checkpoints/jepa/`
+# (see `configs/trainer/jepa.yaml`). On Kaggle, /kaggle/working persists only
+# via Save Version → save outputs.
 # Resume with `trainer.fit(model, datamodule=datamodule, ckpt_path="...")`.
 #
 # Tight-disk alternative (same building blocks, explicit chunks): iterate
@@ -183,14 +251,24 @@ from convgamer.training.engine import maybe_run_lr_finder
 pl.seed_everything(int(cfg.get("seed", 42)), workers=True)
 trainer = create_trainer(cfg)
 
-cfg.trainer.lr_finder = {
-    "enabled": True,
-    "min_lr": 1e-6,
-    "max_lr": 1e-2,
-    "num_training": 50,
-    "mode": "exponential",
-}
-found_lr = maybe_run_lr_finder(trainer, model, datamodule, cfg)
+cfg = OmegaConf.merge(
+    cfg,
+    {
+        "trainer": {
+            "lr_finder": {
+                "enabled": True,
+                "min_lr": 1e-6,
+                "max_lr": 1e-2,
+                "num_training": 50,
+                "mode": "exponential",
+            }
+        }
+    },
+)
+try:
+    maybe_run_lr_finder(trainer, model, datamodule, cfg)  # type: ignore[arg-type]
+except Exception as error:  # tuner is flaky under DDP; keep the config LR
+    print(f"lr finder failed ({error}); keeping config lr {model.lr}")
 print("training with lr:", model.lr)
 print(f"free disk before fit: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
 trainer.fit(model, datamodule=datamodule)
@@ -200,7 +278,8 @@ print(f"free disk after fit: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
 # List checkpoints produced by this run.
 import glob
 
-for ckpt in sorted(glob.glob("checkpoints/jepa/*.ckpt")):
+ckpt_dir = str(cfg.trainer.get("checkpoint_callback", {}).get("dirpath", "checkpoints/jepa"))
+for ckpt in sorted(glob.glob(f"{ckpt_dir}/*.ckpt")):
     print(ckpt)
 
 # %% [markdown]
@@ -209,6 +288,11 @@ for ckpt in sorted(glob.glob("checkpoints/jepa/*.ckpt")):
 # The checkpoint holds a headless foundation encoder. Attach a head later:
 # `encoder.add_classification_head(num_actions)` then fine-tune supervised on
 # labeled gameplay frames. Skeleton (not run here):
+#
+# Future label source: `markov-ai/gaming-500-hours` reportedly ships
+# per-workflow event logs + `metadata.jsonl` game labels (verify with
+# `list_repo_files` before relying on it) — the closest thing to action
+# supervision in the pool (Terraria has provenance only).
 
 # %%
 # from convgamer.modules.jepa_module import ConvGamerVJEPAModel

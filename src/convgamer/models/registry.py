@@ -29,5 +29,9 @@ def unregister_model(name: str) -> None:
 
 
 def clear_registry() -> None:
-    """Remove all registered models (test isolation helper)."""
+    """Remove all registered models.
+
+    Test-isolation helper only — never call in production code; use
+    :func:`unregister_model` for surgical teardown.
+    """
     MODEL_REGISTRY.clear()

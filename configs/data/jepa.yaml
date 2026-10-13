@@ -21,13 +21,27 @@ width: 256               # 16:9 native game aspect (terraria workhorse is 256x14
 mask_ratio: 0.25         # multi-block coverage target
 image_mask_ratio: 0.10   # lower mask for spatial regularizer
 data_dir: ./data/jepa
-sample_stride: 1         # frames to skip when slicing long MP4s
+sample_stride: 2         # frames to skip when slicing long MP4s (30+ min videos:
+                         # stride 2 decorrelates passes and halves decord decode)
 max_frames: 10000        # cap decoded frames per clip (prevents OOM)
 streaming: true          # list remote .mp4 (no bytes), fetch one file at a
                          # time just-in-time; required on ~20 GB Kaggle disks
 max_files_per_repo: null # non-streaming cap: first N remote .mp4 per repo (O(chunk))
 cleanup_downloads: true  # streaming only: delete each file after its sample +
                          # evict the scoped Hub cache, so disk stays flat
+val_max_files: 8         # non-streaming val cap (last-repo holdout)
+# Importance-weighted subsets per pass (streaming train slice; val takes
+# val_tail files per repo on top, so every repo trains AND validates).
+# Terraria (~35 GB, 310 files) regularizes generalization: a small strided
+# slice suffices. Small important repos repeat for balanced exposure —
+# repeats yield fresh clips/masks via the per-sample counter salt.
+subset_caps:
+  "Infatoshi/terraria-gameplay-256x144-15fps": 60
+oversample:
+  "Xiaokunfeng2022/hollow_knight_dataset": 2
+  "ch1415926/cuphead": 5
+val_tail: 2                # held-out files per repo for the val slice (cached,
+                          # never cleaned): ~10 val files across all domains
 
 # Tier 1: Direct MP4 datasets
 video_dataset_ids:

@@ -7,6 +7,8 @@ strategy: auto    # DDP for multi-GPU, single-process otherwise
 precision: "16-mixed"          # FP16 for T4 (no BF16)
 log_every_n_steps: 20
 max_steps: 135000              # Primary phase (Appendix A)
+min_steps: 2000               # floor: ~30 full data passes before early stop may fire
+max_time: "00:08:30:00"        # hard 8.5h backstop (Kaggle session limit)
 val_check_interval: 100
 limit_val_batches: 10          # 10 val batches for fast eval
 accumulate_grad_batches: 2     # Effective batch: 4 * 2 * 2 = 16; also aggregates
@@ -24,19 +26,41 @@ lr_finder:
   num_training: 100
   mode: exponential
 
+# Early stopping on the held-out loss: stops at convergence instead of
+# burning the full step budget. Built by engine._build_early_stopping only
+# when enabled; val-free runs (limit_val_batches=0) safely ignore it.
+early_stopping:
+  enabled: true
+  monitor: val/loss
+  patience: 15               # val checks (~1500 steps) without improvement
+  min_delta: 1.0e-4
+  mode: min
+
+# Collapse guard on the predictor-std sentinel: representation collapse
+# drives the loss to ~zero while learning nothing, so val/loss alone cannot
+# catch it. Stops after 3 consecutive val checks below 1e-4 (healthy: O(0.1-1)).
+collapse_guard:
+  enabled: true
+  monitor: val/pred_std
+  min_std: 1.0e-4
+  patience: 3
+
 # Callbacks (built by convgamer.training.engine._build_callback).
 # Note: checkpoint_callback below replaces the lazy model_checkpoint —
 # engine drops the duplicate so only one ModelCheckpoint is active.
+# No explicit `timer`: Lightning auto-adds one when max_time is set, and an
+# explicit entry would silently drop the max_time backstop.
 callbacks:
   - ema_update
   - lr_monitor
-  - timer
 
-# Checkpointing (built by create_trainer from this dict)
+# Checkpointing (built by create_trainer from this dict).
+# Monitors val/loss (frozen-schedule, stable), not the raw train loss, so the
+# kept top-k are the best-converged weights for early-stopped runs.
 checkpoint_callback:
   dirpath: checkpoints/jepa
   filename: jepa-convgamer-{step:07d}
   save_top_k: 3
   save_last: true
-  monitor: train_loss
+  monitor: val/loss
   mode: min

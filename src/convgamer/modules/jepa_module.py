@@ -68,6 +68,7 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         self.total_steps = total_steps
         self.betas = (float(betas[0]), float(betas[1]))
         self._ema_initialized = False
+        self._ema_device: torch.device | None = None
         enc_dim = getattr(encoder, "level_dim", None)
         if enc_dim is not None and predictor.feature_dim != enc_dim:
             raise ValueError(
@@ -111,10 +112,18 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         """
         return self.ema_encoder.shadow_module.forward_feature_maps(y)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+        return_pred: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Single V-JEPA 2.1 training step.
 
-        Returns scalar L_dense = L_predict + L_ctx, averaged over levels.
+        Returns scalar L_dense = L_predict + L_ctx, averaged over levels
+        (plus the raw predictor output when ``return_pred`` is true, so
+        validation can log representation statistics without recomputing).
         """
         # x-encoder: level pyramid on masked input, fused for the predictor
         x_pyramid = self.encode_x(x)
@@ -127,7 +136,8 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         pred = self.predictor(x_fused, mask)
 
         # Dense predictive loss (L_predict + L_ctx), averaged over levels
-        return self.loss_fn(pred, y_pyramid, mask)
+        loss = self.loss_fn(pred, y_pyramid, mask)
+        return (loss, pred) if return_pred else loss
 
     def training_step(self, batch, batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:  # noqa: ARG002
         x, y, mask = batch
@@ -135,28 +145,58 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         # V-JEPA 2.1 ramps lambda over early epochs: global_step survives
         # resume via the checkpoint, unlike a manual Python counter.
         self.loss_fn.set_step(int(self.global_step) + 1)
-        if self._trainer is not None:
-            self.log("train_loss", loss, prog_bar=True, sync_dist=True)
+        try:
+            self.log(
+                "train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True
+            )
+            sigreg = self.loss_fn.last_sigreg
+            if sigreg is not None:
+                self.log(
+                    "train/sigreg",
+                    sigreg,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+        except RuntimeError:
+            pass  # no trainer attached (e.g. manual forward / lr-find probe)
         return loss
 
-    def _val_test_loss(self, batch) -> torch.Tensor:
-        """Loss with the warmup schedule frozen so val/test are comparable."""
+    def _val_test_forward(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        """Loss plus predictor output, warmup schedule frozen for comparability."""
         x, y, mask = batch
-        prev = int(self.loss_fn._step_int)
+        prev = self.loss_fn._current_step()
         try:
             self.loss_fn.set_step(max(prev, self.loss_fn.lambda_warmup_steps))
-            return self(x, y, mask)
+            return self(x, y, mask, return_pred=True)
         finally:
             self.loss_fn.set_step(prev)
 
+    def _val_test_loss(self, batch) -> torch.Tensor:
+        """Loss with the warmup schedule frozen so val/test are comparable."""
+        loss, _ = self._val_test_forward(batch)
+        return loss
+
     def validation_step(self, batch, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
-        loss = self._val_test_loss(batch)
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        loss, pred = self._val_test_forward(batch)
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        # Collapse sentinel: constant predictor output (std -> 0) means the
+        # encoder collapsed even when the loss looks healthy. Watched by
+        # CollapseGuardCallback; healthy runs sit at O(0.1-1).
+        self.log(
+            "val/pred_std",
+            pred.detach().float().std(),
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
         return loss
 
     def test_step(self, batch, batch_idx: int) -> torch.Tensor:  # noqa: ARG002
         loss = self._val_test_loss(batch)
-        self.log("test/loss", loss, sync_dist=True)
+        self.log("test/loss", loss, on_step=False, on_epoch=True, sync_dist=True)
         return loss
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
@@ -209,13 +249,17 @@ class ConvGamerVJEPAModel(pl.LightningModule):
         """Move the non-module EMA shadow onto the online encoder's device.
 
         Dtype is left alone: the EMA target stays fp32 even under AMP.
+        Probes the device once per distinct device (not per batch).
         """
         shadow = self.ema_encoder.shadow_module
         ref = next(self.encoder.parameters(), None)
         if shadow is None or ref is None or next(shadow.parameters(), None) is None:
             return
+        if self._ema_device == ref.device:
+            return
         if next(shadow.parameters()).device != ref.device:
             shadow.to(device=ref.device)
+        self._ema_device = ref.device
 
     def setup(self, stage: str | None = None) -> None:
         """Ensure EMA shadow matches encoder at the start of training.

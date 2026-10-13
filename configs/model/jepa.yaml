@@ -22,16 +22,22 @@ predictor:
   num_outputs: 4             # one prediction per encoder level
   expansion: 4               # MLP expansion in predictor blocks
 
-# Loss
+# Loss: JEPA dense loss + LeJEPA isotropy pressure (arXiv:2511.08544).
 loss:
   _target_: convgamer.models.jepa.JEPALoss
   lambda_base: 0.5          # video lambda (0.5 video, 0.7 image per Appendix A)
   lambda_image: 0.7         # static-image (T=1) context weight
   lambda_warmup_steps: 30000  # paper's epochs 50-100 ramp (~30k steps at 135k)
+  sigreg_lambda: 0.02      # isotropy weight on predicted latents (paper goto); 0 disables
+  sigreg_slices: 256       # random 1D slices per step (paper)
+  sigreg_tokens: 2048      # token subsample cap per step (T4 cost control)
 
 # Training hyperparameters (Appendix A)
+# Canonical owners: peak LR lives in model.lr, decay in optimizer.weight_decay;
+# optimizer.lr (if present) is ignored by the JEPA path. total_steps is the
+# paper budget reference; the schedule is warmup-then-constant.
 ema_decay: 0.99925
 lr: 5.25e-4
-weight_decay: 0.04
+weight_decay: 0.04  # duplicate of optimizer.weight_decay (informational)
 warmup_steps: 12000          # linear LR warmup, stepped every optimizer update
-total_steps: 135000
+total_steps: 135000          # reference only (schedule ignores it)

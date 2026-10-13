@@ -27,7 +27,7 @@ from convgamer.models.convgamer.causal import CausalTemporalMixer
 from convgamer.models.convgamer.encoder import ConvGamerEncoder
 from convgamer.models.jepa import JEPALoss, VJEPAPredictor
 
-FIXTURE = Path("tests/fixtures/terraria16_u8.pt")
+FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "terraria16_u8.pt"
 DOC = Path("docs/ablations/temporal_and_norm.md")
 
 
@@ -73,7 +73,11 @@ def _build(norm: str, seed: int):
 
 
 def _clips() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    raw = torch.load(FIXTURE, weights_only=True).float() / 255.0  # (3,16,144,256)
+    if not FIXTURE.is_file():
+        raise FileNotFoundError(f"smoke fixture not found: {FIXTURE}")
+    raw = (
+        torch.load(FIXTURE, map_location="cpu", weights_only=True).float() / 255.0
+    )  # (3,16,144,256)
     x = torch.stack([raw, raw.flip(-1)])  # (2,3,16,144,256)
     mask = torch.stack([multiblock_mask_3d(16, 144, 256, 0.25, seed=s) for s in (7, 8)])
     xc = x.clone()
@@ -95,16 +99,16 @@ def _run_variant(norm: str, steps: int, seed: int) -> dict:
         opt.zero_grad()
         t0 = time.perf_counter()
         x_pyr = enc.forward_feature_maps(xc)
-        p = pred(enc.fuse_pyramid(x_pyr), mask)
+        probed = pred(enc.fuse_pyramid(x_pyr), mask)
         with torch.no_grad():
             y_pyr = enc.forward_feature_maps(x)
-        loss = loss_fn(p, y_pyr, mask)
+        loss = loss_fn(probed, y_pyr, mask)
         loss.backward()
         step_times.append(time.perf_counter() - t0)
         total = sum(
-            p.grad.abs().sum().item() ** 2
-            for p in list(enc.parameters()) + list(pred.parameters())
-            if p.grad is not None
+            param.grad.detach().float().pow(2).sum().item()
+            for param in list(enc.parameters()) + list(pred.parameters())
+            if param.grad is not None
         )
         grad_norms.append(total**0.5)
         opt.step()
@@ -117,17 +121,17 @@ def _run_variant(norm: str, steps: int, seed: int) -> dict:
     # Streaming: latency per frame + long-horizon drift over 64 frames.
     enc.eval()
     long_clip = x[:1].repeat(1, 1, 4, 1, 1)  # (1,3,64,144,256)
-    t0 = time.perf_counter()
     with torch.no_grad():
         state = enc.init_state(1, 144, 256)
         outs = []
+        t0 = time.perf_counter()
         for t in range(long_clip.shape[2]):
             out = enc.step(long_clip[:, :, t], state)
             outs.append(out.features)
             state = out.new_state
+        step_ms = (time.perf_counter() - t0) / long_clip.shape[2] * 1000
         rolled = torch.cat(outs, dim=2)
         ref = enc.forward_features(long_clip)
-    step_ms = (time.perf_counter() - t0) / long_clip.shape[2] * 1000
     drift = (rolled - ref).abs().max().item()
     return {
         "norm": norm,
