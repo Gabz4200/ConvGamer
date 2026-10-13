@@ -13,7 +13,7 @@
 # Regularization = extra entries in video_dataset_ids (no separate plumbing).
 
 mode: fixture            # fixture (offline smoke) | video | mixed
-batch_size: 8            # per-GPU; effective = 8 × 2 (T4) = 16
+batch_size: 8            # per-GPU; effective = 8 × 2 (devices) × 2 (accum) = 32
 num_workers: 4
 num_frames: 16           # T — V-JEPA 2.1 App A clip length
 height: 144

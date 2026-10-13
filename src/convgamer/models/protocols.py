@@ -23,6 +23,9 @@ __all__ = ["DenseFeatureEncoder"]
 class DenseFeatureEncoder(Protocol):
     """A video backbone usable as the JEPA context/target encoder.
 
+    Static-only seam: not ``runtime_checkable``, so ``isinstance`` checks
+    are unsupported — type checkers enforce conformance instead.
+
     Required by ``ConvGamerVJEPAModel`` and ``EMAEncoder``:
 
     - ``forward_feature_maps`` produces the level pyramid that the
@@ -42,6 +45,8 @@ class DenseFeatureEncoder(Protocol):
         ...
 
     def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]: ...
+
+    def buffers(self, recurse: bool = True) -> Iterator[torch.Tensor]: ...
 
     def state_dict(self, *args: Any, **kwargs: Any) -> Any: ...
 

@@ -14,7 +14,9 @@ from torch.nn.init import trunc_normal_
 class InceptionDWConv2d(nn.Module):
     """Decomposed depthwise convolution from InceptionNeXt.
 
-    Splits the input channels into four groups:
+    Splits the input channels into four groups (exact 1/8 ratios when
+    ``in_channels`` is divisible by 8; otherwise the identity branch takes
+    the remainder):
       * 1/8  -> 3x3 square kernel
       * 1/8  -> 1 x band (horizontal band)
       * 1/8  -> band x 1 (vertical band)
@@ -103,6 +105,8 @@ class InceptionNeXtBlock(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, in_channels),
         )
+        if layer_scale_init < 0:
+            raise ValueError(f"layer_scale_init must be >= 0, got {layer_scale_init}")
         self.gamma = (
             nn.Parameter(layer_scale_init * torch.ones(in_channels))
             if layer_scale_init > 0

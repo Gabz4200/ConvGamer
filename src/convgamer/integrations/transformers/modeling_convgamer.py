@@ -22,11 +22,14 @@ class ConvGamerImageModel(PreTrainedModel):
 
     def __init__(self, config: ConvGamerImageConfig):
         super().__init__(config)
+        num_layers = (
+            tuple(config.num_layers) if isinstance(config.num_layers, list) else config.num_layers
+        )
         self.native = get_model(
             "InceptionNeXtEncoder",
             input_dim=config.input_dim,
             hidden_dim=config.hidden_dim,
-            num_layers=config.num_layers,
+            num_layers=num_layers,
             num_classes=config.num_classes,
             layer_scale_init=config.layer_scale_init,
             mlp_ratios=tuple(config.mlp_ratios),
@@ -41,7 +44,9 @@ class ConvGamerImageModel(PreTrainedModel):
         return_dict: bool | None = None,
         **kwargs,
     ) -> BaseModelOutput | tuple:
-        """Encode images; returns logits with a head, pooled features headless."""
+        """Encode images; returns pooled features (or logits with a head)."""
+        if kwargs:
+            raise TypeError(f"Unexpected kwargs: {sorted(kwargs)}")
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         hidden = (
             inputs_embeds

@@ -19,6 +19,28 @@ __all__ = ["EMAUpdateCallback"]
 class EMAUpdateCallback(pl.Callback):
     """Update the JEPA target encoder after each optimizer step."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_step: int = -1
+
+    def on_before_zero_grad(
+        self,
+        trainer: pl.Trainer | None,
+        pl_module: pl.LightningModule,
+        optimizer,
+    ) -> None:
+        step = int(getattr(trainer, "global_step", -1)) if trainer is not None else -1
+        if step == self._last_step:
+            return
+        self._last_step = step
+        ema_encoder = getattr(pl_module, "ema_encoder", None)
+        if ema_encoder is None:
+            raise AttributeError(
+                f"{type(pl_module).__name__} has no 'ema_encoder'; "
+                "EMAUpdateCallback requires a module exposing ema_encoder.update()"
+            )
+        ema_encoder.update()
+
     def on_train_batch_end(
         self,
         trainer: pl.Trainer | None,
@@ -28,6 +50,14 @@ class EMAUpdateCallback(pl.Callback):
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> None:
+        # Back-compat for trainers that never call on_before_zero_grad
+        # (e.g. manual optimization): fall back only if no optimizer step ran.
+        if trainer is not None and getattr(trainer, "global_step", -1) == self._last_step:
+            return
+        # If gradient accumulation is active, batch-end fires per micro-batch;
+        # the on_before_zero_grad hook above already handles the true step.
+        if trainer is not None and getattr(trainer, "accumulate_grad_batches", 1) != 1:
+            return
         ema_encoder = getattr(pl_module, "ema_encoder", None)
         if ema_encoder is None:
             raise AttributeError(

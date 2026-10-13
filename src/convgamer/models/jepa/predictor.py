@@ -111,9 +111,10 @@ class VJEPAPredictor(nn.Module):
 
         mask_resized = resize_token_mask(mask, (ft, fh, fw))
 
-        # Inject the (shared) mask token at masked positions.
-        mask_b = mask_resized.unsqueeze(1).expand(-1, self.predictor_dim, ft, fh, fw)
-        h = torch.where(mask_b, self.mask_token.view(1, -1, 1, 1, 1), h)
+        # Inject the (shared) mask token at masked positions. The singleton
+        # dim broadcasts — never materialize a full B×D×T×H×W mask.
+        mask_key = mask_resized.unsqueeze(1)  # (B, 1, T, H, W)
+        h = torch.where(mask_key, self.mask_token.view(1, -1, 1, 1, 1), h)
 
         for blk in self.blocks:
             h = blk(h)

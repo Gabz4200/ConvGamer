@@ -39,7 +39,7 @@ pip install -e '.[cu124]'
 # Train InceptionNeXt image classification (default config)
 uv run train model=inception_next data=default trainer=default
 
-# Train V-JEPA ConvGamer — all four groups must be selected together
+# Train V-JEPA ConvGamer — model=jepa needs data=jepa and vice versa
 uv run train model=jepa data=jepa trainer=jepa optimizer=jepa
 
 # Smoke run (forces max_epochs=1 via cfg.fast_dev_run)
@@ -50,7 +50,7 @@ uv run eval +eval.checkpoint=/path/to/checkpoint.ckpt
 
 # Export to Hugging Face format (argparse CLI)
 uv run export-hf --checkpoint /path/to/checkpoint.ckpt --output-dir /path/to/output --ckpt-kind video
-# --ckpt-kind is video|image
+# --ckpt-kind is video|image|jepa
 ```
 
 **Configuration:** Hydra configs live in `configs/`. Groups: `model`, `optimizer`, `data`, `trainer`. Default composition is `configs/config.yaml` (`model=inception_next`, `optimizer=adamw`, `data=default`, `trainer=default`, plus `fast_dev_run: false`, `seed: 42`). There is **no** `experiment`, `debug`, or `ops` group.
@@ -75,7 +75,7 @@ uv run pytest -k "test_encoder" -v
 
 **Test structure:**
 - `tests/models/` — model behavior (architecture, shapes, forward pass, JEPA loss/predictor, causal/streaming parity)
-- `tests/data/` — dataset and Oklab behavior
+- `tests/data/` — dataset and ImageNet-standardized RGB behavior
 - `tests/test_wiring_seams.py` — script dispatch, trainer factory, datamodule wiring
 - `tests/test_shared_seams.py` — registry and callback seams
 

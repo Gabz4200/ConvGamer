@@ -52,7 +52,14 @@ class ClassificationLightningModule(pl.LightningModule):
         )
 
     def _step(self, batch, stage: str) -> torch.Tensor:
-        x, y = batch
+        try:
+            x, y = batch
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"BackboneClassifier expects (x, y) pairs; got batch of type "
+                f"{type(batch).__name__} (for (context, target, mask) triplets use "
+                f"ConvGamerVJEPAModel): {e}"
+            ) from e
         loss, acc = _cls_metrics(self(x), y)
         self.log(f"{stage}/loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log(f"{stage}/acc", acc, prog_bar=True, on_step=False, on_epoch=True)
@@ -124,8 +131,15 @@ class ClassificationLightningModule(pl.LightningModule):
 
 
 def _load_model_metadata(checkpoint_path: Any) -> dict[str, Any]:
-    """Return a mutable copy of the ``model`` hyper-parameter mapping."""
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    """Return a mutable copy of the ``model`` hyper-parameter mapping.
+
+    Trusted checkpoints only: Lightning stores non-tensor hparams that
+    require ``weights_only=False`` to read.
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     hyper_parameters = checkpoint.get("hyper_parameters") or {}
     model_kwargs = hyper_parameters.get("model", {}) if isinstance(hyper_parameters, dict) else {}
     return dict(model_kwargs)

@@ -19,6 +19,7 @@ O(1) in the sequence length. Training always uses the parallel ``forward``.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 
 import einops
 import torch
@@ -73,7 +74,7 @@ class ConvGamerEncoder(nn.Module):
         self,
         input_dim: int = 3,
         hidden_dim: int = 96,
-        num_layers: int | tuple[int, ...] = 3,
+        num_layers: int | Sequence[int] = 3,
         num_classes: int | None = None,
         layer_scale_init: float = 1e-6,
         mlp_ratios: tuple[int, int, int, int] = (4, 4, 4, 3),
@@ -108,11 +109,7 @@ class ConvGamerEncoder(nn.Module):
             mlp_ratios=mlp_ratios,
             widths=widths,
         )
-        stage_dims = (
-            tuple(widths)
-            if widths is not None
-            else (hidden_dim, hidden_dim * 2, hidden_dim * 4, hidden_dim * 8)
-        )
+        stage_dims = tuple(self.frame_encoder.stage_widths)
         self.level_projs = nn.ModuleList(
             [nn.Conv3d(d, level_dim, kernel_size=1) for d in stage_dims]
         )
@@ -123,11 +120,12 @@ class ConvGamerEncoder(nn.Module):
             nn.GELU(),
             nn.Conv3d(level_dim, level_dim, kernel_size=1),
         )
-        for m in list(self.level_projs) + list(self.level_fuse):
-            if isinstance(m, nn.Conv3d):
-                trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        for container in (self.level_projs, self.level_fuse):
+            for m in container.modules():
+                if isinstance(m, nn.Conv3d):
+                    trunc_normal_(m.weight, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
         # Foundation-model seam: no classification head by default.
         # Callers may attach one later via ``add_classification_head``.
         if num_classes is not None and num_classes > 0:
@@ -144,7 +142,19 @@ class ConvGamerEncoder(nn.Module):
 
     def add_classification_head(self, num_classes: int) -> None:
         """Attach a classification head after foundation pre-training."""
-        self.head = nn.Linear(self.level_dim, num_classes)
+        if not isinstance(num_classes, int) or isinstance(num_classes, bool) or num_classes <= 0:
+            raise ValueError(f"num_classes must be a positive int, got {num_classes}")
+        if not isinstance(self.head, nn.Identity):
+            warnings.warn(
+                "Overwriting existing classification head.",
+                UserWarning,
+                stacklevel=2,
+            )
+        head = nn.Linear(self.level_dim, num_classes)
+        trunc_normal_(head.weight, std=0.02)
+        if head.bias is not None:
+            nn.init.zeros_(head.bias)
+        self.head = head
 
     @property
     def history_frames(self) -> int:
@@ -154,18 +164,12 @@ class ConvGamerEncoder(nn.Module):
     @property
     def _correction_history(self) -> int:
         """Downsampler correction window (temporal extent of its conv)."""
-        return self.downsampler.correction_conv.temporal_extent
+        return self.downsampler.history_frames
 
     @property
     def _stem_history(self) -> int:
         """Stem window (max temporal extent of the branch convs)."""
-        stem = self.spatial_stem
-        return max(
-            stem.near_conv.temporal_extent,
-            stem.local_conv.temporal_extent,
-            stem.far_conv.temporal_extent,
-            stem.fuse_conv.temporal_extent,
-        )
+        return self.spatial_stem.history_frames
 
     def _encode_projected(self, x: torch.Tensor) -> torch.Tensor:
         """Stem -> per-frame stage taps -> per-level projection.
@@ -244,14 +248,14 @@ class ConvGamerEncoder(nn.Module):
         dev = ref.device if device is None else device
         dt = ref.dtype if dtype is None else dtype
         h_out, w_out = self.downsampler.resolve_spatial_size(height, width)
-        fe_h = max(1, h_out // 4)
-        fe_w = max(1, w_out // 4)
+        stride = self.frame_encoder.stem.stride
+        s_h, s_w = (stride[0], stride[1]) if isinstance(stride, tuple) else (stride, stride)
+        fe_h = max(1, (h_out + s_h - 1) // s_h)
+        fe_w = max(1, (w_out + s_w - 1) // s_w)
         base_ch = self.downsampler.out_channels
-        # The down cache holds post-downsampler frames (same width as base).
-        down_ch = base_ch
         return StreamCache(
             base=torch.zeros(batch_size, base_ch, 0, h_out, w_out, device=dev, dtype=dt),
-            down=torch.zeros(batch_size, down_ch, 0, h_out, w_out, device=dev, dtype=dt),
+            down=torch.zeros(batch_size, base_ch, 0, h_out, w_out, device=dev, dtype=dt),
             levels=torch.zeros(
                 batch_size,
                 NUM_LEVELS,
@@ -278,6 +282,8 @@ class ConvGamerEncoder(nn.Module):
         Each stage replays its stateless ``forward`` over its fixed cache
         window, so the output matches ``forward()`` on the same prefix.
         """
+        if x_t.ndim != 4:
+            raise ValueError(f"Expected 4D frame (B, C, H, W), got shape {x_t.shape}")
         ds = self.downsampler
         kb, ks, km = self._correction_history, self._stem_history, self.history_frames
 
@@ -285,14 +291,16 @@ class ConvGamerEncoder(nn.Module):
         # over its window; take the last frame to match forward().
         base_cur = ds.patch_embed(x_t.unsqueeze(2))
         base_win = torch.cat([state.base, base_cur], dim=2)[:, :, -kb - 1 :]
-        assert base_win.shape[2] <= kb + 1
+        if base_win.shape[2] > kb + 1:
+            raise ValueError(f"base cache window {base_win.shape[2]} exceeds bound {kb + 1}")
         correct = ds.act(ds.correction_conv(base_win))
         # Per-location norm: last-frame application matches forward() exactly.
         down_cur = ds.norm(base_cur + ds.out_correction_conv(correct)[:, :, -1:])
 
         # Stem: replayed over its window; take the last frame.
         down_win = torch.cat([state.down, down_cur], dim=2)[:, :, -ks - 1 :]
-        assert down_win.shape[2] <= ks + 1
+        if down_win.shape[2] > ks + 1:
+            raise ValueError(f"down cache window {down_win.shape[2]} exceeds bound {ks + 1}")
         stem_cur = self.spatial_stem(down_win)[:, :, -1:]
 
         # Per-frame stage taps + projection (no temporal mixing yet).
@@ -307,7 +315,8 @@ class ConvGamerEncoder(nn.Module):
             dim=1,
         )
         lvl_win = torch.cat([state.levels, proj_cur], dim=3)[:, :, :, -km - 1 :]
-        assert lvl_win.shape[3] <= km + 1
+        if lvl_win.shape[3] > km + 1:
+            raise ValueError(f"level cache window {lvl_win.shape[3]} exceeds bound {km + 1}")
         mixed = self._mix_levels(lvl_win)[:, :, :, -1:]
         fused = self.fuse_pyramid(mixed)
         # Spatial mean over (H, W): (B, P, 1).
@@ -326,8 +335,8 @@ class ConvGamerEncoder(nn.Module):
             features=features,
             logits=logits,
             new_state=StreamCache(
-                base=base_win[:, :, -kb:].detach(),
-                down=down_win[:, :, -ks:].detach(),
+                base=base_win[:, :, -kb:].detach() if kb else base_win[:, :, :0].detach(),
+                down=down_win[:, :, -ks:].detach() if ks else down_win[:, :, :0].detach(),
                 levels=lvl_win[:, :, :, -km:].detach() if km else lvl_win[:, :, :, :0].detach(),
                 count=count,
                 cumsum=cumsum,

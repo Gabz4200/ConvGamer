@@ -8,3 +8,11 @@ precision: "32-true"
 log_every_n_steps: 10
 callbacks:
   - model_checkpoint
+
+# Lightning LR finder (opt-in): +trainer.lr_finder.enabled=true
+lr_finder:
+  enabled: false
+  min_lr: 1.0e-6
+  max_lr: 1.0e-2
+  num_training: 100
+  mode: exponential

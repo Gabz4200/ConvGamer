@@ -14,7 +14,25 @@ def _looks_like_hf_id(item: str) -> bool:
         return False
     if item.endswith((".mp4", ".jpg", ".jpeg", ".png")):
         return False
-    return "/" in item
+    if item.startswith((".", "/", "~", "data/")) or "\\" in item:
+        # Local relative/absolute paths and the repo's own data/ tree are
+        # never HF ids (e.g. "data/videos" must glob locally, not download).
+        return False
+    parts = [p for p in item.split("/") if p not in ("", ".", "..")]
+    return len(parts) == 2
+
+
+def _shard_for_distributed(paths: list[str]) -> list[str]:
+    """Shard ``paths`` across DDP ranks (no-op outside distributed)."""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank, world = dist.get_rank(), dist.get_world_size()
+            return paths[rank::world]
+    except Exception:
+        pass
+    return paths
 
 
 def _resolve_video_paths(
@@ -42,6 +60,7 @@ def _resolve_video_paths(
             paths.extend(_expand_archive_globs(local_dir, recursive=True))
         else:
             paths.extend(_expand_archive_globs(item, recursive=True))
+    paths = _shard_for_distributed(paths)
     if num_workers > 1:
         paths = paths[worker_id::num_workers]
     return paths
@@ -73,17 +92,29 @@ def _expand_archive_globs(pattern: str, recursive: bool = True) -> list[str]:
 
 def _extract_archive(archive_path: str) -> list[str]:
     """Extract ``.tar``/``.zip`` to a sibling cache dir and return MP4 paths."""
+    from pathlib import Path
+
     extract_dir = archive_path + ".extracted"
     os.makedirs(extract_dir, exist_ok=True)
+    root = Path(extract_dir).resolve()
     if archive_path.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as zf:
+            for member in zf.namelist():
+                dest = (root / member).resolve()
+                if not dest.is_relative_to(root):
+                    raise ValueError(f"unsafe zip member: {member!r}")
             zf.extractall(extract_dir)
     else:
         # tarfile auto-detects compression (.tar, .tar.gz, .tgz).
         with tarfile.open(archive_path, mode="r:*") as tf:
+            for member in tf.getmembers():
+                dest = (root / member.name).resolve()
+                if not dest.is_relative_to(root):
+                    raise ValueError(f"unsafe tar member: {member.name!r}")
             try:
                 tf.extractall(extract_dir, filter="data")
             except TypeError:
+                # Older Python without filter=: members already validated above.
                 tf.extractall(extract_dir)
     return sorted(glob.glob(os.path.join(extract_dir, "**", "*.mp4"), recursive=True))
 
@@ -115,6 +146,7 @@ def _resolve_image_paths(
             )
         else:
             paths.extend(sorted(glob.glob(item, recursive=True)))
+    paths = _shard_for_distributed(paths)
     if num_workers > 1:
         paths = paths[worker_id::num_workers]
     return paths

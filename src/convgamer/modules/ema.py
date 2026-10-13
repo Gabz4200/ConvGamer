@@ -27,6 +27,10 @@ class EMAEncoder(Generic[EncoderT]):  # noqa: UP046
     and the checker — not by a runtime ``getattr`` probe — guarantees the shadow
     exposes ``forward_feature_maps``.
 
+    Plain (non-module) holder so the optimizer never sees the shadow; device
+    moves are forwarded explicitly via :meth:`to` and the Lightning module's
+    ``transfer_batch_to_device`` hook. Buffers are synced alongside parameters.
+
     Usage::
 
         ema = EMAEncoder(encoder, decay=0.99925)
@@ -38,18 +42,40 @@ class EMAEncoder(Generic[EncoderT]):  # noqa: UP046
     def __init__(self, module: EncoderT, decay: float = 0.99925):
         self.module: EncoderT = module
         self.decay = decay
-        self.shadow_module: EncoderT = cast(EncoderT, copy.deepcopy(module).eval())
+        shadow = copy.deepcopy(module).eval()
+        for p in shadow.parameters():
+            p.requires_grad_(False)
+        self.shadow_module: EncoderT = cast(EncoderT, shadow)
         self.shadow_params = list(self.shadow_module.parameters())
 
     @torch.no_grad()
     def update(self) -> None:
         ema_d = self.decay
-        for s_param, param in zip(self.shadow_params, self.module.parameters(), strict=True):
-            if param.requires_grad:
-                s_param.mul_(ema_d).add_(param.data, alpha=1 - ema_d)
+        online_params = list(self.module.parameters())
+        if len(online_params) != len(self.shadow_params):
+            raise ValueError(
+                f"EMA param count mismatch: shadow has {len(self.shadow_params)}, "
+                f"online has {len(online_params)} (did the head change post-construction?)"
+            )
+        for s_param, param in zip(self.shadow_params, online_params, strict=True):
+            s_param.mul_(ema_d).add_(param.data, alpha=1 - ema_d)
+        try:
+            for s_buf, buf in zip(self.shadow_module.buffers(), self.module.buffers(), strict=True):
+                s_buf.copy_(buf)
+        except ValueError as e:
+            raise ValueError(f"EMA buffer mismatch: {e}") from e
+
+    def to(self, *args: Any, **kwargs: Any) -> EMAEncoder[EncoderT]:
+        self.shadow_module.to(*args, **kwargs)
+        return self
+
+    def eval(self) -> EMAEncoder[EncoderT]:
+        self.shadow_module.eval()
+        return self
 
     def state_dict(self) -> Any:
         return self.shadow_module.state_dict()
 
     def load_state_dict(self, state_dict: Any) -> None:
         self.shadow_module.load_state_dict(state_dict)
+        self.shadow_params = list(self.shadow_module.parameters())

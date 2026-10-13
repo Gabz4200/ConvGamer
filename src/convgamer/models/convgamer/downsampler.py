@@ -82,7 +82,12 @@ class LearnedSpatialTemporalDownsampler(nn.Module):
     def resolve_spatial_size(self, h: int, w: int) -> tuple[int, int]:
         """Output spatial dims of the strided patch embed for an ``h, w`` input."""
         p = self.patch_size
-        return (max(1, (h - p) // p + 1), max(1, (w - p) // p + 1))
+        return (max(1, (h + p - 1) // p), max(1, (w + p - 1) // p))
+
+    @property
+    def history_frames(self) -> int:
+        """Past frames needed alongside the current one for streaming."""
+        return self.correction_conv.temporal_extent
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W) — temporal dim preserved, spatial downsampled only

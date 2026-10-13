@@ -1,9 +1,9 @@
 # V-JEPA 2.1 trainer config — 2x T4 setup
 target: pytorch_lightning.Trainer
 
-accelerator: cuda
-devices: 2
-strategy: ddp
+accelerator: auto  # cuda on the 2x T4 host, cpu elsewhere
+devices: auto     # both T4s when present (DDP below), 1 otherwise
+strategy: auto    # DDP for multi-GPU, single-process otherwise
 precision: "16-mixed"          # FP16 for T4 (no BF16)
 log_every_n_steps: 20
 max_steps: 135000              # Primary phase (Appendix A)
@@ -13,10 +13,21 @@ accumulate_grad_batches: 2     # Effective batch: 8 * 2 * 2 = 32; also aggregate
                               # one video + one image batch per step in mixed mode
                               # (mirrors V-JEPA 2.1 App A per-modality aggregation)
 gradient_clip_val: 1.0
+benchmark: true  # cudnn autotune; inputs are fixed 144x256 so shapes are stable
 
-# Callbacks (built by convgamer.training.engine._build_callback)
+# Lightning LR finder (opt-in): uv run train ... +trainer.lr_finder.enabled=true
+# Suggestion is written back to model.lr before fit; weights are restored.
+lr_finder:
+  enabled: false
+  min_lr: 1.0e-6
+  max_lr: 1.0e-2
+  num_training: 100
+  mode: exponential
+
+# Callbacks (built by convgamer.training.engine._build_callback).
+# Note: checkpoint_callback below replaces the lazy model_checkpoint —
+# engine drops the duplicate so only one ModelCheckpoint is active.
 callbacks:
-  - model_checkpoint
   - ema_update
   - lr_monitor
   - timer

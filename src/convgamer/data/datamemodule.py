@@ -6,7 +6,7 @@ import torch
 import torchvision.transforms.functional as TF
 from torch.utils.data import DataLoader, Dataset
 
-from .dataset import FixtureFrameDataset, _load_fixture_clip
+from .dataset import FixtureFrameDataset, _load_fixture_clip, _normalize_rgb
 
 
 class FixtureVideoDataset(Dataset):
@@ -25,9 +25,11 @@ class FixtureVideoDataset(Dataset):
             raise ValueError(f"fixture has {tf} frames, need >= {num_frames}")
         clips = clip[:, : groups * num_frames].reshape(3, groups, num_frames, *clip.shape[2:])
         clips = einops.rearrange(clips, "c g t h w -> g c t h w")
-        self.clips = torch.stack(
+        resized = torch.stack(
             [torch.stack([TF.resize(f, [size, size]) for f in clip]) for clip in clips]
         )
+        # Match GameVideoDataset: ImageNet-standardized inputs.
+        self.clips = _normalize_rgb(resized, dim=1)
         self.num_classes = num_classes
 
     def __len__(self) -> int:

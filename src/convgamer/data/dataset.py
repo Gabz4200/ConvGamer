@@ -14,6 +14,7 @@ from pathlib import Path
 import einops
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
 from decord import VideoReader as _DecordVideoReader
 from decord import cpu as _decord_cpu
 from PIL import Image
@@ -47,8 +48,6 @@ def fixture_path() -> Path:
 
 def _resize_video_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if frames.shape[-2:] != (height, width):
-        import torchvision.transforms.functional as TF
-
         frames = torch.stack([TF.resize(f, [height, width]) for f in frames])
     return frames
 
@@ -74,12 +73,15 @@ def _normalize_rgb(y: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 def _mask_video_clip(y: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask ``y`` (T, C, H, W), standardize RGB, return (x, y) as (C, T, H, W)."""
+    """Mask ``y`` (T, C, H, W), standardize RGB, return (x, y) as (C, T, H, W).
+
+    Masking happens *after* ImageNet normalization with the channel mean
+    (0.0 post-norm) so masked tokens are neutral, not a constant outlier.
+    """
+    y = _normalize_rgb(y, dim=1)
     x = y.clone()
     c = y.shape[1]
     x[mask.unsqueeze(1).expand(-1, c, -1, -1)] = 0.0
-    y = _normalize_rgb(y, dim=1)
-    x = _normalize_rgb(x, dim=1)
     y = einops.rearrange(y, "t c h w -> c t h w")
     x = einops.rearrange(x, "t c h w -> c t h w")
     return x, y
@@ -107,6 +109,7 @@ class FixtureClipDataset(IterableDataset):
         mask_ratio: float = 0.25,
         repeats: int = 8,
         fixture: Path | None = None,
+        base_seed: int = 0,
     ):
         self.num_frames = num_frames
         self.height = height
@@ -114,6 +117,7 @@ class FixtureClipDataset(IterableDataset):
         self.mask_ratio = mask_ratio
         self.repeats = repeats
         self.fixture = fixture
+        self.base_seed = base_seed
 
     def __len__(self) -> int:
         return self.repeats
@@ -129,8 +133,15 @@ class FixtureClipDataset(IterableDataset):
         frames = einops.rearrange(frames, "c t h w -> t c h w")
         frames = _resize_video_frames(frames, self.height, self.width)
         for n in range(self.repeats):
+            # Per-sample seed varies per epoch via base_seed so masks
+            # don't freeze across epochs when the loader is re-iterated
+            # with a new base_seed.
             mask = multiblock_mask_3d(
-                self.num_frames, self.height, self.width, self.mask_ratio, seed=n
+                self.num_frames,
+                self.height,
+                self.width,
+                self.mask_ratio,
+                seed=self.base_seed + n,
             )
             x, y = _mask_video_clip(frames, mask)
             yield x, y, mask
@@ -151,7 +162,7 @@ class FixtureFrameDataset(Dataset):
     ):
         clip = _load_fixture_clip(fixture)  # (C, Tf, Hf, Wf)
         frames = einops.rearrange(clip, "c t h w -> t c h w")
-        self.frames = _resize_video_frames(frames, size, size)
+        self.frames = _normalize_rgb(_resize_video_frames(frames, size, size), dim=1)
         self.num_classes = num_classes
 
     def __len__(self) -> int:
@@ -207,20 +218,21 @@ class GameVideoDataset(IterableDataset):
         total = min(total, self.max_frames)
 
         if total < self.num_frames * self.sample_stride:
-            # Pad by repeating last frame if clip too short
-            start, stride = 0, 1
+            # Short clip: wrap around instead of repeating the last frame
+            # (avoids a static temporal edge the causal TCN could overfit).
+            stride = 1
+            indices = [(i % total) for i in range(self.num_frames)]
         else:
             stride = self.sample_stride
             span = total - self.num_frames * stride
             start = torch.randint(0, span, (1,)).item() if span > 0 else 0
-
-        indices = list(
-            range(int(start), min(int(start) + self.num_frames * stride, total), int(stride))
-        )
-        # Pad if needed
-        if len(indices) < self.num_frames:
-            indices += [indices[-1]] * (self.num_frames - len(indices))
-        indices = indices[: self.num_frames]
+            indices = list(
+                range(int(start), min(int(start) + self.num_frames * stride, total), int(stride))
+            )
+            # Pad if needed
+            if len(indices) < self.num_frames:
+                indices += [indices[-1]] * (self.num_frames - len(indices))
+            indices = indices[: self.num_frames]
 
         frames = vr.get_batch(indices).asnumpy()  # (T, H, W, C) uint8 from decord
         frames = torch.from_numpy(frames)
@@ -233,6 +245,10 @@ class GameVideoDataset(IterableDataset):
     def __iter__(self):
         logger = logging.getLogger(__name__)
         worker_id, num_workers = _worker_info()
+        # NOTE: path resolution/download runs per DataLoader worker. For
+        # large-scale runs prefer resolving in DataModule.setup() (main
+        # process) and passing resolved paths in; the per-worker call here
+        # keeps the dataset self-contained for smoke/standalone use.
         resolved = _resolve_video_paths(
             self.video_paths,
             data_dir=self.data_dir,
@@ -246,7 +262,11 @@ class GameVideoDataset(IterableDataset):
                 logger.warning("Skipping unreadable video %s (%s)", path, error)
                 continue
 
-            mask = multiblock_mask_3d(self.num_frames, self.height, self.width, self.mask_ratio)
+            # Deterministic per-worker stream under seed_everything(workers=True).
+            seed = int(torch.initial_seed() % (2**31)) + hash(path) % (2**16)
+            mask = multiblock_mask_3d(
+                self.num_frames, self.height, self.width, self.mask_ratio, seed=seed
+            )
             x, y = _mask_video_clip(y, mask)
 
             # (C, T, H, W)
@@ -309,13 +329,12 @@ class GameImageDataset(IterableDataset):
             # Inject dummy temporal axis: (C, 1, H, W)
             y = img.unsqueeze(1)  # (C, 1, H, W)
 
-            mask = multiblock_mask_3d(1, self.size, self.size, self.mask_ratio)
+            seed = int(torch.initial_seed() % (2**31)) + hash(path) % (2**16)
+            mask = multiblock_mask_3d(1, self.size, self.size, self.mask_ratio, seed=seed)
+            # Mask after normalization with the mean (0.0 post-norm).
+            y = _normalize_rgb(y, dim=0)
             x = y.clone()
             # y is (C, 1, H, W); mask is (T=1, H, W) -> align on (C, T) dims.
             x[mask.unsqueeze(0).expand_as(y)] = 0.0
-
-            # Single sample (C, T, H, W): channel lives at dim 0.
-            y = _normalize_rgb(y, dim=0)
-            x = _normalize_rgb(x, dim=0)
 
             yield x, y, mask

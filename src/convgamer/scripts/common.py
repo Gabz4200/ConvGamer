@@ -37,12 +37,9 @@ def _backbone_kwargs_for_checkpoint(target: str, params: dict[str, Any]) -> dict
     from Hydra are normalized to tuples.
     """
     kwargs = {"target": target, **params}
-    if isinstance(kwargs.get("num_layers"), list):
-        kwargs["num_layers"] = tuple(kwargs["num_layers"])
-    if isinstance(kwargs.get("temporal_dilations"), list):
-        kwargs["temporal_dilations"] = tuple(kwargs["temporal_dilations"])
-    if isinstance(kwargs.get("mlp_ratios"), list):
-        kwargs["mlp_ratios"] = tuple(kwargs["mlp_ratios"])
+    for key in ("num_layers", "temporal_dilations", "mlp_ratios", "widths"):
+        if isinstance(kwargs.get(key), list):
+            kwargs[key] = tuple(kwargs[key])
     return kwargs
 
 
@@ -51,6 +48,7 @@ def _build_jepa_model(cfg: DictConfig) -> ConvGamerVJEPAModel:
     encoder = instantiate(cfg.model.encoder)
     predictor = instantiate(cfg.model.predictor)
     loss_fn = instantiate(cfg.model.loss)
+    betas = tuple(cfg.optimizer.get("betas", [0.9, 0.999]))
     return ConvGamerVJEPAModel(
         encoder=encoder,
         predictor=predictor,
@@ -60,6 +58,7 @@ def _build_jepa_model(cfg: DictConfig) -> ConvGamerVJEPAModel:
         weight_decay=cfg.optimizer.weight_decay,
         warmup_steps=cfg.model.get("warmup_steps", 12000),
         total_steps=cfg.model.get("total_steps", 135000),
+        betas=(float(betas[0]), float(betas[1])),
     )
 
 
@@ -152,15 +151,16 @@ def build_datamodule(
 def _build_jepa_datamodule(
     cfg: DictConfig, *, num_workers: int | None = None
 ) -> VJEPAGamingDataModule:
-    mode = cfg.data.get("mode", "fixture")
-    workers = cfg.data.num_workers if num_workers is None else num_workers
+    data = cfg.data
+    mode = data.get("mode", "fixture")
+    workers = data.get("num_workers", 4) if num_workers is None else num_workers
     shared = {
-        "batch_size": cfg.data.batch_size,
+        "batch_size": data.get("batch_size", 8),
         "num_workers": workers,
-        "num_frames": cfg.data.num_frames,
-        "height": cfg.data.height,
-        "width": cfg.data.width,
-        "mask_ratio": cfg.data.mask_ratio,
+        "num_frames": data.get("num_frames", 16),
+        "height": data.get("height", 144),
+        "width": data.get("width", 256),
+        "mask_ratio": data.get("mask_ratio", 0.25),
     }
     if mode == "fixture":
         return VJEPAGamingDataModule(**shared, mode=mode)

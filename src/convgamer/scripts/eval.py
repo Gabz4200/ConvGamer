@@ -18,7 +18,6 @@ from .common import (
     CONFIG_DIR,
     build_backbone,
     build_datamodule,
-    build_model,
 )
 
 
@@ -26,18 +25,23 @@ from .common import (
 def main(cfg: DictConfig) -> None:
     target = str(cfg.model.get("target", ""))
     if target == _JEPA_TARGET:
-        model = build_model(cfg)
+        if not hasattr(cfg, "eval") or getattr(cfg.eval, "checkpoint", None) is None:
+            raise ValueError("JEPA eval requires +eval.checkpoint=<path>")
+        from convgamer.modules.jepa_module import ConvGamerVJEPAModel
+
+        ckpt = Path(str(cfg.eval.checkpoint))
+        if not ckpt.exists():
+            raise FileNotFoundError(f"eval checkpoint missing: {ckpt}")
+        model = ConvGamerVJEPAModel.load_from_checkpoint(str(ckpt))
     else:
         # Rebuild the pure backbone from the config, then either inject it
         # straight into its system wrapper or hand it to load_from_checkpoint
         # (whose stored hyper-parameters fill lr/weight_decay/model_kwargs).
         backbone = build_backbone(cfg)
-        ckpt = Path(cfg.eval.checkpoint) if hasattr(cfg, "eval") else None
-        model = (
-            BackboneClassifier.load_from_checkpoint(str(ckpt), model=backbone)
-            if ckpt is not None and ckpt.exists()
-            else build_model(cfg)
-        )
+        ckpt = Path(str(cfg.eval.checkpoint)) if hasattr(cfg, "eval") else None
+        if ckpt is None or not ckpt.exists():
+            raise FileNotFoundError(f"eval checkpoint missing: {ckpt}")
+        model = BackboneClassifier.load_from_checkpoint(str(ckpt), model=backbone)
     datamodule = build_datamodule(cfg, num_workers=0)
     trainer = create_trainer(cfg)
     trainer.test(model, datamodule=datamodule)

@@ -1,4 +1,8 @@
-"""Shared token-mask utilities for the JEPA predictor and loss."""
+"""Shared token-mask utilities for the JEPA predictor and loss.
+
+See also :mod:`convgamer.data.masking` (multi-block mask *sampling* at data
+time) — this module only *resizes* an existing boolean token mask.
+"""
 
 from __future__ import annotations
 
@@ -18,4 +22,6 @@ def resize_token_mask(mask: torch.Tensor, size: tuple[int, int, int]) -> torch.T
         raise ValueError(f"Expected 4D mask (B, T, H, W), got {mask.ndim}D")
     if mask.dtype != torch.bool:
         raise ValueError(f"Expected bool mask, got {mask.dtype}")
+    if any(s <= 0 for s in size):
+        raise ValueError(f"Target size must be positive, got {size}")
     return F.interpolate(mask.float().unsqueeze(1), size=size, mode="nearest").bool().squeeze(1)

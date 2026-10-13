@@ -24,7 +24,6 @@ dependencies = [
     "huggingface-hub>=0.25.0",
     "einops>=0.8.2",
     "decord>=0.6.0",
-    "datasets>=5.0.1",
 ]
 
 [project.optional-dependencies]
@@ -95,4 +94,3 @@ report-error-codes = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v"

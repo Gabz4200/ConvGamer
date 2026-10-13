@@ -4,9 +4,14 @@ Masks are unions of random 3D (time × height × width) blocks sampled until
 the masked fraction reaches ``mask_ratio`` — block structure at token
 resolution, never iid per-pixel noise. Masking is strictly a train-time
 data-layer augmentation; the encoder and streaming path never see masks.
+
+See also :mod:`convgamer.models.jepa.masking` (nearest *resize* of an
+existing token mask for the predictor/loss) — this module *samples* masks.
 """
 
 from __future__ import annotations
+
+import logging
 
 import torch
 
@@ -53,4 +58,13 @@ def multiblock_mask_3d(
         h0 = int(torch.randint(0, height - bh + 1, (1,), generator=g).item())
         w0 = int(torch.randint(0, width - bw + 1, (1,), generator=g).item())
         mask[t0 : t0 + bt, h0 : h0 + bh, w0 : w0 + bw] = True
+    coverage = mask.sum().item() / mask.numel()
+    if guard >= 64 and coverage < mask_ratio:
+        logging.getLogger(__name__).warning(
+            "multiblock_mask_3d guard exhausted at %.3f < target %.3f", coverage, mask_ratio
+        )
+    elif coverage > mask_ratio + 0.05:
+        logging.getLogger(__name__).warning(
+            "multiblock_mask_3d overshot target: %.3f vs %.3f", coverage, mask_ratio
+        )
     return mask

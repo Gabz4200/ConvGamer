@@ -74,14 +74,14 @@ def test_fixture_dataset_is_finite_and_real_pixels() -> None:
 
 
 def test_fixture_video_clips_are_unit_scale() -> None:
-    """Video smoke clips live in [0, 1] with real image content."""
+    """Video smoke clips are ImageNet-standardized like the real pipeline."""
     from convgamer.data.datamemodule import FixtureVideoDataset
 
     ds = FixtureVideoDataset(num_frames=8, size=16, num_classes=4)
     x, y = ds[0]
     assert x.shape == (3, 8, 16, 16)
-    assert x.min() >= 0.0 and x.max() <= 1.0
-    assert x.float().mean() > 0.01  # not divided twice, not blank
+    assert torch.isfinite(x).all()
+    assert abs(x.float().mean().item()) < 2.0  # standardized, not [0, 1]
     assert y.item() == 0  # labels cycle from 0
 
 

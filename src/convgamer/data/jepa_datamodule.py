@@ -73,9 +73,9 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         self.video_ds: GameVideoDataset | None = None
         self.image_ds: GameImageDataset | None = None
 
-    def _build_video_dataset(self) -> GameVideoDataset:
+    def _build_video_dataset(self, video_ids: list[str] | None = None) -> GameVideoDataset:
         return GameVideoDataset(
-            video_paths=self.video_dataset_ids,
+            video_paths=list(video_ids) if video_ids is not None else list(self.video_dataset_ids),
             num_frames=self.num_frames,
             height=self.height,
             width=self.width,
@@ -86,6 +86,8 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         )
 
     def _build_image_dataset(self) -> GameImageDataset:
+        # Spatial regularizer: square crop at the video height so the
+        # encoder sees comparable scale (video is height x width).
         return GameImageDataset(
             image_paths=self.image_dataset_ids,
             size=min(self.height, self.width),
@@ -104,13 +106,17 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         elif self.mode == "video":
             if not self.video_dataset_ids:
                 raise ValueError("mode='video' requires non-empty video_dataset_ids")
-            self.train_ds = self._build_video_dataset()
+            # Hold out the last file for validation.
+            train_ids = self.video_dataset_ids[:-1] or self.video_dataset_ids
+            self.train_ds = self._build_video_dataset(train_ids)
         elif self.mode == "mixed":
             if not self.video_dataset_ids or not self.image_dataset_ids:
                 raise ValueError(
                     "mode='mixed' requires non-empty video_dataset_ids and image_dataset_ids"
                 )
-            self.video_ds = self._build_video_dataset()
+            self.video_ds = self._build_video_dataset(
+                self.video_dataset_ids[:-1] or self.video_dataset_ids
+            )
             self.image_ds = self._build_image_dataset()
             self.train_ds = self.video_ds
         else:
@@ -130,7 +136,8 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         return _make_loader(self.train_ds, self.batch_size, self.num_workers)
 
     def val_dataloader(self) -> DataLoader | None:
-        # Validation streams the same sources with fresh random clips/masks.
+        # Validation holds out data: fixture uses fewer repeats with an
+        # offset seed (disjoint masks); video holds out the last file.
         if self.mode == "fixture" or self.train_ds is None:
             val_ds = FixtureClipDataset(
                 num_frames=self.num_frames,
@@ -138,7 +145,23 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
                 width=self.width,
                 mask_ratio=self.mask_ratio,
                 repeats=2,
+                base_seed=10_000,
             )
         else:
-            val_ds = self._build_video_dataset()
+            ids = list(self.video_dataset_ids)
+            val_ids = ids[-1:] if ids else []
+            if not val_ids:
+                raise ValueError("no video ids to hold out for validation")
+            val_ds = GameVideoDataset(
+                video_paths=val_ids,
+                num_frames=self.num_frames,
+                height=self.height,
+                width=self.width,
+                mask_ratio=self.mask_ratio,
+                sample_stride=self.sample_stride,
+                max_frames=self.max_frames,
+                data_dir=self.data_dir,
+            )
+        # num_workers=0: val resolves paths in the main process, avoiding
+        # the per-worker download race noted in dataset.GameVideoDataset.
         return DataLoader(val_ds, batch_size=self.batch_size, num_workers=0)

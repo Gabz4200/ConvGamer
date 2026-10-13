@@ -27,7 +27,7 @@ loss:
   _target_: convgamer.models.jepa.JEPALoss
   lambda_base: 0.5          # video lambda (0.5 video, 0.7 image per Appendix A)
   lambda_image: 0.7         # static-image (T=1) context weight
-  lambda_warmup_steps: 0    # 0 disables; set ~30000 for the paper's epochs 50-100 ramp
+  lambda_warmup_steps: 30000  # paper's epochs 50-100 ramp (~30k steps at 135k)
 
 # Training hyperparameters (Appendix A)
 ema_decay: 0.99925

@@ -31,7 +31,7 @@ def _normalize_layer_count(num_layers: int | Sequence[int], stages: int = 4) -> 
         raise ValueError(f"num_layers must be int or sequence, got {type(num_layers).__name__}")
     if isinstance(num_layers, int):
         return [num_layers] * stages
-    if not isinstance(num_layers, Sequence):
+    if isinstance(num_layers, str) or not isinstance(num_layers, Sequence):
         raise ValueError(f"num_layers must be int or sequence, got {type(num_layers).__name__}")
     layers = list(num_layers)
     if len(layers) != stages:
@@ -105,6 +105,7 @@ class InceptionNeXtEncoder(nn.Module):
 
         self.stages = nn.Sequential(*stages)
         self.feature_dim = last_out_ch
+        self.stage_widths: tuple[int, int, int, int] = tuple(widths)  # type: ignore[assignment]
         self.head = nn.Linear(last_out_ch, num_classes) if num_classes > 0 else nn.Identity()
 
         self._init_weights()
@@ -135,12 +136,16 @@ class InceptionNeXtEncoder(nn.Module):
         return x.transpose(1, 2).reshape(b, c, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"Expected 4D input (B, C, H, W), got shape {x.shape}")
         x = self.forward_feature_map(x)
         x = x.mean(dim=[2, 3])
         return self.head(x)
 
     def forward_feature_map(self, x: torch.Tensor) -> torch.Tensor:
         """Spatial feature map (B, F, H', W'); no pooling, no head."""
+        if x.ndim != 4:
+            raise ValueError(f"Expected 4D input (B, C, H, W), got shape {x.shape}")
         x = self._stem_forward(x)
         return self.stages(x)
 

@@ -36,6 +36,10 @@ class CausalConv3d(nn.Module):
         kt, kh, kw = _triple(kernel_size)
         dt, dh, dw = _triple(dilation)
         stride = _triple(stride)
+        if stride[0] != 1:
+            raise ValueError(
+                f"CausalConv3d requires temporal stride 1 for streaming parity, got {stride}"
+            )
 
         pt = dt * (kt - 1)
         ph = dh * (kh - 1)
@@ -80,7 +84,10 @@ class CausalLayerNorm(nn.LayerNorm):
 
     def __init__(self, num_channels: int) -> None:
         super().__init__(num_channels)
-        self.num_channels = num_channels
+
+    @property
+    def num_channels(self) -> int:
+        return self.normalized_shape[0]
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
         if input.ndim == 5:

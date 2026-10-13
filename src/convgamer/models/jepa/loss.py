@@ -10,6 +10,8 @@ L_dense = L_predict + L_ctx
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 from torch import nn
 
@@ -50,20 +52,31 @@ def compute_context_lambdas(
     has_mask = mask_flat.any(dim=1)
 
     if not has_mask.any():
+        warnings.warn(
+            "compute_context_lambdas got a batch with no masked tokens.",
+            UserWarning,
+            stacklevel=2,
+        )
         return lambdas.reshape(B, T, H, W)
 
-    # Vectorized: for every token, distance to its nearest masked token.
-    # O(N * M) worst case; masked tokens are typically sparse so M << N.
+    # Chunked: for every token, distance to its nearest masked token.
+    # Chunk the query dim so peak memory is O(chunk * M), not O(N * M).
     for b in range(B):
         if not mask_flat[b].any():
             continue
         masked_idx = mask_flat[b].nonzero(as_tuple=True)[0]  # (M,)
-        # Distances: (N, M) where N = T*H*W
-        dist_t = (t_flat[b].unsqueeze(1) - t_flat[b][masked_idx].unsqueeze(0)).abs()
-        dist_h = (h_flat[b].unsqueeze(1) - h_flat[b][masked_idx].unsqueeze(0)).abs()
-        dist_w = (w_flat[b].unsqueeze(1) - w_flat[b][masked_idx].unsqueeze(0)).abs()
-        dist = dist_t + dist_h + dist_w  # L1 distance in grid
-        d_min = dist.min(dim=1).values  # (N,)
+        mt = t_flat[b][masked_idx]
+        mh = h_flat[b][masked_idx]
+        mw = w_flat[b][masked_idx]
+        d_min = torch.empty(mask_flat.shape[1], device=device, dtype=torch.float)
+        for chunk in torch.split(torch.arange(mask_flat.shape[1], device=device), 1024):
+            dist = (
+                (t_flat[b][chunk].unsqueeze(1) - mt.unsqueeze(0)).abs()
+                + (h_flat[b][chunk].unsqueeze(1) - mh.unsqueeze(0)).abs()
+                + (w_flat[b][chunk].unsqueeze(1) - mw.unsqueeze(0)).abs()
+            )
+            d_min[chunk] = dist.min(dim=1).values
+        # Adjacent (distance-1) context keeps full lambda_base; masked get 0.
         d_min = torch.clamp(d_min, min=1.0)  # avoid div-by-zero at masked positions
         weight = lambda_base / torch.sqrt(d_min)
         # Masked positions: lambda = 0 (no L_ctx on masked)
@@ -97,9 +110,11 @@ class JEPALoss(nn.Module):
         # counter must survive resume, so the buffer stays persistent.
         self._step_counter: torch.Tensor
         self.register_buffer("_step_counter", torch.zeros((), dtype=torch.long))
+        self._step_int: int = 0
 
     def set_step(self, step: int) -> None:
         """Update the running step counter used by the lambda warmup."""
+        self._step_int = int(step)
         self._step_counter.fill_(int(step))
 
     def _effective_lambda(self, mask: torch.Tensor) -> float:
@@ -110,7 +125,7 @@ class JEPALoss(nn.Module):
         if self.lambda_warmup_steps <= 0:
             return base
         # Linear ramp from 0 to base over the warmup window (paper: epochs 50-100).
-        ramp = min(1.0, float(self._step_counter.item()) / float(self.lambda_warmup_steps))
+        ramp = min(1.0, float(self._step_int) / float(self.lambda_warmup_steps))
         return base * ramp
 
     def forward(
@@ -147,11 +162,18 @@ class JEPALoss(nn.Module):
 
         _, _, ft, fh, fw = flat_pred.shape
         mask_resized = resize_token_mask(mask, (ft, fh, fw))
+        eff_lambda = self._effective_lambda(mask)
+        if not mask_resized.any():
+            warnings.warn(
+                "JEPALoss got a batch with no masked tokens; loss is 0.",
+                UserWarning,
+                stacklevel=2,
+            )
         # The level fold shares one mask and one lambda map: tile across levels.
         mask_folded = mask_resized.repeat_interleave(num_levels, dim=0)
-        lambdas = compute_context_lambdas(
-            mask_resized, lambda_base=self._effective_lambda(mask)
-        ).repeat_interleave(num_levels, dim=0)
+        lambdas = compute_context_lambdas(mask_resized, lambda_base=eff_lambda).repeat_interleave(
+            num_levels, dim=0
+        )
 
         # Per-token L1 distance
         l1 = (flat_pred - flat_target).abs()

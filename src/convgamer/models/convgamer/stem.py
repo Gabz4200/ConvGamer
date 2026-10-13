@@ -49,8 +49,22 @@ class ConvGamerStem(nn.Module):
         )
         self.norm = CausalLayerNorm(self.out_channels) if use_norm else nn.Identity()
 
+    @property
+    def history_frames(self) -> int:
+        """Max past frames needed alongside the current one for streaming."""
+        return max(
+            self.near_conv.temporal_extent,
+            self.local_conv.temporal_extent,
+            self.far_conv.temporal_extent,
+            self.fuse_conv.temporal_extent,
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, T, H, W)
+        if x.ndim != 5:
+            raise ValueError(f"Expected 5D input (B, C, T, H, W), got shape {x.shape}")
+        if x.shape[1] != self.in_channels:
+            raise ValueError(f"Expected in_channels={self.in_channels}, got {x.shape[1]}")
         near = self.near_conv(x)
         local = self.local_conv(x)
         far = self.far_conv(x)

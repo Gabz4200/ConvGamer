@@ -21,3 +21,13 @@ def get_model(name: str, **kwargs):
         raise KeyError(f"Unknown model '{name}'. Registered: {list(MODEL_REGISTRY)}")
     cls = MODEL_REGISTRY[name]
     return cls(**kwargs)
+
+
+def unregister_model(name: str) -> None:
+    """Remove ``name`` from the registry (test teardown helper)."""
+    MODEL_REGISTRY.pop(name, None)
+
+
+def clear_registry() -> None:
+    """Remove all registered models (test isolation helper)."""
+    MODEL_REGISTRY.clear()
