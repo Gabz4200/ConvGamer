@@ -54,6 +54,9 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         mode: str = "fixture",
         sample_stride: int = 1,
         max_frames: int = 10_000,
+        streaming: bool = False,
+        max_files_per_repo: int | None = None,
+        cleanup_downloads: bool = False,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -69,6 +72,9 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
         self.mode = mode
         self.sample_stride = sample_stride
         self.max_frames = max_frames
+        self.streaming = streaming
+        self.max_files_per_repo = max_files_per_repo
+        self.cleanup_downloads = cleanup_downloads
         self.train_ds: FixtureClipDataset | GameVideoDataset | None = None
         self.video_ds: GameVideoDataset | None = None
         self.image_ds: GameImageDataset | None = None
@@ -83,6 +89,9 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
             sample_stride=self.sample_stride,
             max_frames=self.max_frames,
             data_dir=self.data_dir,
+            streaming=self.streaming,
+            max_files_per_repo=self.max_files_per_repo,
+            cleanup_downloads=self.cleanup_downloads,
         )
 
     def _build_image_dataset(self) -> GameImageDataset:
@@ -152,6 +161,8 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
             val_ids = ids[-1:] if ids else []
             if not val_ids:
                 raise ValueError("no video ids to hold out for validation")
+            # Streaming val stays tiny: 2 files max, no cleanup (reused across
+            # val checks), so validation never snapshot-downloads a repo.
             val_ds = GameVideoDataset(
                 video_paths=val_ids,
                 num_frames=self.num_frames,
@@ -161,6 +172,9 @@ class VJEPAGamingDataModule(pl.LightningDataModule):
                 sample_stride=self.sample_stride,
                 max_frames=self.max_frames,
                 data_dir=self.data_dir,
+                streaming=self.streaming,
+                max_files_per_repo=2 if self.streaming else self.max_files_per_repo,
+                cleanup_downloads=False,
             )
         # num_workers=0: val resolves paths in the main process, avoiding
         # the per-worker download race noted in dataset.GameVideoDataset.

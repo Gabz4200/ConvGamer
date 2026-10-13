@@ -21,7 +21,13 @@ from PIL import Image
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from convgamer.data.masking import multiblock_mask_3d
-from convgamer.data.sources import _resolve_image_paths, _resolve_video_paths
+from convgamer.data.sources import (
+    _resolve_image_paths,
+    _resolve_video_paths,
+    _shard_for_distributed,
+    download_remote_file,
+    list_remote_video_files,
+)
 
 __all__ = [
     "FixtureClipDataset",
@@ -186,6 +192,15 @@ class GameVideoDataset(IterableDataset):
         mask_ratio: Fraction of spatio-temporal tokens to mask.
         sample_stride: Frames to skip between sampled frames.
         max_frames: Cap on frames to read per clip (prevents OOM on massive files).
+        streaming: When True, HF ids are listed (metadata only) and each
+            ``.mp4`` is fetched just-in-time, one file at a time, so disk
+            stays O(1 file) instead of O(repo). Required for Kaggle's ~20 GB
+            working disk with the 5-repo gameplay list.
+        max_files_per_repo: Cap remote ``.mp4`` per repo in non-streaming
+            mode (bounded ``snapshot`` alternative).
+        cleanup_downloads: In streaming mode, delete each downloaded file
+            after yielding its sample and evict the scoped Hub cache every
+            few files, so training loop is download-train-delete.
     """
 
     def __init__(
@@ -198,6 +213,9 @@ class GameVideoDataset(IterableDataset):
         sample_stride: int = 1,
         max_frames: int = 10_000,
         data_dir: str = "./data/jepa",
+        streaming: bool = False,
+        max_files_per_repo: int | None = None,
+        cleanup_downloads: bool = False,
     ):
         self.video_paths = video_paths
         self.num_frames = num_frames
@@ -207,6 +225,9 @@ class GameVideoDataset(IterableDataset):
         self.sample_stride = sample_stride
         self.max_frames = max_frames
         self.data_dir = data_dir
+        self.streaming = streaming
+        self.max_files_per_repo = max_files_per_repo
+        self.cleanup_downloads = cleanup_downloads
 
     def _load_video(self, path: str) -> torch.Tensor:
         """Load frames from a single mp4 using decord.
@@ -242,8 +263,73 @@ class GameVideoDataset(IterableDataset):
         frames = _resize_video_frames(frames, self.height, self.width)
         return frames
 
-    def __iter__(self):
+    def _sample_from_path(self, path: str):
+        """Load ``path`` and yield its ``(x, y, mask)`` triplet (or skip)."""
+        import logging
+
         logger = logging.getLogger(__name__)
+        try:
+            y = self._load_video(path)  # (T, C, H, W)
+        except Exception as error:
+            logger.warning("Skipping unreadable video %s (%s)", path, error)
+            return
+        # Deterministic per-worker stream under seed_everything(workers=True).
+        seed = int(torch.initial_seed() % (2**31)) + hash(path) % (2**16)
+        mask = multiblock_mask_3d(
+            self.num_frames, self.height, self.width, self.mask_ratio, seed=seed
+        )
+        x, y = _mask_video_clip(y, mask)
+        # (C, T, H, W)
+        yield x, y, mask
+
+    def _iter_streaming_refs(self):
+        """Yield local paths one file at a time (HF ids fetched just-in-time).
+
+        Remote repos are listed without downloading; each ``.mp4`` is pulled
+        via single-file download, yielded to the caller, then optionally
+        deleted so disk stays flat across thousand-file repos.
+        """
+        import os
+        import shutil
+
+        from convgamer.data.sources import _expand_archive_globs, _looks_like_hf_id
+
+        worker_id, num_workers = _worker_info()
+        for item in self.video_paths:
+            if _looks_like_hf_id(item) and not os.path.exists(item):
+                remote = list_remote_video_files(item)
+                if self.max_files_per_repo is not None:
+                    remote = remote[: self.max_files_per_repo]
+                remote = _shard_for_distributed(remote)
+                if num_workers > 1:
+                    remote = remote[worker_id::num_workers]
+                repo_root = os.path.join(self.data_dir, item.replace("/", "__"))
+                for n, name in enumerate(remote):
+                    local_path = download_remote_file(item, name, data_dir=self.data_dir)
+                    yield local_path
+                    if self.cleanup_downloads:
+                        try:
+                            if os.path.isfile(local_path):
+                                os.remove(local_path)
+                        except OSError:
+                            pass
+                        # Evict the scoped Hub cache every few files so the
+                        # cache blob half of each download does not accumulate.
+                        if (n + 1) % 5 == 0:
+                            shutil.rmtree(os.path.join(repo_root, ".hf_cache"), ignore_errors=True)
+                if self.cleanup_downloads:
+                    shutil.rmtree(os.path.join(repo_root, ".hf_cache"), ignore_errors=True)
+            else:
+                local = _shard_for_distributed(_expand_archive_globs(item, recursive=True))
+                if num_workers > 1:
+                    local = local[worker_id::num_workers]
+                yield from local
+
+    def __iter__(self):
+        if self.streaming:
+            for path in self._iter_streaming_refs():
+                yield from self._sample_from_path(path)
+            return
         worker_id, num_workers = _worker_info()
         # NOTE: path resolution/download runs per DataLoader worker. For
         # large-scale runs prefer resolving in DataModule.setup() (main
@@ -254,23 +340,10 @@ class GameVideoDataset(IterableDataset):
             data_dir=self.data_dir,
             worker_id=worker_id,
             num_workers=num_workers,
+            max_files_per_repo=self.max_files_per_repo,
         )
         for path in resolved:
-            try:
-                y = self._load_video(path)  # (T, C, H, W)
-            except Exception as error:
-                logger.warning("Skipping unreadable video %s (%s)", path, error)
-                continue
-
-            # Deterministic per-worker stream under seed_everything(workers=True).
-            seed = int(torch.initial_seed() % (2**31)) + hash(path) % (2**16)
-            mask = multiblock_mask_3d(
-                self.num_frames, self.height, self.width, self.mask_ratio, seed=seed
-            )
-            x, y = _mask_video_clip(y, mask)
-
-            # (C, T, H, W)
-            yield x, y, mask
+            yield from self._sample_from_path(path)
 
 
 class GameImageDataset(IterableDataset):

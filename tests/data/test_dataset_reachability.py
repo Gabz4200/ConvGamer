@@ -156,3 +156,95 @@ def test_live_hf_datasets_reachable() -> None:
     for repo_id in cfg["video_dataset_ids"]:
         info = api.dataset_info(str(repo_id))
         assert info.id.lower() == str(repo_id).lower()
+
+
+def test_iter_video_chunks_slices_local_globs(tmp_path, monkeypatch) -> None:
+    """Local globs chunk without any Hub contact (bounded working set)."""
+    from convgamer.data.sources import iter_video_chunks
+
+    for name in ("a.mp4", "b.mp4", "c.mp4"):
+        (tmp_path / name).write_bytes(b"placeholder")
+    monkeypatch.chdir(tmp_path)
+    chunks = list(iter_video_chunks(["*.mp4"], data_dir=str(tmp_path), chunk_size=2))
+    assert chunks == [["a.mp4", "b.mp4"], ["c.mp4"]]
+
+
+def test_cleanup_chunk_removes_only_repo_dirs(tmp_path) -> None:
+    """cleanup_chunk frees per-repo trees; outside files are never deleted."""
+    from convgamer.data.sources import cleanup_chunk
+
+    repo_file = tmp_path / "owner__repo" / "videos" / "clip.mp4"
+    repo_file.parent.mkdir(parents=True)
+    repo_file.write_bytes(b"placeholder")
+    (tmp_path / "owner__repo" / ".hf_cache").mkdir(exist_ok=True)
+    outside = tmp_path / "keep.mp4"
+    outside.write_bytes(b"placeholder")
+    cleanup_chunk([str(repo_file), str(outside)], data_dir=str(tmp_path))
+    assert not (tmp_path / "owner__repo").exists()
+    assert outside.is_file()
+
+
+def test_resolve_video_paths_caps_remote_files(tmp_path, monkeypatch) -> None:
+    """max_files_per_repo fetches N single files, never a full snapshot."""
+    import convgamer.data.sources as srcmod
+
+    seen: list[str] = []
+
+    def fake_download(repo_id: str, filenames: list[str], data_dir: str = "") -> list[str]:
+        seen.extend(filenames)
+        return [f"{data_dir}/{repo_id.replace('/', '__')}/{n}" for n in filenames]
+
+    monkeypatch.setattr(srcmod, "list_remote_video_files", lambda repo_id: ["a.mp4", "b.mp4"])
+    monkeypatch.setattr(srcmod, "download_video_chunk", fake_download)
+    resolved = _resolve_video_paths(["owner/repo"], data_dir=str(tmp_path), max_files_per_repo=1)
+    assert seen == ["a.mp4"]
+    assert resolved == [f"{tmp_path}/owner__repo/a.mp4"]
+
+
+def test_game_video_dataset_streams_one_file_at_a_time(monkeypatch, tmp_path) -> None:
+    """Streaming mode lists (no bytes), downloads just-in-time, cleans up."""
+    import convgamer.data.dataset as dsmod
+
+    frames = torch.rand(4, 3, 16, 16)
+    downloaded: list[str] = []
+
+    def fake_download(repo_id: str, filename: str, data_dir: str = "") -> str:
+        path = str(tmp_path / filename)
+        Path(path).write_bytes(b"placeholder")
+        downloaded.append(path)
+        return path
+
+    monkeypatch.setattr(dsmod, "list_remote_video_files", lambda repo_id: ["a.mp4", "b.mp4"])
+    monkeypatch.setattr(dsmod, "download_remote_file", fake_download)
+    monkeypatch.setattr(GameVideoDataset, "_load_video", lambda self, path: frames)
+    ds = GameVideoDataset(
+        video_paths=["owner/repo"],
+        num_frames=4,
+        height=16,
+        width=16,
+        data_dir=str(tmp_path),
+        streaming=True,
+        cleanup_downloads=True,
+    )
+    batches = list(ds)
+    assert len(batches) == 2
+    for x, y, mask in batches:
+        assert x.shape == y.shape == (3, 4, 16, 16)
+        assert mask.shape == (4, 16, 16) and mask.dtype == torch.bool
+    # Each just-in-time file is deleted after its sample (flat disk).
+    assert downloaded and all(not os.path.exists(p) for p in downloaded)
+
+
+def test_streaming_val_holds_to_two_files() -> None:
+    """Streaming validation never snapshot-downloads the held-out repo."""
+    mod = VJEPAGamingDataModule(
+        video_dataset_ids=["a", "b"], mode="video", streaming=True, cleanup_downloads=True
+    )
+    mod.setup("fit")
+    val_loader = mod.val_dataloader()
+    assert val_loader is not None
+    val_ds = val_loader.dataset
+    assert isinstance(val_ds, GameVideoDataset)
+    assert val_ds.streaming is True
+    assert val_ds.max_files_per_repo == 2
+    assert val_ds.cleanup_downloads is False

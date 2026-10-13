@@ -173,4 +173,7 @@ def _build_jepa_datamodule(
         data_dir=cfg.data.get("data_dir", "./data/jepa"),
         sample_stride=cfg.data.get("sample_stride", 1),
         max_frames=cfg.data.get("max_frames", 10_000),
+        streaming=bool(cfg.data.get("streaming", False)),
+        max_files_per_repo=cfg.data.get("max_files_per_repo", None),
+        cleanup_downloads=bool(cfg.data.get("cleanup_downloads", False)),
     )

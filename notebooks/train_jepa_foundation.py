@@ -17,6 +17,14 @@
 # exceeds Kaggle's 9h session limit — train in chunks with Save Version outputs,
 # or lower MAX_STEPS. All configured video datasets are public, so no HF token
 # is needed unless you add a gated one (then store it under Add-ons → Secrets).
+#
+# Disk strategy (Kaggle /kaggle/working is ~20 GB): the dataset streams —
+# remote `.mp4` are listed (metadata only, zero bytes), fetched **one file at
+# a time just-in-time**, and deleted right after their sample when
+# `data.cleanup_downloads=true`. Disk stays O(1 file), never O(dataset), so
+# the 5-repo gameplay list trains without the ENOSPC crash. Never call
+# `_resolve_video_paths` on the full id list here — that snapshot-downloads
+# every repo up front.
 
 # %%
 # Clone the repo (skip if already present) and add it to the path.
@@ -52,6 +60,12 @@ if torch.cuda.is_available():
 # if VRAM allows), `accelerator/devices/strategy` all `auto`
 # (→ cuda/2/DDP on the T4 host, cpu/1/single elsewhere).
 # For the full run, raise `MAX_STEPS` (paper Appendix A uses 135000).
+#
+# Streaming flags below are the disk fix: `data.streaming=true` lists remote
+# files without downloading and fetches one `.mp4` at a time inside the
+# IterableDataset; `data.cleanup_downloads=true` deletes each file after its
+# sample and evicts the scoped Hub cache. `num_workers=2` bounds concurrent
+# just-in-time downloads (4 workers × full snapshots was part of the OOM).
 
 # %%
 from hydra import compose, initialize_config_dir
@@ -63,6 +77,10 @@ USE_CUDA = torch.cuda.is_available()
 MAX_STEPS = 1000  # demo budget; raise toward 135000 for the real run
 # Full gameplay list from configs/data/jepa.yaml (~2k clips across 5 repos).
 VIDEO_IDS = list(OmegaConf.load(CONFIG_DIR / "data" / "jepa.yaml")["video_dataset_ids"])
+# Keep every downloaded byte inside the writable working disk (Kaggle or CWD).
+DATA_DIR = "/kaggle/working/data/jepa" if os.path.isdir("/kaggle/working") else "./data/jepa"
+os.makedirs(DATA_DIR, exist_ok=True)
+os.environ["HF_HUB_CACHE"] = os.path.join(DATA_DIR, ".hf_global_cache")
 
 overrides = [
     "model=jepa",
@@ -78,7 +96,11 @@ overrides = [
     "trainer.limit_val_batches=10",
     "trainer.val_check_interval=100",
     "data.batch_size=4",
-    "data.num_workers=4",
+    "data.num_workers=2",
+    f"data.data_dir={DATA_DIR}",
+    # Streaming disk fix (see header): O(1-file) disk instead of O(dataset).
+    "data.streaming=true",
+    "data.cleanup_downloads=true",
     f"data.video_dataset_ids=[{','.join(VIDEO_IDS)}]",
 ]
 
@@ -89,20 +111,26 @@ print(OmegaConf.to_yaml(cfg.data))
 print("video ids:", len(cfg.data.video_dataset_ids))
 
 # %% [markdown]
-# ## 2. Pre-download in the main process, then smoke-test one batch
+# ## 2. Count remote files (no bytes), then smoke-test one streaming batch
 #
-# Workers each resolve paths on their own, so download once here first —
-# otherwise N workers race N concurrent snapshot downloads. `build_model`
-# dispatches on the `convgamer.models.jepa` marker to `ConvGamerVJEPAModel`
-# (encoder/predictor/loss from `configs/model/jepa.yaml`).
-# Batches are `(context, target, mask)` triplets of standardized RGB.
+# No upfront snapshot download: `list_remote_video_files` hits the Hub API
+# only (filenames, not blobs), and the first training batch pulls just enough
+# `.mp4` just-in-time (~4 files for batch 4) through the streaming
+# `GameVideoDataset`. `build_model` dispatches on the `convgamer.models.jepa`
+# marker to `ConvGamerVJEPAModel` (encoder/predictor/loss from
+# `configs/model/jepa.yaml`). Batches are `(context, target, mask)` triplets
+# of standardized RGB.
 
 # %%
-from convgamer.data.sources import _resolve_video_paths
+from convgamer.data.sources import disk_free_bytes, list_remote_video_files
 from convgamer.scripts.common import build_datamodule, build_model
 
-_resolved = _resolve_video_paths(list(cfg.data.video_dataset_ids), data_dir=str(cfg.data.data_dir))
-print("resolved video files:", len(_resolved))
+print(f"free disk in {DATA_DIR}: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
+for vid in list(cfg.data.video_dataset_ids):
+    try:
+        print(f"  {vid}: {len(list_remote_video_files(vid))} remote .mp4")
+    except Exception as error:
+        print(f"  {vid}: list failed ({error})")
 
 model = build_model(cfg)
 datamodule = build_datamodule(cfg)
@@ -113,6 +141,7 @@ x, y, mask = batch
 print(
     "x:", tuple(x.shape), x.dtype, "| y:", tuple(y.shape), "| mask:", tuple(mask.shape), mask.dtype
 )
+print(f"free disk after smoke batch: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
 
 with torch.no_grad():
     loss = model(x[:1], y[:1], mask[:1])
@@ -137,15 +166,22 @@ print("smoke fit ok; ema shadow device:", next(model.ema_encoder.shadow_module.p
 #
 # Lightning sweeps the LR exponentially, restores the pre-sweep weights, and
 # writes the suggestion back to `model.lr` (read by `configure_optimizers`).
+# Training streams file-by-file (download → train → delete, with scoped-cache
+# eviction), so the working disk stays flat for the whole run.
 # Checkpoints land in `checkpoints/jepa/` (see `configs/trainer/jepa.yaml`).
 # On Kaggle, /kaggle/working persists only via Save Version → save outputs.
 # Resume with `trainer.fit(model, datamodule=datamodule, ckpt_path="...")`.
+#
+# Tight-disk alternative (same building blocks, explicit chunks): iterate
+# `iter_video_chunks(ids, DATA_DIR, chunk_size=30)`, build a datamodule per
+# chunk from the returned local paths, `fit` a slice of steps, then
+# `cleanup_chunk(chunk_paths, DATA_DIR)` before the next chunk.
 
 # %%
+from convgamer.training.engine import maybe_run_lr_finder
+
 pl.seed_everything(int(cfg.get("seed", 42)), workers=True)
 trainer = create_trainer(cfg)
-
-from convgamer.training.engine import maybe_run_lr_finder
 
 cfg.trainer.lr_finder = {
     "enabled": True,
@@ -156,7 +192,9 @@ cfg.trainer.lr_finder = {
 }
 found_lr = maybe_run_lr_finder(trainer, model, datamodule, cfg)
 print("training with lr:", model.lr)
+print(f"free disk before fit: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
 trainer.fit(model, datamodule=datamodule)
+print(f"free disk after fit: {disk_free_bytes(DATA_DIR) / 1e9:.2f} GB")
 
 # %%
 # List checkpoints produced by this run.

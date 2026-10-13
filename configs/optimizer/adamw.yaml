@@ -1,5 +1,5 @@
 # Paper §4.1: AdamW with lr = 0.001 × batchsize/1024, weight_decay = 0.05
 target: torch.optim.AdamW
 
-lr: 4.0e-3  # paper §4.1: lr = 0.001 × batchsize/1024, with batch 4096 -> 4e-3
+lr: 4.0e-6  # linear rule at the dev batch (0.001 × 4/1024); paper's 4e-3 is for batch 4096
 weight_decay: 0.05  # paper §4.1

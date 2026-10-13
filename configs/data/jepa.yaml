@@ -13,8 +13,8 @@
 # Regularization = extra entries in video_dataset_ids (no separate plumbing).
 
 mode: fixture            # fixture (offline smoke) | video | mixed
-batch_size: 8            # per-GPU; effective = 8 × 2 (devices) × 2 (accum) = 32
-num_workers: 4
+batch_size: 4            # per-GPU; effective = 4 × 2 (devices) × 2 (accum) = 16
+num_workers: 2           # bounds concurrent just-in-time downloads in streaming mode
 num_frames: 16           # T — V-JEPA 2.1 App A clip length
 height: 144
 width: 256               # 16:9 native game aspect (terraria workhorse is 256x144)
@@ -23,6 +23,11 @@ image_mask_ratio: 0.10   # lower mask for spatial regularizer
 data_dir: ./data/jepa
 sample_stride: 1         # frames to skip when slicing long MP4s
 max_frames: 10000        # cap decoded frames per clip (prevents OOM)
+streaming: true          # list remote .mp4 (no bytes), fetch one file at a
+                         # time just-in-time; required on ~20 GB Kaggle disks
+max_files_per_repo: null # non-streaming cap: first N remote .mp4 per repo (O(chunk))
+cleanup_downloads: true  # streaming only: delete each file after its sample +
+                         # evict the scoped Hub cache, so disk stays flat
 
 # Tier 1: Direct MP4 datasets
 video_dataset_ids:
